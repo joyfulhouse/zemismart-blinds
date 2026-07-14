@@ -21,6 +21,7 @@ from .codec import (
     encode_b0,
     make_payload,
     validate_b0_frame,
+    validate_channels,
 )
 from .const import (
     CONF_AREA_ID,
@@ -51,9 +52,14 @@ CommandStatusValue = Literal["accepted", "rejected"]
 
 MIN_REPEATS: Final = 1
 MAX_REPEATS: Final = 20
+# Firmware caps stop_after_ms at 3,600,000 (one hour); a travel calibration
+# above this could produce partial moves the bridge rejects.
+MAX_TRAVEL_SECONDS: Final = 3600
 DEFAULT_ACK_TIMEOUT_SECONDS: Final = 2.0
 DEFAULT_STARTED_TIMEOUT_SECONDS: Final = 30.0
 _DISPLACED_MEMORY_SECONDS: Final = 60.0
+_DISPLACED_MAX_ID_LENGTH: Final = 64
+_DISPLACED_MAX_ENTRIES: Final = 256
 _BRIDGE_AFFINITY_SECONDS: Final = 120.0
 
 
@@ -125,14 +131,7 @@ def parse_channels(value: object) -> tuple[int, ...]:
     else:
         msg = "channels must be text or an iterable of integers"
         raise ValueError(msg)
-    normalized = tuple(sorted(channels))
-    if not normalized or any(channel < 1 or channel > 16 for channel in normalized):
-        msg = "channels must be in the range 1..16"
-        raise ValueError(msg)
-    if len(normalized) != len(set(normalized)):
-        msg = "channels must be unique"
-        raise ValueError(msg)
-    return normalized
+    return tuple(sorted(validate_channels(channels)))
 
 
 def _required(mapping: Mapping[str, object], key: str) -> object:
@@ -200,14 +199,7 @@ class RemoteIdentity:
 
     def target_key(self, channels: Iterable[int]) -> str:
         """Return the canonical bridge-agnostic key for one channel set."""
-        normalized = tuple(sorted(channels))
-        if (
-            not normalized
-            or any(channel < 1 or channel > 16 for channel in normalized)
-            or len(normalized) != len(set(normalized))
-        ):
-            msg = "target channels must be a unique non-empty set in the range 1..16"
-            raise ValueError(msg)
+        normalized = tuple(sorted(validate_channels(channels)))
         channel_key = ",".join(str(channel) for channel in normalized)
         return f"{self.key}:{channel_key}"
 
@@ -229,7 +221,7 @@ class BlindConfig:
         """Normalize and validate values at the config-entry boundary."""
         name = self.name.strip()
         area_id = self.area_id.strip()
-        channels = tuple(sorted(self.channels))
+        channels = tuple(sorted(validate_channels(self.channels)))
         if not name:
             msg = "name must not be empty"
             raise ValueError(msg)
@@ -239,18 +231,15 @@ class BlindConfig:
         if self.remote.bases is None:
             msg = "remote calibration is required"
             raise ValueError(msg)
-        if not channels or any(channel < 1 or channel > 16 for channel in channels):
-            msg = "channels must contain values in the range 1..16"
-            raise ValueError(msg)
-        if len(channels) != len(set(channels)):
-            msg = "channels must be unique"
-            raise ValueError(msg)
         if not all(
-            math.isfinite(value) and value > 0 for value in (self.travel_up, self.travel_down)
+            math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
+            for value in (self.travel_up, self.travel_down)
         ):
             # NaN slips through plain comparisons (nan <= 0 is False) and
-            # would leave the position model "moving" forever.
-            msg = "travel times must be finite and greater than zero"
+            # would leave the position model "moving" forever. The upper
+            # bound keeps every derivable partial-move stop_after_ms inside
+            # the firmware's accepted 1-hour range.
+            msg = f"travel times must be finite, greater than zero, at most {MAX_TRAVEL_SECONDS}"
             raise ValueError(msg)
         if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
             msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
@@ -334,8 +323,12 @@ class BlindConfig:
             CONF_BASE_DOWN: f"{self.remote.bases.down:04x}",
             CONF_BASE_STOP: f"{self.remote.bases.stop:04x}",
         }
-        if self.remote.bases.trailer is not None:
-            values[CONF_BASE_TRAILER] = f"{self.remote.bases.trailer:04x}"
+        # Always emitted, empty when absent: options merge OVER entry data,
+        # so removing a trailer must store an explicit empty marker — an
+        # omitted key would let the stale data-layer trailer keep winning.
+        values[CONF_BASE_TRAILER] = (
+            f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
+        )
         return values
 
     @property
@@ -564,7 +557,7 @@ class ZemismartHub:
         self._fast_inflight: set[_QueuedCommand] = set()
         self._fast_stops: set[asyncio.Task[None]] = set()
         self._recent_displaced: dict[str, float] = {}
-        self._bridge_affinity: dict[str, tuple[str, float]] = {}
+        self._bridge_affinity: dict[tuple[str, str], tuple[str, float]] = {}
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -574,7 +567,15 @@ class ZemismartHub:
             listener()
 
     def _remember_displaced(self, command_id: str) -> None:
-        """Keep a short displaced-id memory for late-registering motion models."""
+        """Keep a short, bounded displaced-id memory for late motion models.
+
+        Both the ID length and the entry count are capped: anything able to
+        publish bridge statuses could otherwise grow this dict (and the
+        per-insert expiry scan) without limit. Real command IDs are UUIDs and
+        the bridge caps in-flight commands, so the bounds are generous.
+        """
+        if len(command_id) > _DISPLACED_MAX_ID_LENGTH:
+            return
         now = self._now()
         self._recent_displaced[command_id] = now
         expired = [
@@ -584,6 +585,9 @@ class ZemismartHub:
         ]
         for key in expired:
             del self._recent_displaced[key]
+        while len(self._recent_displaced) > _DISPLACED_MAX_ENTRIES:
+            # dict preserves insertion order: drop the oldest entry.
+            del self._recent_displaced[next(iter(self._recent_displaced))]
 
     def was_displaced(self, command_id: str) -> bool:
         """Return whether this command was recently displaced by the bridge.
@@ -611,8 +615,8 @@ class ZemismartHub:
         """Resolve only a correlated admission or first-dispatch status."""
         decoded: object
         if isinstance(payload, bytes | bytearray | str):
-            text = payload.decode() if isinstance(payload, bytes | bytearray) else payload
             try:
+                text = payload.decode() if isinstance(payload, bytes | bytearray) else payload
                 decoded = json.loads(text)
             except UnicodeDecodeError, json.JSONDecodeError:
                 return False
@@ -654,7 +658,18 @@ class ZemismartHub:
         if raw_status == "started":
             if pending.started.done():
                 return False
-            pending.started.set_result(self._now())
+            started_at = self._now()
+            raw_age = decoded.get("age_ms")
+            if (
+                isinstance(raw_age, int)
+                and not isinstance(raw_age, bool)
+                and 0 < raw_age <= 7_200_000
+            ):
+                # A QoS-1 duplicate replay reports how long ago the ORIGINAL
+                # RF handoff happened; anchor the model at the true start so
+                # travel timing is not shifted by the redelivery delay.
+                started_at -= raw_age / 1_000
+            pending.started.set_result(started_at)
             return True
         if pending.admission.done():
             return False
@@ -706,7 +721,23 @@ class ZemismartHub:
                 # that STOP's completion — dropping to the global queue would
                 # park a safety STOP behind an unrelated in-flight command.
                 inflight = self._inflight
-                if inflight is not None and inflight.overlaps(command):
+                # A queued live overlapping command at this point is a raw
+                # debug frame (overlapping movements were superseded above).
+                # It was requested BEFORE this STOP: publishing the STOP
+                # first would let the raw frame displace it on the bridge
+                # and re-drive the just-stopped motor, so the STOP queues
+                # directly behind it instead of taking the fast lane.
+                last_overlap = None
+                for index, queued in enumerate(self._queue):
+                    if queued.overlaps(command) and any(
+                        not queued_future.done() for queued_future in queued.futures
+                    ):
+                        last_overlap = index
+                if last_overlap is not None:
+                    # Behind the queued overlap (and therefore also behind
+                    # any overlapping in-flight command).
+                    self._queue.insert(last_overlap + 1, command)
+                elif inflight is not None and inflight.overlaps(command):
                     self._queue.appendleft(command)
                 else:
                     fast_lane = True
@@ -796,12 +827,13 @@ class ZemismartHub:
                 # deadline must not stretch the head's window either.
                 blocked: set[tuple[str, int]] = set()
                 for queued in self._queue:
-                    if queued is command:
+                    if queued is command or all(future.done() for future in queued.futures):
+                        # A fully resolved command is discarded by the merge
+                        # pass; it must not extend the window or act as a
+                        # merge barrier here either.
                         continue
-                    if (
-                        self._coalesce_eligible(queued, command)
-                        and not self._blocks(blocked, queued)
-                        and any(not future.done() for future in queued.futures)
+                    if self._coalesce_eligible(queued, command) and not self._blocks(
+                        blocked, queued
                     ):
                         assert queued.coalesce_deadline is not None
                         command.coalesce_deadline = min(
@@ -966,7 +998,10 @@ class ZemismartHub:
         """
         assert command.area_id is not None
         now = asyncio.get_running_loop().time()
-        key = command.remote.key if command.remote is not None else None
+        # The key includes the area: channels of one remote can live in
+        # different rooms served by different bridges, and affinity must
+        # never override that RF-reachability partition.
+        key = (command.remote.key, command.area_id) if command.remote is not None else None
         if key is not None:
             held = self._bridge_affinity.get(key)
             if held is not None and held[1] > now:
@@ -981,7 +1016,7 @@ class ZemismartHub:
 
     def _remember_affinity(
         self,
-        key: str,
+        key: tuple[str, str],
         bridge_id: str,
         command: _QueuedCommand,
         now: float,

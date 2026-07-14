@@ -980,3 +980,181 @@ async def test_single_channel_timeout_invalidates_containing_group(
     finally:
         await group.async_will_remove_from_hass()
         await single.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_clamped_member_deadline_matches_its_own_duration(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clamped member's model ENDS at its own arrival, not the group deadline.
+
+    The duration rescale is meaningless if the group's later bridge-armed
+    deadline still drives the member's completion: the member would report
+    opening long after its limit switch.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(travel=1.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 20.0
+    member._position = 90.0
+    try:
+        await group.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.02)
+
+        assert member._motion_deadline == pytest.approx(
+            member._motion_started + member._motion_duration
+        )
+        assert member._motion_deadline < group._motion_deadline
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_member_already_at_endpoint_never_blips_during_group_travel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member sitting at 100 stays at 100 while its group runs a full open."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=0.5))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(travel=0.5),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 50.0
+    member._position = 100.0
+    try:
+        await group.async_open_cover()
+        await asyncio.sleep(0.02)
+
+        assert member.current_cover_position == 100
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_restore_anchor_is_revoked_by_late_offline_availability(
+    hass: HomeAssistant,
+) -> None:
+    """A late retained offline report invalidates a trusting expired anchor.
+
+    On a cold restart the registry is empty when the entity restores; the
+    expired timed motion anchors at its target, but the anchor is remembered
+    as unverified. When the motion bridge's retained availability finally
+    arrives saying offline, the STOP may never have fired: only unknown is
+    honest. An online report instead confirms the anchor.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    assert attributes["motion_timed"] is True
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)  # let the persisted deadline expire
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    empty_registry = BridgeRegistry()
+    restored_hub = ZemismartHub(empty_registry, quiet_publish)
+    restored = await attach_cover(
+        hass,
+        restored_hub,
+        config=cover_config(travel=0.02),
+        cover_type=RestoredCover,
+    )
+    try:
+        # Anchored at target while the bridge is merely undiscovered.
+        assert restored.current_cover_position == 80
+
+        empty_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+
+        assert restored.current_cover_position is None
+        assert restored.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_restore_anchor_is_confirmed_by_late_online_availability(
+    hass: HomeAssistant,
+) -> None:
+    """An online report clears the unverified marker and keeps the anchor."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    empty_registry = BridgeRegistry()
+    restored_hub = ZemismartHub(empty_registry, quiet_publish)
+    restored = await attach_cover(
+        hass,
+        restored_hub,
+        config=cover_config(travel=0.02),
+        cover_type=RestoredCover,
+    )
+    try:
+        empty_registry.update_availability("bridge-a", "online")
+        restored_hub.notify_bridge_change()
+
+        assert restored.current_cover_position == 80
+        # A second, later offline drop no longer questions the anchor.
+        empty_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+        assert restored.current_cover_position == 80
+    finally:
+        await restored.async_will_remove_from_hass()

@@ -104,8 +104,13 @@ class CommandBases:
         return value
 
 
-def _channels_tuple(channels: Iterable[int], *, allow_empty: bool) -> tuple[int, ...]:
-    """Validate and materialize a channel collection once."""
+def validate_channels(channels: Iterable[int], *, allow_empty: bool = False) -> tuple[int, ...]:
+    """Validate and materialize a channel collection once.
+
+    The single definition of the 1..16, unique, (optionally) non-empty
+    channel-set rule, shared by the codec, config parsing, and target-key
+    construction.
+    """
     materialized = tuple(channels)
     if not materialized and not allow_empty:
         msg = "channel set must not be empty"
@@ -131,7 +136,7 @@ def group_offset(channels: Iterable[int]) -> int:
     codec defines the empty-set offset as zero, although empty groups cannot be
     transmitted by :func:`make_payload`.
     """
-    normalized = _channels_tuple(channels, allow_empty=True)
+    normalized = validate_channels(channels, allow_empty=True)
     if not normalized:
         return 0
     return _signed8(2 + sum(1 << ((channel - 1) % 8) for channel in normalized))
@@ -139,7 +144,7 @@ def group_offset(channels: Iterable[int]) -> int:
 
 def channel_field(channels: Iterable[int]) -> int:
     """Encode channels as the protocol's 16-bit active-low bit field."""
-    normalized = _channels_tuple(channels, allow_empty=True)
+    normalized = validate_channels(channels, allow_empty=True)
     mask = 0
     for channel in normalized:
         mask |= 1 << ((channel + 7) % 16)
@@ -153,7 +158,7 @@ def derive_base(
     remote_id: int,
 ) -> int:
     """Derive one button base from a captured command reference."""
-    normalized = _channels_tuple(ref_channels, allow_empty=False)
+    normalized = validate_channels(ref_channels, allow_empty=False)
     if button not in _ACTION_COMMAND_HIGH:
         msg = f"reference button must be one of {', '.join(_ACTION_COMMAND_HIGH)}"
         raise ValueError(msg)
@@ -169,7 +174,7 @@ def derive_bases(
     remote_id: int,
 ) -> CommandBases:
     """Derive all action bases from one labeled UP, DOWN, or STOP reference."""
-    normalized = _channels_tuple(ref_channels, allow_empty=False)
+    normalized = validate_channels(ref_channels, allow_empty=False)
     derive_base(normalized, button, ref_cmd, remote_id)
     calibration_command = (
         ref_cmd + group_offset(normalized) - group_offset(_CALIBRATION_CHANNELS)
@@ -225,7 +230,7 @@ def make_payload(
     """Build a 64-bit payload for one channel or an arbitrary group."""
     _require_uint(prefix, 24, "prefix")
     _require_uint(remote_id, 8, "remote_id")
-    normalized = _channels_tuple(channels, allow_empty=False)
+    normalized = validate_channels(channels, allow_empty=False)
     if button not in BUTTONS:
         msg = f"button must be one of {', '.join(BUTTONS)}"
         raise ValueError(msg)

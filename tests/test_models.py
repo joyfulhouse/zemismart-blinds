@@ -1106,3 +1106,128 @@ def test_registry_distinguishes_undiscovered_from_known_offline() -> None:
     assert registry.is_known_offline("bridge-a")
     registry.update_availability("bridge-a", "online")
     assert not registry.is_known_offline("bridge-a")
+
+
+@pytest.mark.asyncio
+async def test_affinity_is_partitioned_by_area() -> None:
+    """Affinity never routes a command through another area's bridge.
+
+    Channels of one remote can live in rooms served by different bridges;
+    consecutive commands in different areas each use their own area's bridge.
+    """
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_availability("bridge-a", "online")
+    registry.update_info("bridge-b", {"area": "bedroom"})
+    registry.update_availability("bridge-b", "online")
+    topics: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        topics.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    living = replace(blind_config(), channels=(1,))
+    bedroom = replace(blind_config(area_id="bedroom"), channels=(2,))
+    await hub.async_transmit(living, "UP")
+    await hub.async_transmit(bedroom, "UP")
+
+    assert topics == ["rf433/bridge-a/tx", "rf433/bridge-b/tx"]
+
+
+@pytest.mark.asyncio
+async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
+    """A started status carrying age_ms back-dates the model's start time."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "started", "command_id": body["command_id"], "age_ms": 5_000},
+        )
+
+    clock = {"now": 100.0}
+    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    ack = await hub.async_transmit(blind_config(), "UP")
+
+    assert isinstance(ack, CommandAck)
+    assert ack.started_at == pytest.approx(95.0)
+
+
+@pytest.mark.asyncio
+async def test_stop_queues_behind_an_overlapping_queued_raw_frame() -> None:
+    """A fast-lane STOP never jumps an earlier overlapping raw debug frame.
+
+    Publishing the STOP first would let the raw frame displace it on the
+    bridge and re-drive the just-stopped motor.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_events = [asyncio.Event() for _ in range(3)]
+    ids = iter(("blocker", "raw-1", "stop-1"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        publish_events[len(published) - 1].set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    blocker_config = replace(blind_config(), channels=(3,))
+    blocker = asyncio.create_task(hub.async_transmit(blocker_config, "UP"))
+    await publish_events[0].wait()
+
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    raw = asyncio.create_task(hub.async_send_raw("bridge-a", frame, 3))
+    await asyncio.sleep(0)
+    stop = asyncio.create_task(hub.async_transmit(replace(blind_config(), channels=(1,)), "STOP"))
+    await asyncio.sleep(0)
+    # The STOP overlaps the queued raw frame: both wait for the blocker in
+    # request order instead of the STOP taking the fast lane.
+    assert len(published) == 1
+
+    accept_and_start(hub, "bridge-a", published[0])
+    await blocker
+    await publish_events[1].wait()
+    assert published[1]["command_id"] == "raw-1"
+    accept_and_start(hub, "bridge-a", published[1])
+    await raw
+    await publish_events[2].wait()
+    assert published[2]["command_id"] == "stop-1"
+    accept_and_start(hub, "bridge-a", published[2])
+    await stop
+
+
+def test_travel_time_is_bounded_by_the_firmware_stop_cap() -> None:
+    """A travel calibration above one hour cannot produce rejected partial moves."""
+    with pytest.raises(ValueError, match="travel"):
+        replace(blind_config(), travel_up=3601.0)
+
+
+def test_as_dict_always_emits_the_trailer_marker() -> None:
+    """A trailer-less calibration stores an explicit empty base_trailer.
+
+    Options merge over entry data: without the marker, a stale data-layer
+    trailer base could never be removed through the options flow.
+    """
+    trailerless = replace(
+        blind_config(),
+        remote=RemoteIdentity(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            CommandBases(up=TEST_BASES.up, down=TEST_BASES.down, stop=TEST_BASES.stop),
+        ),
+    )
+    values = trailerless.as_dict()
+    assert values["base_trailer"] == ""
+    restored = BlindConfig.from_mapping(values)
+    assert restored.remote.bases is not None
+    assert restored.remote.bases.trailer is None

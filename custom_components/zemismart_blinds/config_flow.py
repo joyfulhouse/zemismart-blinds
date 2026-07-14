@@ -49,6 +49,26 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 
+def _whole_number(value: object, field: str) -> int:
+    """Reject fractional selector values instead of silently truncating them.
+
+    Home Assistant's number selector does not enforce its configured step, so
+    a backend-valid 1.9 would otherwise be stored as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg)
+    try:
+        number = float(value)
+    except ValueError as exc:
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg) from exc
+    if not number.is_integer():
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg)
+    return int(number)
+
+
 def _float_value(value: object, fallback: float) -> float:
     """Convert a persisted selector value to a display float."""
     if isinstance(value, bool) or not isinstance(value, int | float | str):
@@ -296,8 +316,11 @@ def _config_from_input(
         travel_up=float(user_input[CONF_TRAVEL_UP]),
         travel_down=float(user_input[CONF_TRAVEL_DOWN]),
         area_id=str(user_input[CONF_AREA_ID]),
-        repeats=int(user_input[CONF_REPEATS]),
-        coalesce_window_ms=int(user_input.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS)),
+        repeats=_whole_number(user_input[CONF_REPEATS], CONF_REPEATS),
+        coalesce_window_ms=_whole_number(
+            user_input.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
+            CONF_COALESCE_WINDOW_MS,
+        ),
     )
 
 

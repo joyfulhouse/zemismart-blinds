@@ -102,6 +102,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_bridge: str | None = None
         self._motion_command_id: str | None = None
         self._motion_timed = False
+        self._unverified_anchor_bridge: str | None = None
         self._motion_token: object | None = None
         self._motion_task: asyncio.Task[None] | None = None
         self._last_bridge: str | None = None
@@ -221,6 +222,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if now >= deadline:
             self._position = target
             self._clear_motion()
+            if timed and not self._bridge_seen_online(bridge):
+                # The anchored target assumed the bridge's armed STOP fired
+                # while HA was down, but retained availability has not
+                # arrived yet on this cold start. Remember the bridge: if it
+                # later reports offline, the STOP may never have fired and
+                # the anchor is invalidated. (Not persisted — a second
+                # restart before any availability arrives loses the marker.)
+                self._unverified_anchor_bridge = bridge
             return
         # Prefer the persisted motion origin: interpolating from the original
         # start keeps the transient estimate accurate across the restart gap
@@ -278,8 +287,24 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._interrupt_motion(WALL_CLOCK())
             self.async_write_ha_state()
 
+    def _bridge_seen_online(self, bridge_id: str) -> bool:
+        """Return whether this bridge has explicitly announced itself online."""
+        return any(
+            bridge.online for bridge in self._hub.registry.bridges if bridge.bridge_id == bridge_id
+        )
+
     def _on_bridge_change(self) -> None:
         """Re-evaluate availability and timed-motion safety on bridge changes."""
+        if self._unverified_anchor_bridge is not None:
+            anchor_bridge = self._unverified_anchor_bridge
+            if self._hub.registry.is_known_offline(anchor_bridge):
+                # The restore-time anchor trusted a STOP this bridge never
+                # got to fire: the retained availability that just arrived
+                # says it was offline. The motor may sit at its hard limit.
+                self._unverified_anchor_bridge = None
+                self._mark_unknown()
+            elif self._bridge_seen_online(anchor_bridge):
+                self._unverified_anchor_bridge = None
         if (
             self._direction != 0
             and self._motion_timed
@@ -316,9 +341,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._motion_start_position
             + (self._motion_target - self._motion_start_position) * progress
         )
-        if progress < 1.0 and self._motion_target == 100:
+        # Hold just short of an endpoint until the model completes — but only
+        # when actually traveling toward it; a member already sitting at its
+        # endpoint must not blip to 99/1 while its group runs a full travel.
+        if progress < 1.0 and self._motion_target == 100 and self._motion_start_position != 100:
             return min(99.0, estimated)
-        if progress < 1.0 and self._motion_target == 0:
+        if progress < 1.0 and self._motion_target == 0 and self._motion_start_position != 0:
             return max(1.0, estimated)
         return estimated
 
@@ -357,6 +385,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._cancel_motion_task()
         self._position = None
         self._clear_motion()
+        self._unverified_anchor_bridge = None
         self._degraded = True
 
     def _mark_unknown_and_notify_members(self) -> None:
@@ -437,11 +466,20 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Commit a fresh local model from correlated first RF dispatch."""
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
+        # Fresh RF supersedes any unverified restore-time anchor question.
+        self._unverified_anchor_bridge = None
         self._motion_start_position = self._position
         self._motion_target = target
         self._motion_duration = duration
         self._motion_started = ack.started_at
-        self._motion_deadline = ack.deadline or (ack.started_at + duration)
+        # The model ends at whichever comes first: this cover's own travel
+        # (a clamped member reaches its limit switch before the group frame
+        # ends) or the bridge-armed STOP deadline. For the cover that owns
+        # the command the two coincide.
+        deadline = ack.started_at + duration
+        if ack.deadline is not None:
+            deadline = min(deadline, ack.deadline)
+        self._motion_deadline = deadline
         self._direction = direction
         self._motion_bridge = ack.bridge.bridge_id
         self._motion_command_id = ack.command_id

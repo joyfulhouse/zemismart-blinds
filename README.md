@@ -180,6 +180,11 @@ logger:
 - **No RX/state sync yet**: presses on the physical remote are not observed (stock ESPHome cannot
   surface Portisch B1 captures as events). Planned as Phase 2 — see [PROTOCOL.md](PROTOCOL.md).
 - **Assumed position**: there is no motor feedback; position is modeled from travel time.
+- **Bridge isolated from MQTT mid-command**: a bridge that loses its network link (but not power)
+  keeps executing its already-armed fail-safe STOP locally. With multiple bridges, commands fail
+  over to another bridge meanwhile, and the isolated bridge's late STOP can still reach the motor
+  over the air. One-way RF offers no way to recall it; re-issue the movement if a blind stops
+  unexpectedly after a bridge drops.
 - **Bridge reboot during an HA restart**: a bridge's armed fail-safe STOP lives in its RAM. If the
   bridge power-cycles entirely within Home Assistant's own downtime (offline and back online before
   HA restores state), a restored in-flight partial move cannot detect that its STOP was lost and
