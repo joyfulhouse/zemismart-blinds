@@ -25,6 +25,8 @@ send_raw:
           max: 20
           mode: box
 
+# supports_response is declared in code (SupportsResponse.OPTIONAL); hassfest
+# rejects it as a services.yaml key.
 new_virtual_remote:
   name: Allocate virtual remote
   description: >-
@@ -32,5 +34,4 @@ new_virtual_remote:
     The response's prefix, remote ID, and UP base go straight into the manual
     add-integration flow; pair the motor by sending OPEN while it is in its
     RF pairing mode.
-  supports_response: optional
 
