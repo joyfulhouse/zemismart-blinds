@@ -12,6 +12,7 @@ import pytest
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 
 import custom_components.zemismart_blinds as integration_module
 from custom_components.zemismart_blinds import (
@@ -445,7 +446,7 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
         message("rf433/bridge-a/availability", "online", retain=True)
     )
 
-    with pytest.raises(ValueError, match="hex"):
+    with pytest.raises(HomeAssistantError, match="hex"):
         await hass.services.async_call(
             DOMAIN,
             SERVICE_SEND_RAW,

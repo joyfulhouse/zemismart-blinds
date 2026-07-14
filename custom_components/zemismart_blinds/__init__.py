@@ -186,11 +186,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         if runtime is None or not runtime.initialized:
             msg = "no Zemismart Blinds entry is loaded, so no bridge registry exists"
             raise HomeAssistantError(msg)
-        await runtime.hub.async_send_raw(
-            str(call.data[ATTR_BRIDGE]),
-            str(call.data[ATTR_RAW]),
-            int(call.data[ATTR_REPEATS]),
-        )
+        try:
+            await runtime.hub.async_send_raw(
+                str(call.data[ATTR_BRIDGE]),
+                str(call.data[ATTR_RAW]),
+                int(call.data[ATTR_REPEATS]),
+            )
+        except (ValueError, RuntimeError) as exc:
+            # Frame validation, routing, rejection, and timeout errors are
+            # user-actionable service failures, not tracebacks.
+            raise HomeAssistantError(str(exc)) from exc
 
     async def async_new_virtual_remote(_call: ServiceCall) -> ServiceResponse:
         prefix, remote_id, bases = new_virtual_remote_identity(hass)

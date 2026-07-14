@@ -26,8 +26,8 @@ send_raw:
           max: 20
           mode: box
 
-# supports_response is declared in code (SupportsResponse.OPTIONAL); hassfest
-# rejects it as a services.yaml key.
+# supports_response is declared in code (SupportsResponse.ONLY: callers must
+# request the response); hassfest rejects it as a services.yaml key.
 new_virtual_remote:
   name: Allocate virtual remote
   description: >-

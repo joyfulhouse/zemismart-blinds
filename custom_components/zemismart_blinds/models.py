@@ -54,6 +54,7 @@ MAX_REPEATS: Final = 20
 DEFAULT_ACK_TIMEOUT_SECONDS: Final = 2.0
 DEFAULT_STARTED_TIMEOUT_SECONDS: Final = 30.0
 _DISPLACED_MEMORY_SECONDS: Final = 60.0
+_BRIDGE_AFFINITY_SECONDS: Final = 120.0
 
 
 class NoOnlineBridgeError(RuntimeError):
@@ -361,6 +362,9 @@ class BridgeInfo:
     area_id: str | None = None
     online: bool = False
     is_default: bool = False
+    # Whether an availability payload has ever been applied: online=False
+    # without it only means "not discovered yet", not "reported offline".
+    availability_seen: bool = False
 
 
 class BridgeRegistry:
@@ -389,6 +393,7 @@ class BridgeRegistry:
             area_id=current.area_id,
             online=online,
             is_default=current.is_default,
+            availability_seen=True,
         )
 
     def update_info(self, bridge_id: str, payload: Mapping[str, object]) -> None:
@@ -412,6 +417,7 @@ class BridgeRegistry:
             area_id=area_id,
             online=current.online,
             is_default=is_default,
+            availability_seen=current.availability_seen,
         )
 
     def resolve(self, area_id: str) -> BridgeInfo:
@@ -427,6 +433,17 @@ class BridgeRegistry:
             return online[0]
         msg = "no RF433 bridge is online"
         raise NoOnlineBridgeError(msg)
+
+    def is_known_offline(self, bridge_id: str) -> bool:
+        """Return whether this bridge has EXPLICITLY reported itself offline.
+
+        A bridge that has never announced availability (registry empty at
+        startup, or only retained info seen so far) is unknown, not offline;
+        conflating the two would irreversibly invalidate restored motion on
+        every restart.
+        """
+        bridge = self._bridges.get(bridge_id)
+        return bridge is not None and bridge.availability_seen and not bridge.online
 
     def online_bridge(self, bridge_id: str) -> BridgeInfo:
         """Resolve a specific online bridge for the debug raw service."""
@@ -547,6 +564,7 @@ class ZemismartHub:
         self._fast_inflight: set[_QueuedCommand] = set()
         self._fast_stops: set[asyncio.Task[None]] = set()
         self._recent_displaced: dict[str, float] = {}
+        self._bridge_affinity: dict[str, tuple[str, float]] = {}
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -703,7 +721,11 @@ class ZemismartHub:
                 self._queue.append(command)
             if not fast_lane:
                 self._ensure_worker()
-                self._queue_ready.notify()
+            # Notify even on the fast lane: the STOP may have superseded the
+            # queued movement the worker is currently sleeping on in its
+            # coalesce window, and the wake-up lets it discard that head
+            # immediately instead of idling out the window.
+            self._queue_ready.notify()
         if fast_lane:
             task = asyncio.create_task(
                 self._async_run_fast(command, fast_barriers),
@@ -768,15 +790,26 @@ class ZemismartHub:
                 command = self._queue[0]
                 if command.coalesce_deadline is None:
                     return self._queue.popleft()
+                # Only siblings that may actually merge below extend the wait:
+                # a sibling behind an overlapping intervening command is
+                # barred from merging (see _coalesce_queued_movements), so its
+                # deadline must not stretch the head's window either.
+                blocked: set[tuple[str, int]] = set()
                 for queued in self._queue:
-                    if self._coalesce_eligible(queued, command) and any(
-                        not future.done() for future in queued.futures
+                    if queued is command:
+                        continue
+                    if (
+                        self._coalesce_eligible(queued, command)
+                        and not self._blocks(blocked, queued)
+                        and any(not future.done() for future in queued.futures)
                     ):
                         assert queued.coalesce_deadline is not None
                         command.coalesce_deadline = min(
                             command.coalesce_deadline,
                             queued.coalesce_deadline,
                         )
+                    else:
+                        self._block(blocked, queued)
                 remaining = command.coalesce_deadline - asyncio.get_running_loop().time()
                 if remaining > 0:
                     with suppress(TimeoutError):
@@ -797,6 +830,25 @@ class ZemismartHub:
             and queued.stop_after_ms == command.stop_after_ms
         )
 
+    @staticmethod
+    def _blocks(blocked: set[tuple[str, int]], queued: _QueuedCommand) -> bool:
+        """Return whether earlier retained commands bar merging this sibling.
+
+        Merging moves the sibling's effect to the head of the queue; if any
+        command positionally between the head and the sibling addresses one
+        of the sibling's channels, the merge would reverse the per-channel
+        command order on air (the older intervening command would win).
+        """
+        return queued.remote is not None and any(
+            (queued.remote.key, channel) in blocked for channel in queued.channels
+        )
+
+    @staticmethod
+    def _block(blocked: set[tuple[str, int]], queued: _QueuedCommand) -> None:
+        """Record a retained command's channels as merge barriers."""
+        if queued.remote is not None:
+            blocked.update((queued.remote.key, channel) for channel in queued.channels)
+
     def _coalesce_queued_movements(self, command: _QueuedCommand) -> None:
         """Absorb eligible siblings that arrived within the first command's window."""
         if (
@@ -809,18 +861,24 @@ class ZemismartHub:
         channels = set(command.coalesce_config.channels)
         repeats = command.coalesce_config.repeats
         retained: deque[_QueuedCommand] = deque()
+        blocked: set[tuple[str, int]] = set()
         merged = False
         while self._queue:
             queued = self._queue.popleft()
             if all(future.done() for future in queued.futures):
                 continue
-            if self._coalesce_eligible(queued, command) and queued.coalesce_config is not None:
+            if (
+                self._coalesce_eligible(queued, command)
+                and queued.coalesce_config is not None
+                and not self._blocks(blocked, queued)
+            ):
                 channels.update(queued.coalesce_config.channels)
                 repeats = max(repeats, queued.coalesce_config.repeats)
                 command.futures.extend(queued.futures)
                 merged = True
             else:
                 retained.append(queued)
+                self._block(blocked, queued)
         self._queue = retained
         if not merged:
             return
@@ -896,13 +954,51 @@ class ZemismartHub:
             msg = f"bridge RF start timed out for command {command_id}"
             raise CommandStartedTimeoutError(msg) from exc
 
+    def _resolve_with_affinity(self, command: _QueuedCommand) -> BridgeInfo:
+        """Route consecutive commands for one remote through one bridge.
+
+        Scheduler and armed fail-safe STOP state live in the selected
+        bridge's RAM. If availability or preference changes re-routed a
+        follow-up STOP or movement to a different bridge, the first bridge
+        would keep transmitting its stale command (never displaced). Affinity
+        holds while the previous bridge could still hold active state for the
+        remote, and breaks immediately if that bridge goes offline.
+        """
+        assert command.area_id is not None
+        now = asyncio.get_running_loop().time()
+        key = command.remote.key if command.remote is not None else None
+        if key is not None:
+            held = self._bridge_affinity.get(key)
+            if held is not None and held[1] > now:
+                with suppress(NoOnlineBridgeError):
+                    bridge = self.registry.online_bridge(held[0])
+                    self._remember_affinity(key, bridge.bridge_id, command, now)
+                    return bridge
+        bridge = self.registry.resolve(command.area_id)
+        if key is not None:
+            self._remember_affinity(key, bridge.bridge_id, command, now)
+        return bridge
+
+    def _remember_affinity(
+        self,
+        key: str,
+        bridge_id: str,
+        command: _QueuedCommand,
+        now: float,
+    ) -> None:
+        """Hold affinity for as long as this command can occupy the bridge."""
+        hold = max(
+            _BRIDGE_AFFINITY_SECONDS,
+            (command.stop_after_ms or 0) / 1_000 + 60.0,
+        )
+        self._bridge_affinity[key] = (bridge_id, now + hold)
+
     async def _async_execute(self, command: _QueuedCommand) -> CommandAck:
         """Resolve, publish, then await admission and first RF dispatch."""
         if command.bridge_id is not None:
             bridge = self.registry.online_bridge(command.bridge_id)
         else:
-            assert command.area_id is not None
-            bridge = self.registry.resolve(command.area_id)
+            bridge = self._resolve_with_affinity(command)
         command_id = self._new_command_id()
         body = dict(command.body)
         body["command_id"] = command_id
@@ -1051,7 +1147,12 @@ class ZemismartHub:
             )
         )
         if result == "superseded":
-            raise AssertionError("raw commands cannot be superseded")
+            # Another controller sharing the bridge displaced this frame in
+            # its pre-start window (bridge latest-command-wins). Raw commands
+            # have no cover model to reconcile, so surface it as a plain
+            # command failure the service layer can report.
+            msg = "raw command was displaced by a newer overlapping command"
+            raise CommandRejectedError(msg)
         return result
 
     def close(self) -> None:
@@ -1062,8 +1163,15 @@ class ZemismartHub:
         for task in self._fast_stops:
             task.cancel()
         self._fast_stops.clear()
+        if self._inflight is not None:
+            for future in self._inflight.futures:
+                future.cancel()
+        for command in self._fast_inflight:
+            for future in command.futures:
+                future.cancel()
         self._fast_inflight.clear()
         self._recent_displaced.clear()
+        self._bridge_affinity.clear()
         for command in self._queue:
             for future in command.futures:
                 future.cancel()

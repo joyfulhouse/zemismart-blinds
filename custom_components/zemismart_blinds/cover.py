@@ -207,6 +207,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return
 
         self._last_bridge = bridge
+        timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
+        if timed and self._hub.registry.is_known_offline(bridge):
+            # The restored motion depends on a bridge-armed fail-safe STOP,
+            # and that bridge has explicitly reported itself offline: its
+            # RAM-only scheduler state (and the STOP) may be gone, whether
+            # the deadline has passed or not. A bridge merely not discovered
+            # yet is NOT treated as offline — later drops are caught by
+            # _on_bridge_change via the restored _motion_timed flag.
+            self._mark_unknown()
+            return
         now = WALL_CLOCK()
         if now >= deadline:
             self._position = target
@@ -235,14 +245,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_duration = deadline - self._motion_started
         self._motion_bridge = bridge
         self._motion_command_id = command_id
-        self._motion_timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
-        if self._motion_timed and self._hub.registry.bridges and not self._bridge_online(bridge):
-            # The restored motion depends on a bridge-armed fail-safe STOP,
-            # and that bridge is already known to be offline: its RAM-only
-            # scheduler state (and the STOP) may be gone. Later drops are
-            # caught by _on_bridge_change via the restored _motion_timed.
-            self._mark_unknown()
-            return
+        self._motion_timed = timed
         self._sync_position(now)
         self._create_motion_task("recovered travel")
 
@@ -275,23 +278,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._interrupt_motion(WALL_CLOCK())
             self.async_write_ha_state()
 
-    def _bridge_online(self, bridge_id: str) -> bool:
-        """Return whether the named bridge is currently registered and online."""
-        return any(
-            bridge.online for bridge in self._hub.registry.bridges if bridge.bridge_id == bridge_id
-        )
-
     def _on_bridge_change(self) -> None:
         """Re-evaluate availability and timed-motion safety on bridge changes."""
         if (
             self._direction != 0
             and self._motion_timed
             and self._motion_bridge is not None
-            and not self._bridge_online(self._motion_bridge)
+            and self._hub.registry.is_known_offline(self._motion_bridge)
         ):
-            # The bridge holding this motion's armed fail-safe STOP dropped
-            # offline; its scheduler state is RAM-only, so the STOP may be
-            # lost and the motor may run to its limit. Only unknown is honest.
+            # The bridge holding this motion's armed fail-safe STOP has
+            # explicitly reported offline; its scheduler state is RAM-only,
+            # so the STOP may be lost and the motor may run to its limit.
+            # Only unknown is honest. (A bridge merely not discovered yet is
+            # not offline — during startup, unrelated bridges announce first.)
             self._mark_unknown()
         self.async_write_ha_state()
 
@@ -361,12 +360,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._degraded = True
 
     def _mark_unknown_and_notify_members(self) -> None:
-        """Invalidate this target and every registered group member."""
+        """Invalidate this target, its members, and overlapping aggregates.
+
+        Used on ambiguous acknowledgement/start timeouts: the frame MAY have
+        reached RF, so every cover whose channels it addresses — direct
+        members and any overlapping group whose aggregate could now be stale
+        — loses its estimate.
+        """
         self._mark_unknown()
         self.async_write_ha_state()
         for member in self._member_covers():
             member._mark_unknown()
             member.async_write_ha_state()
+        self._reconcile_overlaps(moving=True)
 
     def _member_covers(self) -> tuple[ZemismartCover, ...]:
         """Return registered single-channel members addressed by this group."""
@@ -473,24 +479,35 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         travels the same fraction of full travel from wherever it physically
         is — not from the group's aggregate estimate.
         """
+        full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
+        # Compute from the member's estimate AT RF start: if this member was
+        # itself still moving, its stored position is up to one update
+        # interval stale, and _start_motion will sync the model origin to
+        # ack.started_at — the target must come from the same instant.
+        origin = self._estimated_position(ack.started_at)
         if group_target in (0.0, 100.0):
             # A full travel runs each motor to its own limit switch: model it
             # over this member's OWN calibration, not the group's duration (a
             # slower member would otherwise report done while moving, and a
             # faster one would report moving long after its limit switch).
             target = group_target
-            member_travel = self._config.travel_up if direction > 0 else self._config.travel_down
-            duration = member_travel + FULL_TRAVEL_MARGIN_SECONDS
-        elif self._position is None:
+            duration = full_travel + FULL_TRAVEL_MARGIN_SECONDS
+        elif origin is None:
             # The member moved with the group but its origin is unknown; only
             # an unknown estimate is honest here.
             self._mark_unknown()
             self.async_write_ha_state()
             return
         else:
-            full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
             delta = duration / full_travel * 100.0 * (1 if direction > 0 else -1)
-            target = max(0.0, min(100.0, self._position + delta))
+            target = max(0.0, min(100.0, origin + delta))
+            # A clamped target means this member reaches its own limit switch
+            # long before the group's frame duration elapses: model only the
+            # physical distance (plus the usual endpoint margin), so the
+            # member does not report moving after it stopped.
+            duration = abs(target - origin) / 100.0 * full_travel
+            if target in (0.0, 100.0):
+                duration += FULL_TRAVEL_MARGIN_SECONDS
         self._start_motion(
             ack,
             direction=direction,

@@ -997,3 +997,112 @@ async def test_overlapping_fast_stop_chains_behind_fast_stop_not_inflight() -> N
 
     accept_and_start(hub, "bridge-a", published[0])
     await blocker
+
+
+@pytest.mark.asyncio
+async def test_coalescing_never_merges_across_an_overlapping_command() -> None:
+    """A sibling behind an overlapping intervening command keeps its order.
+
+    UP ch1, DOWN group {2,3}, UP ch2 within one window: merging UP ch2 into
+    the leading UP would emit UP {1,2} BEFORE the older DOWN {2,3}, letting
+    the older DOWN win channel 2 on air. The merge is barred and the three
+    commands publish in arrival order.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    up_one = config_with_window(replace(blind_config(), channels=(1,)), 20)
+    down_group = replace(blind_config(), channels=(2, 3))
+    up_two = config_with_window(replace(blind_config(), channels=(2,)), 20)
+    first = asyncio.create_task(hub.async_transmit(up_one, "UP"))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(hub.async_transmit(down_group, "DOWN"))
+    await asyncio.sleep(0)
+    third = asyncio.create_task(hub.async_transmit(up_two, "UP"))
+    await asyncio.gather(first, second, third)
+
+    assert [body["target"] for body in published] == [
+        "a1b2c3:42:1",
+        "a1b2c3:42:2,3",
+        "a1b2c3:42:2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_followup_commands_stick_to_the_motion_bridge() -> None:
+    """Consecutive commands for one remote route through one bridge.
+
+    A timed movement starts through the only online bridge; a same-area
+    bridge (which resolve() would now prefer) then announces. The follow-up
+    STOP must go to the original bridge -- it holds the scheduler state and
+    the armed fail-safe STOP -- and affinity breaks only when that bridge
+    reports offline.
+    """
+    registry = BridgeRegistry()
+    registry.update_info("bridge-b", {"area": "somewhere_else"})
+    registry.update_availability("bridge-b", "online")
+    topics: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        topics.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    await hub.async_transmit(blind_config(), "UP", stop_after_ms=5000)
+    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_availability("bridge-a", "online")
+    await hub.async_transmit(blind_config(), "STOP")
+
+    assert topics == ["rf433/bridge-b/tx", "rf433/bridge-b/tx"]
+
+    registry.update_availability("bridge-b", "offline")
+    await hub.async_transmit(blind_config(), "STOP")
+    assert topics[-1] == "rf433/bridge-a/tx"
+
+
+@pytest.mark.asyncio
+async def test_displaced_raw_command_raises_a_command_error() -> None:
+    """A raw frame displaced pre-start surfaces as a command failure.
+
+    A second controller sharing the bridge can displace the raw frame in its
+    pre-start window; the service caller gets a reportable error, never an
+    AssertionError.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published_event = asyncio.Event()
+    ids = iter(("raw-1",))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published_event.set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    task = asyncio.create_task(hub.async_send_raw("bridge-a", frame, 3))
+    await published_event.wait()
+    assert hub.handle_status("bridge-a", {"status": "displaced", "command_id": "raw-1"})
+
+    with pytest.raises(CommandRejectedError, match="displaced"):
+        await task
+
+
+def test_registry_distinguishes_undiscovered_from_known_offline() -> None:
+    """Only an explicitly reported offline availability counts as offline."""
+    registry = BridgeRegistry()
+    assert not registry.is_known_offline("bridge-a")
+    registry.update_info("bridge-a", {"area": "living_room"})
+    assert not registry.is_known_offline("bridge-a")  # info only, no availability
+    registry.update_availability("bridge-a", "offline")
+    assert registry.is_known_offline("bridge-a")
+    registry.update_availability("bridge-a", "online")
+    assert not registry.is_known_offline("bridge-a")

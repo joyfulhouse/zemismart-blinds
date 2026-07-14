@@ -858,3 +858,125 @@ async def test_restored_timed_motion_with_offline_bridge_becomes_unknown(
         assert restored.extra_state_attributes["degraded_bridge"] is True
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_restored_timed_motion_with_undiscovered_bridge_keeps_tracking(
+    hass: HomeAssistant,
+) -> None:
+    """A motion bridge that merely has not announced yet is not offline.
+
+    During startup, retained availability arrives in arbitrary order; only an
+    EXPLICIT offline report for the motion's own bridge invalidates restored
+    tracking.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    partial_registry = BridgeRegistry()
+    partial_registry.update_info("bridge-z", {"area": "other_room"})
+    partial_registry.update_availability("bridge-z", "online")
+    restored = await attach_cover(
+        hass,
+        ZemismartHub(partial_registry, quiet_publish),
+        config=cover_config(travel=10.0),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert restored.is_opening
+        assert restored.current_cover_position is not None
+    finally:
+        await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_clamped_member_models_only_its_physical_distance(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member clamped at an endpoint stops modeling at its limit switch.
+
+    Member at 90 in a group moving +40%: the member physically arrives at 100
+    after 10% of its own travel, not after the group's full frame duration.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(travel=1.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 20.0
+    member._position = 90.0
+    try:
+        await group.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.02)
+
+        assert member._motion_target == 100.0
+        assert member._motion_duration == pytest.approx(0.11, abs=0.001)
+        assert group._motion_duration == pytest.approx(0.4, abs=0.01)
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_single_channel_timeout_invalidates_containing_group(
+    hass: HomeAssistant,
+) -> None:
+    """An ambiguous single-channel timeout may have moved a group member.
+
+    The frame MAY have reached RF, so a containing group's aggregate estimate
+    can no longer be trusted either.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish, ack_timeout=0.001)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    single = await attach_cover(
+        hass,
+        hub,
+        config=member_config(),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 40.0
+    single._position = 40.0
+    try:
+        with pytest.raises(HomeAssistantError, match="acknowledgement"):
+            await single.async_open_cover()
+
+        assert single.current_cover_position is None
+        assert group.current_cover_position is None
+        assert group.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await group.async_will_remove_from_hass()
+        await single.async_will_remove_from_hass()

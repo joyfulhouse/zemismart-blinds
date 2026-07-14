@@ -180,6 +180,11 @@ logger:
 - **No RX/state sync yet**: presses on the physical remote are not observed (stock ESPHome cannot
   surface Portisch B1 captures as events). Planned as Phase 2 — see [PROTOCOL.md](PROTOCOL.md).
 - **Assumed position**: there is no motor feedback; position is modeled from travel time.
+- **Bridge reboot during an HA restart**: a bridge's armed fail-safe STOP lives in its RAM. If the
+  bridge power-cycles entirely within Home Assistant's own downtime (offline and back online before
+  HA restores state), a restored in-flight partial move cannot detect that its STOP was lost and
+  models to its target. Bridges that are offline at restore time, or drop offline afterwards, are
+  detected and the cover becomes `unknown`.
 - **Calibration needs one capture** per new physical remote (a one-time step per remote).
 
 ## Development
