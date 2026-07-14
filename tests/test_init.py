@@ -455,3 +455,61 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
         )
 
     assert published == []
+
+
+@pytest.mark.asyncio
+async def test_flow_rejects_same_remote_channel_overlap_across_areas(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One physical motor's channels must stay inside one area.
+
+    Splitting overlapping channel sets across areas would let two bridges
+    hold un-displaceable state for one motor (an armed STOP on bridge A
+    later halting a movement commanded through bridge B).
+    """
+    from custom_components.zemismart_blinds.config_flow import _cross_area_overlap
+    from custom_components.zemismart_blinds.models import BlindConfig
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        del qos
+        return lambda: None
+
+    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
+        return
+
+    async def assign_area(
+        _hass: HomeAssistant,
+        _entry: ConfigEntry[EntryRuntime],
+        _config: Any,
+    ) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
+    entry = config_entry("one")  # channels [1], living_room
+    await async_setup_entry(hass, entry)
+    hass.config_entries._entries[entry.entry_id] = entry
+
+    values = dict(entry.data)
+    values["name"] = "Bedroom group"
+    values["channels"] = [1, 2]
+    values["area_id"] = "bedroom"
+    overlapping = BlindConfig.from_mapping(values)
+    assert _cross_area_overlap(hass, overlapping, None)
+
+    # Same area: allowed. Different area without shared channels: allowed.
+    values["area_id"] = "living_room"
+    assert not _cross_area_overlap(hass, BlindConfig.from_mapping(values), None)
+    values["area_id"] = "bedroom"
+    values["channels"] = [2, 3]
+    assert not _cross_area_overlap(hass, BlindConfig.from_mapping(values), None)
+    # Editing the overlapping entry itself is exempt.
+    values["channels"] = [1, 2]
+    assert not _cross_area_overlap(hass, BlindConfig.from_mapping(values), entry.entry_id)

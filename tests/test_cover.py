@@ -1158,3 +1158,106 @@ async def test_expired_restore_anchor_is_confirmed_by_late_online_availability(
         assert restored.current_cover_position == 80
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_set_position_aborts_when_its_preparatory_stop_is_superseded(
+    hass: HomeAssistant,
+) -> None:
+    """A superseded pre-move STOP means a newer command owns the channels.
+
+    Continuing would publish the OLDER set_position movement over the newer
+    overlapping command; the multi-frame operation must abort instead.
+    """
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        bridge_id = topic.split("/")[1]
+        if len(published) == 2:
+            # The preparatory STOP is displaced by a newer overlapping
+            # command from elsewhere (bridge latest-command-wins).
+            assert hub.handle_status(
+                bridge_id, {"status": "displaced", "command_id": body["command_id"]}
+            )
+        else:
+            acknowledge(hub, bridge_id, body)
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 80})
+        assert entity.is_opening
+
+        await entity.async_set_cover_position(**{ATTR_POSITION: 20})
+
+        # Only the first movement and the superseded STOP were published --
+        # no third (DOWN) frame carrying the stale older intent.
+        assert len(published) == 2
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_partial_move_keeps_the_unverified_anchor_revocable(
+    hass: HomeAssistant,
+) -> None:
+    """A relative move still derives from the questioned restore anchor.
+
+    Only an absolute endpoint travel settles the anchor; after a partial
+    move, a late offline report from the anchor bridge must still invalidate
+    the estimate chain built on it.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    restored_hub_publishes: list[str] = []
+    empty_registry = BridgeRegistry()
+    restored_hub: ZemismartHub
+
+    async def restored_publish(topic: str, payload: str) -> None:
+        restored_hub_publishes.append(topic)
+        acknowledge(restored_hub, topic.split("/")[1], json.loads(payload))
+
+    restored_hub = ZemismartHub(empty_registry, restored_publish)
+    restored = await attach_cover(
+        hass,
+        restored_hub,
+        config=cover_config(travel=0.02),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert restored.current_cover_position == 80
+        # A second bridge comes online and serves a PARTIAL move.
+        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_availability("bridge-b", "online")
+        restored_hub.notify_bridge_change()
+        await restored.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.05)
+        assert restored.current_cover_position == 60
+
+        # The anchor bridge's late offline report still revokes the chain.
+        empty_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+        assert restored.current_cover_position is None
+    finally:
+        await restored.async_will_remove_from_hass()

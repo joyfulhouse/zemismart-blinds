@@ -174,6 +174,13 @@ def _known_remote_pairs(hass: HomeAssistant) -> set[tuple[int, int]]:
     }
 
 
+def _whole_repeats(value: object) -> int:
+    """Reject fractional service repeats instead of truncating them."""
+    from .models import whole_number
+
+    return whole_number(value, ATTR_REPEATS)
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register domain services for the lifetime of the integration."""
     del config
@@ -218,7 +225,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Required(ATTR_BRIDGE): str,
                 vol.Required(ATTR_RAW): str,
                 vol.Optional(ATTR_REPEATS, default=DEFAULT_REPEATS): vol.All(
-                    vol.Coerce(int),
+                    _whole_repeats,
                     vol.Range(min=1, max=20),
                 ),
             }

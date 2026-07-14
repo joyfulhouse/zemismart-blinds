@@ -40,33 +40,13 @@ from .const import (
     MANUAL_REMOTE,
     VIRTUAL_REMOTE,
 )
-from .models import BlindConfig, RemoteIdentity, parse_channels, parse_hex
+from .models import BlindConfig, RemoteIdentity, parse_channels, parse_hex, whole_number
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from homeassistant.config_entries import ConfigFlowResult
     from homeassistant.core import HomeAssistant
-
-
-def _whole_number(value: object, field: str) -> int:
-    """Reject fractional selector values instead of silently truncating them.
-
-    Home Assistant's number selector does not enforce its configured step, so
-    a backend-valid 1.9 would otherwise be stored as 1.
-    """
-    if isinstance(value, bool) or not isinstance(value, int | float | str):
-        msg = f"{field} must be a whole number"
-        raise ValueError(msg)
-    try:
-        number = float(value)
-    except ValueError as exc:
-        msg = f"{field} must be a whole number"
-        raise ValueError(msg) from exc
-    if not number.is_integer():
-        msg = f"{field} must be a whole number"
-        raise ValueError(msg)
-    return int(number)
 
 
 def _float_value(value: object, fallback: float) -> float:
@@ -316,8 +296,8 @@ def _config_from_input(
         travel_up=float(user_input[CONF_TRAVEL_UP]),
         travel_down=float(user_input[CONF_TRAVEL_DOWN]),
         area_id=str(user_input[CONF_AREA_ID]),
-        repeats=_whole_number(user_input[CONF_REPEATS], CONF_REPEATS),
-        coalesce_window_ms=_whole_number(
+        repeats=whole_number(user_input[CONF_REPEATS], CONF_REPEATS),
+        coalesce_window_ms=whole_number(
             user_input.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
             CONF_COALESCE_WINDOW_MS,
         ),
@@ -333,6 +313,36 @@ def _suggested_for(config: BlindConfig) -> dict[str, object]:
     values[CONF_CALIBRATION_BASE] = values[CONF_BASE_UP]
     values[CONF_CALIBRATION_FRAME] = ""
     return values
+
+
+def _cross_area_overlap(
+    hass: HomeAssistant,
+    config: BlindConfig,
+    skip_entry_id: str | None,
+) -> bool:
+    """Detect a same-remote channel overlap configured in a DIFFERENT area.
+
+    Bridge routing is partitioned by area. Overlapping channel sets split
+    across areas would let two bridges hold state for one physical motor
+    that neither can displace (an armed fail-safe STOP on bridge A would
+    later halt a movement commanded through bridge B without any status).
+    A physical blind lives in one room; its groups belong to that room too.
+    """
+    channels = set(config.channels)
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.entry_id == skip_entry_id:
+            continue
+        try:
+            other = BlindConfig.from_mapping(effective_values(entry))
+        except TypeError, ValueError:
+            continue
+        if (
+            other.remote.key == config.remote.key
+            and other.area_id != config.area_id
+            and channels & set(other.channels)
+        ):
+            return True
+    return False
 
 
 def _unique_id(config: BlindConfig) -> str:
@@ -418,8 +428,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 await self.async_set_unique_id(_unique_id(config))
                 self._abort_if_unique_id_configured()
-                _propagate_calibration(self.hass, config, None)
-                return self.async_create_entry(title=config.name, data=config.as_dict())
+                if _cross_area_overlap(self.hass, config, None):
+                    errors["base"] = "cross_area_overlap"
+                else:
+                    _propagate_calibration(self.hass, config, None)
+                    return self.async_create_entry(title=config.name, data=config.as_dict())
 
         return self.async_show_form(
             step_id="user",
@@ -460,6 +473,8 @@ class ZemismartBlindsOptionsFlow(config_entries.OptionsFlowWithReload):
                     for entry in entries
                 ):
                     errors["base"] = "already_configured"
+                elif _cross_area_overlap(self.hass, config, self.config_entry.entry_id):
+                    errors["base"] = "cross_area_overlap"
                 else:
                     self.hass.config_entries.async_update_entry(
                         self.config_entry,

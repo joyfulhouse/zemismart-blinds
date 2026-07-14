@@ -23,6 +23,7 @@ from custom_components.zemismart_blinds.models import (
     NoOnlineBridgeError,
     RemoteIdentity,
     ZemismartHub,
+    parse_channels,
 )
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
@@ -1231,3 +1232,143 @@ def test_as_dict_always_emits_the_trailer_marker() -> None:
     restored = BlindConfig.from_mapping(values)
     assert restored.remote.bases is not None
     assert restored.remote.bases.trailer is None
+
+
+@pytest.mark.asyncio
+async def test_stop_publishes_while_overlapping_movement_awaits_ack() -> None:
+    """A STOP behind an already-published overlapping movement goes out now.
+
+    Only PUBLICATION order must match request order. Waiting for the
+    movement's full acknowledgement lifecycle would park the safety STOP for
+    up to the 30-second started timeout while the blind keeps moving.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_events = [asyncio.Event() for _ in range(2)]
+    ids = iter(("move-1", "stop-1"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        publish_events[len(published) - 1].set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    move = asyncio.create_task(hub.async_transmit(blind_config(), "UP"))
+    await publish_events[0].wait()
+
+    stop = asyncio.create_task(hub.async_transmit(replace(blind_config(), channels=(1,)), "STOP"))
+    # The movement is published but entirely unacknowledged; the STOP must
+    # still reach the broker (in order, after the movement).
+    await publish_events[1].wait()
+    assert [body["command_id"] for body in published] == ["move-1", "stop-1"]
+
+    accept_and_start(hub, "bridge-a", published[0])
+    accept_and_start(hub, "bridge-a", published[1])
+    await move
+    await stop
+
+
+@pytest.mark.asyncio
+async def test_movement_publishes_after_an_earlier_unpublished_fast_stop() -> None:
+    """Per-channel request order holds across the fast lane and the worker.
+
+    STOP ch1 (publish withheld), STOP {1,2} chained behind it, then UP ch2:
+    the movement must not reach the broker before the older group STOP, or
+    the STOP would displace the newest intent on the bridge.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    all_published = asyncio.Event()
+    release_first = asyncio.Event()
+    ids = iter(("stop-1", "stop-12", "up-2"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if body["command_id"] == "stop-1":
+            await release_first.wait()
+        published.append(body)
+        if len(published) == 3:
+            all_published.set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    stop_one = asyncio.create_task(
+        hub.async_transmit(replace(blind_config(), channels=(1,)), "STOP")
+    )
+    await asyncio.sleep(0)
+    stop_group = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await asyncio.sleep(0)
+    up_two = asyncio.create_task(hub.async_transmit(replace(blind_config(), channels=(2,)), "UP"))
+    await asyncio.sleep(0)
+    assert published == []
+
+    release_first.set()
+    await all_published.wait()
+    assert [body["command_id"] for body in published] == ["stop-1", "stop-12", "up-2"]
+    for body in published:
+        accept_and_start(hub, "bridge-a", body)
+    await asyncio.gather(stop_one, stop_group, up_two)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_chained_stop_is_never_transmitted() -> None:
+    """A chained STOP whose caller cancelled must not still reach RF.
+
+    Without the post-barrier recheck, the resolved group STOP would publish
+    anyway and unexpectedly halt the second channel.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    release_first = asyncio.Event()
+    ids = iter(("stop-1", "stop-12"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if body["command_id"] == "stop-1":
+            await release_first.wait()
+        published.append(body)
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    stop_one = asyncio.create_task(
+        hub.async_transmit(replace(blind_config(), channels=(1,)), "STOP")
+    )
+    await asyncio.sleep(0)
+    stop_group = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await asyncio.sleep(0)
+
+    stop_group.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_group
+    release_first.set()
+    await asyncio.sleep(0.01)
+
+    assert [body["command_id"] for body in published] == ["stop-1"]
+    accept_and_start(hub, "bridge-a", published[0])
+    await stop_one
+
+
+def test_empty_availability_payload_is_not_an_offline_report() -> None:
+    """A retained-topic deletion clears knowledge instead of reporting offline."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    registry.update_availability("bridge-a", "")
+    assert not registry.is_known_offline("bridge-a")
+    registry.update_availability("bridge-a", "offline")
+    assert registry.is_known_offline("bridge-a")
+
+
+def test_coalesce_window_is_bounded() -> None:
+    """A hand-edited giant window cannot delay every command."""
+    with pytest.raises(ValueError, match="coalesce_window_ms"):
+        config_with_window(blind_config(), 2001)
+
+
+def test_parse_channels_rejects_fractional_values() -> None:
+    """Stored fractional channels are rejected, never silently truncated."""
+    with pytest.raises(ValueError, match="whole number"):
+        parse_channels([2.9])

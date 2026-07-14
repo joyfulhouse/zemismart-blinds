@@ -466,8 +466,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Commit a fresh local model from correlated first RF dispatch."""
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
-        # Fresh RF supersedes any unverified restore-time anchor question.
-        self._unverified_anchor_bridge = None
+        if target in (0.0, 100.0):
+            # Only an ABSOLUTE re-anchor (a travel that ends on the motor's
+            # own limit switch) settles an unverified restore-time anchor. A
+            # relative partial move still derives from the questioned
+            # position, so the anchor stays revocable by a late offline
+            # report from its bridge.
+            self._unverified_anchor_bridge = None
         self._motion_start_position = self._position
         self._motion_target = target
         self._motion_duration = duration
@@ -638,11 +643,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         async with self._command_lock:
             await self._async_move_full("DOWN", -1, 0.0)
 
-    async def _async_stop(self) -> None:
-        """Stop and freeze tracking only when STOP first dispatches."""
+    async def _async_stop(self) -> bool:
+        """Stop and freeze tracking only when STOP first dispatches.
+
+        Returns False when the STOP was superseded by a newer overlapping
+        command: the caller's multi-frame operation must abort rather than
+        publish an older intent over the newer command.
+        """
         ack = await self._async_transmit("STOP")
         if ack is None:
-            return
+            return False
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
         for member in self._member_covers():
@@ -653,6 +663,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             member.async_write_ha_state()
         self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
+        return True
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Queue a priority STOP and commit interruption after RF dispatch."""
@@ -675,11 +686,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             await self._async_move_full("UP", 1, 100.0)
             return
 
-        if self._direction != 0:
-            # Stop first so the travel duration is computed from a settled
-            # estimate: computing it against a still-moving blind would bake
-            # the queue/transit delay into the physical stopping point.
-            await self._async_stop()
+        # Stop first so the travel duration is computed from a settled
+        # estimate: computing it against a still-moving blind would bake the
+        # queue/transit delay into the physical stopping point. A superseded
+        # STOP means a newer overlapping command owns the channels now —
+        # abort instead of publishing an older intent over it.
+        if self._direction != 0 and not await self._async_stop():
+            return
         current = self._estimated_position(WALL_CLOCK())
         if current is None:
             msg = "position is unknown; run a full open or close calibration first"

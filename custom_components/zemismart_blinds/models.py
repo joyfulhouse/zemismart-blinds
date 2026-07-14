@@ -55,6 +55,8 @@ MAX_REPEATS: Final = 20
 # Firmware caps stop_after_ms at 3,600,000 (one hour); a travel calibration
 # above this could produce partial moves the bridge rejects.
 MAX_TRAVEL_SECONDS: Final = 3600
+# Matches the config-flow selector's maximum.
+MAX_COALESCE_WINDOW_MS: Final = 2000
 DEFAULT_ACK_TIMEOUT_SECONDS: Final = 2.0
 DEFAULT_STARTED_TIMEOUT_SECONDS: Final = 30.0
 _DISPLACED_MEMORY_SECONDS: Final = 60.0
@@ -127,11 +129,32 @@ def parse_channels(value: object) -> tuple[int, ...]:
             msg = "channels must be comma-separated integers"
             raise ValueError(msg) from exc
     elif isinstance(value, Iterable):
-        channels = tuple(int(channel) for channel in value)
+        channels = tuple(whole_number(channel, "channels") for channel in value)
     else:
         msg = "channels must be text or an iterable of integers"
         raise ValueError(msg)
     return tuple(sorted(validate_channels(channels)))
+
+
+def whole_number(value: object, field: str) -> int:
+    """Reject fractional numeric values instead of silently truncating them.
+
+    Shared by the config flow, stored-channel parsing, and the send_raw
+    service: HA selectors and service schemas do not enforce integrality, so
+    a backend-valid 1.9 would otherwise be stored or transmitted as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg)
+    try:
+        number = float(value)
+    except ValueError as exc:
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg) from exc
+    if not number.is_integer():
+        msg = f"{field} must be a whole number"
+        raise ValueError(msg)
+    return int(number)
 
 
 def _required(mapping: Mapping[str, object], key: str) -> object:
@@ -247,9 +270,11 @@ class BlindConfig:
         if (
             isinstance(self.coalesce_window_ms, bool)
             or not isinstance(self.coalesce_window_ms, int)
-            or self.coalesce_window_ms < 0
+            or not 0 <= self.coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
         ):
-            msg = "coalesce_window_ms must be a non-negative integer"
+            # The upper bound matches the config-flow selector: a hand-edited
+            # giant window would silently delay every movement command.
+            msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
             raise ValueError(msg)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "area_id", area_id)
@@ -378,7 +403,11 @@ class BridgeRegistry:
         if not bridge_id:
             return
         current = self._bridges.get(bridge_id, BridgeInfo(bridge_id))
-        online = payload.strip().lower() == "online"
+        normalized = payload.strip().lower()
+        # An empty payload is a retained-topic deletion, not an explicit
+        # offline report: all availability knowledge for the bridge is gone.
+        availability_seen = bool(normalized)
+        online = normalized == "online"
         if online != current.online:
             _LOGGER.debug("Bridge %s is now %s", bridge_id, "online" if online else "offline")
         self._bridges[bridge_id] = BridgeInfo(
@@ -386,7 +415,7 @@ class BridgeRegistry:
             area_id=current.area_id,
             online=online,
             is_default=current.is_default,
-            availability_seen=True,
+            availability_seen=availability_seen,
         )
 
     def update_info(self, bridge_id: str, payload: Mapping[str, object]) -> None:
@@ -498,7 +527,12 @@ class _QueuedCommand:
     enqueued_at: float
     coalesce_deadline: float | None
     futures: list[asyncio.Future[CommandResult]]
-    fast_done: asyncio.Event | None = None
+    # Set the moment this command's MQTT publish completes (or the command
+    # dies unpublished). Later-requested overlapping commands wait on it —
+    # only PUBLICATION order must match request order; waiting on full
+    # acknowledgement lifecycles would park safety STOPs behind slow acks.
+    published: asyncio.Event | None = None
+    publish_barriers: list[asyncio.Event] = field(default_factory=list)
 
     @property
     def coalesce_key(self) -> tuple[str, Button, str] | None:
@@ -691,11 +725,30 @@ class ZemismartHub:
                 name="Zemismart global command worker",
             )
 
+    def _overlap_publish_barriers(self, command: _QueuedCommand) -> list[asyncio.Event]:
+        """Snapshot unpublished earlier overlapping commands' publish events."""
+        barriers = [
+            running.published
+            for running in self._fast_inflight
+            if running.overlaps(command)
+            and running.published is not None
+            and not running.published.is_set()
+        ]
+        inflight = self._inflight
+        if (
+            inflight is not None
+            and inflight.overlaps(command)
+            and inflight.published is not None
+            and not inflight.published.is_set()
+        ):
+            barriers.append(inflight.published)
+        return barriers
+
     async def _async_enqueue(self, command: _QueuedCommand) -> CommandResult:
         """Queue a command, giving STOP front priority and overlap supersession."""
         future = command.futures[0]
         fast_lane = False
-        fast_barriers: list[asyncio.Event] = []
+        command.published = asyncio.Event()
         async with self._queue_ready:
             if command.is_stop:
                 # A STOP supersedes every queued movement whose channels
@@ -712,15 +765,13 @@ class ZemismartHub:
                     else:
                         retained.append(queued)
                 self._queue = retained
-                # Safety fast lane: unless the worker's in-flight command
-                # addresses the same channels (publishing order must be
-                # preserved), a STOP skips the global one-at-a-time lane
-                # entirely so it cannot sit behind another cover's slow
-                # acknowledgement. When it overlaps an already-running
-                # fast-lane STOP it stays in the fast lane but chains behind
-                # that STOP's completion — dropping to the global queue would
-                # park a safety STOP behind an unrelated in-flight command.
-                inflight = self._inflight
+                # Safety fast lane: a STOP skips the global one-at-a-time
+                # lane so it can never sit behind another command's slow
+                # acknowledgement. Publication ORDER against earlier
+                # overlapping commands (the worker's in-flight command or a
+                # running fast-lane STOP) is preserved by waiting on their
+                # publish events only — never their full lifecycles.
+                #
                 # A queued live overlapping command at this point is a raw
                 # debug frame (overlapping movements were superseded above).
                 # It was requested BEFORE this STOP: publishing the STOP
@@ -737,18 +788,16 @@ class ZemismartHub:
                     # Behind the queued overlap (and therefore also behind
                     # any overlapping in-flight command).
                     self._queue.insert(last_overlap + 1, command)
-                elif inflight is not None and inflight.overlaps(command):
-                    self._queue.appendleft(command)
                 else:
                     fast_lane = True
-                    fast_barriers = [
-                        running.fast_done
-                        for running in self._fast_inflight
-                        if running.overlaps(command) and running.fast_done is not None
-                    ]
-                    command.fast_done = asyncio.Event()
+                    command.publish_barriers = self._overlap_publish_barriers(command)
                     self._fast_inflight.add(command)
             else:
+                # Movements and raw frames go through the worker in queue
+                # order, but must also publish AFTER any earlier overlapping
+                # fast-lane STOP: without the barrier a movement could reach
+                # the bridge first and then be displaced by the older STOP.
+                command.publish_barriers = self._overlap_publish_barriers(command)
                 self._queue.append(command)
             if not fast_lane:
                 self._ensure_worker()
@@ -759,7 +808,7 @@ class ZemismartHub:
             self._queue_ready.notify()
         if fast_lane:
             task = asyncio.create_task(
-                self._async_run_fast(command, fast_barriers),
+                self._async_run_fast(command),
                 name="Zemismart fast-lane STOP",
             )
             self._fast_stops.add(task)
@@ -771,20 +820,20 @@ class ZemismartHub:
                 self._queue_ready.notify()
             raise
 
-    async def _async_run_fast(
-        self,
-        command: _QueuedCommand,
-        barriers: list[asyncio.Event],
-    ) -> None:
-        """Run a fast-lane STOP once the overlapping fast STOPs before it finish."""
+    async def _async_run_fast(self, command: _QueuedCommand) -> None:
+        """Run a fast-lane STOP once earlier overlapping commands published."""
         try:
-            for barrier in barriers:
+            for barrier in command.publish_barriers:
                 await barrier.wait()
-            await self._async_run_direct(command)
+            # Re-check after the barrier wait: a caller may have canceled or
+            # a newer command superseded every waiter meanwhile — a resolved
+            # STOP must not still reach RF and halt the newer command.
+            if not all(future.done() for future in command.futures):
+                await self._async_run_direct(command)
         finally:
             self._fast_inflight.discard(command)
-            if command.fast_done is not None:
-                command.fast_done.set()
+            if command.published is not None:
+                command.published.set()
 
     async def _async_run_direct(self, command: _QueuedCommand) -> None:
         """Execute one command, resolving its futures (worker or fast lane)."""
@@ -804,6 +853,11 @@ class ZemismartHub:
                 if not future.done():
                     future.set_exception(exc)
             return
+        finally:
+            # A command that died before publishing imposes no ordering
+            # constraint; release anything barriered on it.
+            if command.published is not None:
+                command.published.set()
         for future in command.futures:
             if not future.done():
                 future.set_result(result)
@@ -821,10 +875,11 @@ class ZemismartHub:
                 command = self._queue[0]
                 if command.coalesce_deadline is None:
                     return self._queue.popleft()
-                # Only siblings that may actually merge below extend the wait:
-                # a sibling behind an overlapping intervening command is
-                # barred from merging (see _coalesce_queued_movements), so its
-                # deadline must not stretch the head's window either.
+                # Only siblings that may actually merge below can SHRINK the
+                # head's window (min() never extends it): a sibling behind an
+                # overlapping intervening command is barred from merging (see
+                # _coalesce_queued_movements), so its earlier deadline must
+                # not truncate the head's window either.
                 blocked: set[tuple[str, int]] = set()
                 for queued in self._queue:
                     if queued is command or all(future.done() for future in queued.futures):
@@ -933,6 +988,8 @@ class ZemismartHub:
             while True:
                 command = await self._async_pop()
                 if all(future.done() for future in command.futures):
+                    if command.published is not None:
+                        command.published.set()
                     continue
                 self._inflight = command
                 try:
@@ -1030,6 +1087,10 @@ class ZemismartHub:
 
     async def _async_execute(self, command: _QueuedCommand) -> CommandAck:
         """Resolve, publish, then await admission and first RF dispatch."""
+        # Request order becomes publish order: wait for earlier overlapping
+        # commands (snapshotted at enqueue) to reach the broker first.
+        for barrier in command.publish_barriers:
+            await barrier.wait()
         if command.bridge_id is not None:
             bridge = self.registry.online_bridge(command.bridge_id)
         else:
@@ -1051,6 +1112,8 @@ class ZemismartHub:
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
                 json.dumps(body, separators=(",", ":")),
             )
+            if command.published is not None:
+                command.published.set()
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
         finally:

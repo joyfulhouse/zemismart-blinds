@@ -30,7 +30,8 @@
       }
     },
     "error": {
-      "invalid_config": "Check the hex identity, channel set, travel times, area, and repeats."
+      "invalid_config": "Check the hex identity, channel set, travel times, area, and repeats.",
+      "cross_area_overlap": "These channels of this remote already exist in a different area. A blind lives in one room; keep all of its entries (and groups) in that room's area."
     },
     "abort": {
       "already_configured": "This remote channel or channel set is already configured."
@@ -63,7 +64,8 @@
     },
     "error": {
       "invalid_config": "Check the hex identity, channel set, travel times, area, and repeats.",
-      "already_configured": "Another device already uses this remote channel set."
+      "already_configured": "Another device already uses this remote channel set.",
+      "cross_area_overlap": "These channels of this remote already exist in a different area. A blind lives in one room; keep all of its entries (and groups) in that room's area."
     }
   },
   "services": {
