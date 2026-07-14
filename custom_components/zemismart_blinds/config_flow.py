@@ -69,7 +69,7 @@ def _int_value(value: object, fallback: int) -> int:
         return fallback
 
 
-def _effective_values(entry: config_entries.ConfigEntry[Any]) -> dict[str, object]:
+def effective_values(entry: config_entries.ConfigEntry[Any]) -> dict[str, object]:
     """Merge an existing entry's mutable options over initial data."""
     values: dict[str, object] = dict(entry.data)
     values.update(entry.options)
@@ -83,7 +83,7 @@ def known_remotes(
     remotes: dict[str, tuple[RemoteIdentity, str]] = {}
     for entry in entries:
         try:
-            config = BlindConfig.from_mapping(_effective_values(entry))
+            config = BlindConfig.from_mapping(effective_values(entry))
         except TypeError, ValueError:
             continue
         remotes.setdefault(config.remote_key, (config.remote, entry.title))
@@ -354,7 +354,7 @@ def _propagate_calibration(
         if entry.entry_id == exclude_entry_id:
             continue
         try:
-            sibling = BlindConfig.from_mapping(_effective_values(entry))
+            sibling = BlindConfig.from_mapping(effective_values(entry))
         except TypeError, ValueError:
             continue
         if sibling.remote_key != config.remote_key or sibling.remote.bases == config.remote.bases:
@@ -422,7 +422,7 @@ class ZemismartBlindsOptionsFlow(config_entries.OptionsFlowWithReload):
         """Edit timing, area, channels, or remote identity."""
         entries = self.hass.config_entries.async_entries(DOMAIN)
         remotes = known_remotes(entries)
-        current = BlindConfig.from_mapping(_effective_values(self.config_entry))
+        current = BlindConfig.from_mapping(effective_values(self.config_entry))
         errors: dict[str, str] = {}
         if user_input is not None:
             try:

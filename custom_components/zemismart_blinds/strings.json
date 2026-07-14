@@ -65,5 +65,29 @@
       "invalid_config": "Check the hex identity, channel set, travel times, area, and repeats.",
       "already_configured": "Another device already uses this remote channel set."
     }
+  },
+  "services": {
+    "send_raw": {
+      "name": "Send raw frame",
+      "description": "Send one debug Portisch B0 frame through a specific online bridge.",
+      "fields": {
+        "bridge": {
+          "name": "Bridge",
+          "description": "Bridge ID from the rf433/<bridge>/info topic."
+        },
+        "raw": {
+          "name": "Raw B0",
+          "description": "Complete AAB0...55 hexadecimal frame."
+        },
+        "repeats": {
+          "name": "Repeats",
+          "description": "How many times the frame is transmitted (distant or obstructed blinds may need more)."
+        }
+      }
+    },
+    "new_virtual_remote": {
+      "name": "Allocate virtual remote",
+      "description": "Generate an unused remote identity with a complete synthesized calibration. The response's prefix, remote ID, and UP base go straight into the manual add-integration flow; pair the motor by sending OPEN while it is in its RF pairing mode."
+    }
   }
 }

@@ -47,10 +47,10 @@ if TYPE_CHECKING:
 
 
 def _entry_config(entry: ZemismartConfigEntry) -> BlindConfig:
-    """Merge entry options over immutable setup data."""
-    values: dict[str, object] = dict(entry.data)
-    values.update(entry.options)
-    return BlindConfig.from_mapping(values)
+    """Build the typed config from an entry's effective values."""
+    from .config_flow import effective_values
+
+    return BlindConfig.from_mapping(effective_values(entry))
 
 
 def _bridge_id(topic: str, leaf: str) -> str | None:
@@ -224,7 +224,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         SERVICE_NEW_VIRTUAL_REMOTE,
         async_new_virtual_remote,
         schema=vol.Schema({}),
-        supports_response=SupportsResponse.OPTIONAL,
+        supports_response=SupportsResponse.ONLY,
     )
     return True
 

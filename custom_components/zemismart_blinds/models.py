@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from collections import deque
@@ -49,6 +50,7 @@ MIN_REPEATS: Final = 1
 MAX_REPEATS: Final = 20
 DEFAULT_ACK_TIMEOUT_SECONDS: Final = 2.0
 DEFAULT_STARTED_TIMEOUT_SECONDS: Final = 30.0
+_DISPLACED_MEMORY_SECONDS: Final = 60.0
 
 
 class NoOnlineBridgeError(RuntimeError):
@@ -65,6 +67,14 @@ class CommandStartedTimeoutError(RuntimeError):
 
 class CommandRejectedError(RuntimeError):
     """Raised when a bridge explicitly rejects a correlated command."""
+
+
+class CommandDisplacedError(RuntimeError):
+    """Raised internally when a newer overlapping command displaced this one.
+
+    Never surfaces to callers: the hub translates it into the ``superseded``
+    command result, exactly like queue-level supersession.
+    """
 
 
 def parse_hex(value: object, field: str, bits: int) -> int:
@@ -231,8 +241,12 @@ class BlindConfig:
         if len(channels) != len(set(channels)):
             msg = "channels must be unique"
             raise ValueError(msg)
-        if self.travel_up <= 0 or self.travel_down <= 0:
-            msg = "travel times must be greater than zero"
+        if not all(
+            math.isfinite(value) and value > 0 for value in (self.travel_up, self.travel_down)
+        ):
+            # NaN slips through plain comparisons (nan <= 0 is False) and
+            # would leave the position model "moving" forever.
+            msg = "travel times must be finite and greater than zero"
             raise ValueError(msg)
         if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
             msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
@@ -448,7 +462,9 @@ class CommandAck:
 type CommandResult = CommandAck | Literal["superseded"]
 
 
-@dataclass(slots=True)
+# eq=False keeps identity hashing: instances live in the fast-lane tracking
+# set, and two distinct commands must never compare equal anyway.
+@dataclass(slots=True, eq=False)
 class _QueuedCommand:
     """One unpublished command waiting for the hub's global worker."""
 
@@ -461,12 +477,27 @@ class _QueuedCommand:
     is_stop: bool
     remote: RemoteIdentity | None
     channels: frozenset[int]
-    coalesce_key: tuple[RemoteIdentity, Button, str] | None
     coalesce_config: BlindConfig | None
     coalesce_button: Button | None
     enqueued_at: float
     coalesce_deadline: float | None
     futures: list[asyncio.Future[CommandResult]]
+
+    @property
+    def coalesce_key(self) -> tuple[str, Button, str] | None:
+        """Derive the merge key: one remote identity, action, and area.
+
+        The area is part of the key: merging covers from different areas
+        would route one RF frame through a bridge that may not physically
+        reach the other room's blind.
+        """
+        if self.coalesce_config is None or self.coalesce_button is None:
+            return None
+        return (
+            self.coalesce_config.remote.key,
+            self.coalesce_button,
+            self.coalesce_config.area_id,
+        )
 
     def overlaps(self, other: _QueuedCommand) -> bool:
         """Return whether both commands address intersecting channels of one remote."""
@@ -506,7 +537,9 @@ class ZemismartHub:
         self._queue_ready = asyncio.Condition()
         self._worker_task: asyncio.Task[None] | None = None
         self._inflight: _QueuedCommand | None = None
+        self._fast_inflight: set[_QueuedCommand] = set()
         self._fast_stops: set[asyncio.Task[None]] = set()
+        self._recent_displaced: dict[str, float] = {}
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -514,6 +547,28 @@ class ZemismartHub:
         """Tell registered entities that retained bridge state changed."""
         for listener in self.bridge_listeners:
             listener()
+
+    def _remember_displaced(self, command_id: str) -> None:
+        """Keep a short displaced-id memory for late-registering motion models."""
+        now = self._now()
+        self._recent_displaced[command_id] = now
+        expired = [
+            key
+            for key, seen in self._recent_displaced.items()
+            if now - seen > _DISPLACED_MEMORY_SECONDS
+        ]
+        for key in expired:
+            del self._recent_displaced[key]
+
+    def was_displaced(self, command_id: str) -> bool:
+        """Return whether this command was recently displaced by the bridge.
+
+        Covers consult this when they commit a motion model: a ``displaced``
+        status that raced ahead of the cover recording its command id would
+        otherwise be lost.
+        """
+        seen = self._recent_displaced.get(command_id)
+        return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -530,15 +585,11 @@ class ZemismartHub:
     ) -> bool:
         """Resolve only a correlated admission or first-dispatch status."""
         decoded: object
-        if isinstance(payload, bytes | bytearray):
+        if isinstance(payload, bytes | bytearray | str):
+            text = payload.decode() if isinstance(payload, bytes | bytearray) else payload
             try:
-                decoded = json.loads(payload.decode())
+                decoded = json.loads(text)
             except UnicodeDecodeError, json.JSONDecodeError:
-                return False
-        elif isinstance(payload, str):
-            try:
-                decoded = json.loads(payload)
-            except json.JSONDecodeError:
                 return False
         else:
             decoded = payload
@@ -554,8 +605,20 @@ class ZemismartHub:
             return False
         if raw_status == "displaced":
             # Latest-command-wins on the bridge retired this command's RF
-            # state (its fail-safe STOP was flushed on air). Let covers freeze
-            # the corresponding motion model.
+            # state (any pending fail-safe STOP is flushed on air within the
+            # next pacing gaps). Resolve a still-waiting caller as superseded
+            # instead of letting it run out its started timeout, remember the
+            # id briefly for covers that have not yet recorded their motion,
+            # and let already-tracking covers react.
+            displaced_pending = self._pending.get((bridge_id, command_id))
+            if displaced_pending is not None:
+                # Resolve exactly the future the caller is awaiting (admission
+                # first, then started) so no exception goes unretrieved.
+                if not displaced_pending.admission.done():
+                    displaced_pending.admission.set_exception(CommandDisplacedError(command_id))
+                elif not displaced_pending.started.done():
+                    displaced_pending.started.set_exception(CommandDisplacedError(command_id))
+            self._remember_displaced(command_id)
             for listener in self.displaced_listeners:
                 listener(bridge_id, command_id)
             return True
@@ -607,13 +670,18 @@ class ZemismartHub:
                     else:
                         retained.append(queued)
                 self._queue = retained
-                # Safety fast lane: unless the in-flight command addresses the
-                # same channels (publishing order must be preserved), a STOP
-                # skips the global one-at-a-time lane entirely so it cannot
-                # sit behind another cover's slow acknowledgement.
+                # Safety fast lane: unless the worker's in-flight command OR a
+                # concurrently running fast-lane command addresses the same
+                # channels (publishing order must be preserved), a STOP skips
+                # the global one-at-a-time lane entirely so it cannot sit
+                # behind another cover's slow acknowledgement.
                 inflight = self._inflight
-                if inflight is None or not inflight.overlaps(command):
+                overlapping = (inflight is not None and inflight.overlaps(command)) or any(
+                    running.overlaps(command) for running in self._fast_inflight
+                )
+                if not overlapping:
                     fast_lane = True
+                    self._fast_inflight.add(command)
                 else:
                     self._queue.appendleft(command)
             else:
@@ -636,21 +704,28 @@ class ZemismartHub:
             raise
 
     async def _async_run_direct(self, command: _QueuedCommand) -> None:
-        """Execute one command outside the worker lane, resolving its futures."""
+        """Execute one command, resolving its futures (worker or fast lane)."""
+        result: CommandResult
         try:
             result = await self._async_execute(command)
         except asyncio.CancelledError:
             for future in command.futures:
                 future.cancel()
             raise
+        except CommandDisplacedError:
+            # A newer overlapping command replaced this one on the bridge —
+            # exactly a supersession, not an error.
+            result = "superseded"
         except Exception as exc:
             for future in command.futures:
                 if not future.done():
                     future.set_exception(exc)
-        else:
-            for future in command.futures:
-                if not future.done():
-                    future.set_result(result)
+            return
+        finally:
+            self._fast_inflight.discard(command)
+        for future in command.futures:
+            if not future.done():
+                future.set_result(result)
 
     async def _async_pop(self) -> _QueuedCommand:
         """Wait for the next command and union one expired movement batch."""
@@ -896,10 +971,6 @@ class ZemismartHub:
                 is_stop=button == "STOP",
                 remote=config.remote,
                 channels=frozenset(config.channels),
-                # The area is part of the key: merging covers from different
-                # areas would route one RF frame through a bridge that may not
-                # physically reach the other room's blind.
-                coalesce_key=(config.remote, button, config.area_id) if coalesces else None,
                 coalesce_config=config if coalesces else None,
                 coalesce_button=button if coalesces else None,
                 enqueued_at=enqueued_at,
@@ -931,7 +1002,6 @@ class ZemismartHub:
                 is_stop=False,
                 remote=remote,
                 channels=frozenset(decoded_channels),
-                coalesce_key=None,
                 coalesce_config=None,
                 coalesce_button=None,
                 enqueued_at=asyncio.get_running_loop().time(),
@@ -951,6 +1021,8 @@ class ZemismartHub:
         for task in self._fast_stops:
             task.cancel()
         self._fast_stops.clear()
+        self._fast_inflight.clear()
+        self._recent_displaced.clear()
         for command in self._queue:
             for future in command.futures:
                 future.cancel()

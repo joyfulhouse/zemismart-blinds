@@ -100,10 +100,15 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_deadline = 0.0
         self._motion_bridge: str | None = None
         self._motion_command_id: str | None = None
+        self._motion_timed = False
         self._motion_token: object | None = None
         self._motion_task: asyncio.Task[None] | None = None
         self._last_bridge: str | None = None
         self._degraded = False
+        # Serializes this entity's own commands: without it, a set_position
+        # racing an unstarted open/close computes travel from a stale
+        # estimate and physically overshoots.
+        self._command_lock = asyncio.Lock()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -244,14 +249,38 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         await super().async_will_remove_from_hass()
 
     def _on_displaced(self, bridge_id: str, command_id: str) -> None:
-        """Freeze this cover's model when the bridge displaced its command."""
+        """React when the bridge displaced this cover's active command.
+
+        Only a TIMED motion is frozen: its flushed fail-safe STOP physically
+        lands within the next pacing gaps, so the current estimate is within
+        one gap of truth. A displaced full travel keeps running to its
+        endpoint on the motor's own limit switch — the model rides to its
+        target, and channels re-driven by the displacing command get a fresh
+        model from that command's own cover.
+        """
         del bridge_id
-        if command_id and command_id == self._motion_command_id:
+        if not command_id or command_id != self._motion_command_id:
+            return
+        if self._motion_timed:
             self._interrupt_motion(WALL_CLOCK())
             self.async_write_ha_state()
 
     def _on_bridge_change(self) -> None:
-        """Re-evaluate availability when retained bridge state changes."""
+        """Re-evaluate availability and timed-motion safety on bridge changes."""
+        if (
+            self._direction != 0
+            and self._motion_timed
+            and self._motion_bridge is not None
+            and not any(
+                bridge.online
+                for bridge in self._hub.registry.bridges
+                if bridge.bridge_id == self._motion_bridge
+            )
+        ):
+            # The bridge holding this motion's armed fail-safe STOP dropped
+            # offline; its scheduler state is RAM-only, so the STOP may be
+            # lost and the motor may run to its limit. Only unknown is honest.
+            self._mark_unknown()
         self.async_write_ha_state()
 
     @staticmethod
@@ -304,6 +333,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_deadline = 0.0
         self._motion_bridge = None
         self._motion_command_id = None
+        self._motion_timed = False
 
     def _interrupt_motion(self, at: float) -> None:
         """Freeze prior tracking only after the replacing command starts."""
@@ -341,6 +371,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             and set(cover._config.channels) <= channels
         )
 
+    def _containing_groups(self) -> tuple[ZemismartCover, ...]:
+        """Return registered group covers whose channels include this cover's."""
+        covers = _COVERS.get(self._hub, ())
+        channels = set(self._config.channels)
+        return tuple(
+            cover
+            for cover in covers
+            if cover is not self
+            and cover._config.is_group
+            and cover._config.remote == self._config.remote
+            and channels <= set(cover._config.channels)
+        )
+
     def _record_ack(self, ack: CommandAck) -> None:
         """Record the bridge selected at worker publish time."""
         self._last_bridge = ack.bridge.bridge_id
@@ -366,6 +409,15 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._direction = direction
         self._motion_bridge = ack.bridge.bridge_id
         self._motion_command_id = ack.command_id
+        self._motion_timed = ack.deadline is not None
+        if self._motion_timed and self._hub.was_displaced(ack.command_id):
+            # The displaced status raced ahead of this model commit: the
+            # bridge already flushed this timed motion's fail-safe STOP, so
+            # freeze immediately instead of tracking a retired command. (A
+            # displaced FULL travel still rides to its endpoint on the
+            # motor's own limit switch, so its model proceeds normally.)
+            self._interrupt_motion(WALL_CLOCK())
+            return
         self._create_motion_task("travel")
         if notify_members:
             for member in self._member_covers():
@@ -375,6 +427,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                     duration=duration,
                     group_target=target,
                 )
+            if not self._config.is_group:
+                # An individually driven channel makes any containing group's
+                # aggregate estimate stale; only unknown is honest there.
+                for group in self._containing_groups():
+                    if group._position is not None or group._direction != 0:
+                        group._mark_unknown()
+                        group.async_write_ha_state()
 
     def _start_member_motion(
         self,
@@ -391,7 +450,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         is — not from the group's aggregate estimate.
         """
         if group_target in (0.0, 100.0):
+            # A full travel runs each motor to its own limit switch: model it
+            # over this member's OWN calibration, not the group's duration
+            # (a slower member would otherwise report done while moving).
             target = group_target
+            member_travel = self._config.travel_up if direction > 0 else self._config.travel_down
+            duration = max(duration, member_travel + FULL_TRAVEL_MARGIN_SECONDS)
         elif self._position is None:
             # The member moved with the group but its origin is unknown; only
             # an unknown estimate is honest here.
@@ -485,12 +549,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open fully and anchor only after full configured travel plus margin."""
         del kwargs
-        await self._async_move_full("UP", 1, 100.0)
+        async with self._command_lock:
+            await self._async_move_full("UP", 1, 100.0)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close fully and anchor only after full configured travel plus margin."""
         del kwargs
-        await self._async_move_full("DOWN", -1, 0.0)
+        async with self._command_lock:
+            await self._async_move_full("DOWN", -1, 0.0)
 
     async def _async_stop(self) -> None:
         """Stop and freeze tracking only when STOP first dispatches."""
@@ -510,11 +576,17 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Queue a priority STOP and commit interruption after RF dispatch."""
         del kwargs
-        await self._async_stop()
+        async with self._command_lock:
+            await self._async_stop()
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Move partially from a known estimate with an acknowledged timed STOP."""
         target = max(0, min(100, int(kwargs[ATTR_POSITION])))
+        async with self._command_lock:
+            await self._async_set_position_locked(target)
+
+    async def _async_set_position_locked(self, target: int) -> None:
+        """Run one serialized partial or endpoint move for this entity."""
         if target == 0:
             await self._async_move_full("DOWN", -1, 0.0)
             return

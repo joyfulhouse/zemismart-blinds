@@ -881,3 +881,69 @@ def test_send_raw_rejects_malformed_b0_before_publish(raw: str) -> None:
         asyncio.run(hub.async_send_raw("bridge-a", raw, 1))
 
     assert published == []
+
+
+@pytest.mark.asyncio
+async def test_displaced_status_resolves_pending_command_as_superseded() -> None:
+    """A displaced command's caller resolves superseded instead of timing out.
+
+    The bridge's latest-command-wins can displace a command between accepted
+    and started; without pending resolution the caller would block for the
+    full started timeout and wrongly invalidate the cover's position.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_event = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        publish_event.set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: "victim")
+    transmit = asyncio.create_task(hub.async_transmit(blind_config(), "UP"))
+    await publish_event.wait()
+
+    assert hub.handle_status("bridge-a", accepted(published[0]))
+    assert hub.handle_status(
+        "bridge-a",
+        json.dumps({"status": "displaced", "command_id": "victim"}),
+    )
+
+    assert await transmit == "superseded"
+    assert hub.was_displaced("victim")
+
+
+@pytest.mark.asyncio
+async def test_second_overlapping_fast_lane_stop_queues_behind_first() -> None:
+    """Concurrent overlapping STOPs never publish out of order.
+
+    The second STOP must see the first fast-lane STOP as in flight and take
+    the ordered queue path instead of racing it to the bridge.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_events = [asyncio.Event() for _ in range(2)]
+    ids = iter(("stop-1", "stop-2"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        publish_events[len(published) - 1].set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    first = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await publish_events[0].wait()
+    second = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await asyncio.sleep(0)
+
+    # The overlapping second STOP is NOT published while the first is in flight.
+    assert len(published) == 1
+    accept_and_start(hub, "bridge-a", published[0])
+    await first
+    await publish_events[1].wait()
+    assert published[1]["command_id"] == "stop-2"
+    accept_and_start(hub, "bridge-a", published[1])
+    await second

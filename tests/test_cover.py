@@ -607,3 +607,62 @@ def test_current_position_getter_is_pure() -> None:
 
     assert entity.current_cover_position == 40
     assert entity._position == 40.0
+
+
+@pytest.mark.asyncio
+async def test_displaced_timed_motion_freezes_at_current_estimate(hass: HomeAssistant) -> None:
+    """A displaced timed move freezes: its fail-safe STOP is flushed on air."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 0.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert entity._motion_timed
+        command_id = entity._motion_command_id
+        assert command_id is not None
+
+        assert hub.handle_status("bridge-a", {"status": "displaced", "command_id": command_id})
+
+        assert entity._direction == 0
+        position = entity.current_cover_position
+        assert position is not None
+        assert position < 60
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_displaced_full_travel_rides_to_endpoint(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A displaced full travel keeps its model: the motor runs to its limit."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.005)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.05))
+    entity._position = 50.0
+    try:
+        await entity.async_open_cover()
+        assert not entity._motion_timed
+        command_id = entity._motion_command_id
+        assert command_id is not None
+
+        assert hub.handle_status("bridge-a", {"status": "displaced", "command_id": command_id})
+
+        # The model keeps running to its endpoint on the motor's own limit.
+        assert entity._direction == 1
+        await asyncio.sleep(0.15)
+        assert entity.current_cover_position == 100
+    finally:
+        await entity.async_will_remove_from_hass()
