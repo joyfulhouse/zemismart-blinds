@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
 import uuid
@@ -38,6 +39,8 @@ from .const import (
     DEFAULT_COALESCE_WINDOW_MS,
     MQTT_ROOT,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 Button = Literal["UP", "DOWN", "STOP", "TRAILER"]
 Publisher = Callable[[str, str], Awaitable[None]]
@@ -378,10 +381,13 @@ class BridgeRegistry:
         if not bridge_id:
             return
         current = self._bridges.get(bridge_id, BridgeInfo(bridge_id))
+        online = payload.strip().lower() == "online"
+        if online != current.online:
+            _LOGGER.debug("Bridge %s is now %s", bridge_id, "online" if online else "offline")
         self._bridges[bridge_id] = BridgeInfo(
             bridge_id=bridge_id,
             area_id=current.area_id,
-            online=payload.strip().lower() == "online",
+            online=online,
             is_default=current.is_default,
         )
 
@@ -482,6 +488,7 @@ class _QueuedCommand:
     enqueued_at: float
     coalesce_deadline: float | None
     futures: list[asyncio.Future[CommandResult]]
+    fast_done: asyncio.Event | None = None
 
     @property
     def coalesce_key(self) -> tuple[str, Button, str] | None:
@@ -619,6 +626,7 @@ class ZemismartHub:
                 elif not displaced_pending.started.done():
                     displaced_pending.started.set_exception(CommandDisplacedError(command_id))
             self._remember_displaced(command_id)
+            _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
             for listener in self.displaced_listeners:
                 listener(bridge_id, command_id)
             return True
@@ -654,6 +662,7 @@ class ZemismartHub:
         """Queue a command, giving STOP front priority and overlap supersession."""
         future = command.futures[0]
         fast_lane = False
+        fast_barriers: list[asyncio.Event] = []
         async with self._queue_ready:
             if command.is_stop:
                 # A STOP supersedes every queued movement whose channels
@@ -670,20 +679,26 @@ class ZemismartHub:
                     else:
                         retained.append(queued)
                 self._queue = retained
-                # Safety fast lane: unless the worker's in-flight command OR a
-                # concurrently running fast-lane command addresses the same
-                # channels (publishing order must be preserved), a STOP skips
-                # the global one-at-a-time lane entirely so it cannot sit
-                # behind another cover's slow acknowledgement.
+                # Safety fast lane: unless the worker's in-flight command
+                # addresses the same channels (publishing order must be
+                # preserved), a STOP skips the global one-at-a-time lane
+                # entirely so it cannot sit behind another cover's slow
+                # acknowledgement. When it overlaps an already-running
+                # fast-lane STOP it stays in the fast lane but chains behind
+                # that STOP's completion — dropping to the global queue would
+                # park a safety STOP behind an unrelated in-flight command.
                 inflight = self._inflight
-                overlapping = (inflight is not None and inflight.overlaps(command)) or any(
-                    running.overlaps(command) for running in self._fast_inflight
-                )
-                if not overlapping:
-                    fast_lane = True
-                    self._fast_inflight.add(command)
-                else:
+                if inflight is not None and inflight.overlaps(command):
                     self._queue.appendleft(command)
+                else:
+                    fast_lane = True
+                    fast_barriers = [
+                        running.fast_done
+                        for running in self._fast_inflight
+                        if running.overlaps(command) and running.fast_done is not None
+                    ]
+                    command.fast_done = asyncio.Event()
+                    self._fast_inflight.add(command)
             else:
                 self._queue.append(command)
             if not fast_lane:
@@ -691,7 +706,7 @@ class ZemismartHub:
                 self._queue_ready.notify()
         if fast_lane:
             task = asyncio.create_task(
-                self._async_run_direct(command),
+                self._async_run_fast(command, fast_barriers),
                 name="Zemismart fast-lane STOP",
             )
             self._fast_stops.add(task)
@@ -702,6 +717,21 @@ class ZemismartHub:
             async with self._queue_ready:
                 self._queue_ready.notify()
             raise
+
+    async def _async_run_fast(
+        self,
+        command: _QueuedCommand,
+        barriers: list[asyncio.Event],
+    ) -> None:
+        """Run a fast-lane STOP once the overlapping fast STOPs before it finish."""
+        try:
+            for barrier in barriers:
+                await barrier.wait()
+            await self._async_run_direct(command)
+        finally:
+            self._fast_inflight.discard(command)
+            if command.fast_done is not None:
+                command.fast_done.set()
 
     async def _async_run_direct(self, command: _QueuedCommand) -> None:
         """Execute one command, resolving its futures (worker or fast lane)."""
@@ -721,8 +751,6 @@ class ZemismartHub:
                 if not future.done():
                     future.set_exception(exc)
             return
-        finally:
-            self._fast_inflight.discard(command)
         for future in command.futures:
             if not future.done():
                 future.set_result(result)
@@ -880,6 +908,13 @@ class ZemismartHub:
         body["command_id"] = command_id
         pending = self._register_pending(bridge, command_id)
         key = (bridge.bridge_id, command_id)
+        _LOGGER.debug(
+            "Publishing command %s (target %s) via bridge %s (area %s)",
+            command_id,
+            command.target,
+            bridge.bridge_id,
+            bridge.area_id,
+        )
         try:
             await self._publisher(
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
@@ -889,6 +924,12 @@ class ZemismartHub:
             started_at = await self._await_started(pending.started, command_id)
         finally:
             self._pending.pop(key, None)
+        _LOGGER.debug(
+            "Command %s %s by bridge %s; RF started",
+            command_id,
+            status.status,
+            bridge.bridge_id,
+        )
         deadline = (
             started_at + command.stop_after_ms / 1_000
             if command.stop_after_ms is not None

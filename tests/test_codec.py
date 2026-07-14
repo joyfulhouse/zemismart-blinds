@@ -351,6 +351,24 @@ def test_strict_b0_input_validation_rejects_malformed_frames(frame: str) -> None
         validate_b0_frame(frame)
 
 
+def test_strict_b0_validation_mirrors_firmware_repeat_and_airtime_limits() -> None:
+    """A frame the validator accepts is never rejected at the bridge.
+
+    The firmware bounds the embedded Portisch hardware repeat to 1..16 and
+    the total requested airtime (pulses x bucket microseconds x embedded
+    repeat) to two seconds; the Python validator enforces the same limits.
+    """
+    repeat_ff = f"{TEST_CH12_UP_B0[:8]}FF{TEST_CH12_UP_B0[10:]}"
+    with pytest.raises(ValueError, match="embedded repeat"):
+        validate_b0_frame(repeat_ff)
+
+    # One 0xFFFF-microsecond bucket, two pulses, embedded repeat 16: ~2.1 s.
+    with pytest.raises(ValueError, match="airtime"):
+        validate_b0_frame("AAB0050110FFFF0855")
+    # The same frame at the controller's embedded repeat of 8 (~1 s) passes.
+    assert validate_b0_frame("AAB0050108FFFF0855") == "AAB0050108FFFF0855"
+
+
 def test_strict_b0_input_validation_normalizes_a_frame() -> None:
     """Whitespace/case normalization retains the exact B0 bytes."""
     spaced = " ".join(

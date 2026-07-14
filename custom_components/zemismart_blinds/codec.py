@@ -34,6 +34,13 @@ DEFAULT_BUCKETS: Final = "1414026C01181414"
 _FRAME_BITS: Final = 64
 _MAX_PAYLOAD: Final = (1 << _FRAME_BITS) - 1
 _MAX_B0_FRAME_BYTES: Final = 260
+# Mirrors the firmware's per-handoff limits so a frame the integration accepts
+# is never rejected at the bridge: embedded hardware repeat 1..16, and at most
+# two seconds of requested RF airtime (buckets are 16-bit microsecond values
+# and every pulse nibble spends one bucket, multiplied by the embedded repeat;
+# a real AOK frame runs ~550 ms at the controller's embedded repeat of 8).
+_MAX_B0_EMBEDDED_REPEAT: Final = 0x10
+_MAX_B0_AIRTIME_US: Final = 2_000_000
 _SYNC_MIN_US: Final = 1_000
 _BIT_MAX_US: Final = 1_000
 _SHORT_MAX_US: Final = 450
@@ -326,12 +333,21 @@ def _b0_parts(frame: str) -> tuple[list[int], str]:
         msg = "B0 frame body is too short for its bucket header"
         raise ValueError(msg)
     bucket_count = int(frame[body_start : body_start + 2], 16)
-    return _bucket_data(
+    embedded_repeat = int(frame[body_start + 2 : body_start + 4], 16)
+    if not 1 <= embedded_repeat <= _MAX_B0_EMBEDDED_REPEAT:
+        msg = "B0 frame embedded repeat count is out of range"
+        raise ValueError(msg)
+    buckets, pulse_data = _bucket_data(
         frame,
         bucket_count=bucket_count,
         bucket_start=body_start + 4,
         data_end=body_end,
     )
+    airtime_us = sum(buckets[int(nibble, 16) & 0x07] for nibble in pulse_data)
+    if airtime_us * embedded_repeat > _MAX_B0_AIRTIME_US:
+        msg = "B0 frame requested airtime exceeds the limit"
+        raise ValueError(msg)
+    return buckets, pulse_data
 
 
 def validate_b0_frame(frame: str) -> str:

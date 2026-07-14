@@ -919,8 +919,9 @@ async def test_displaced_status_resolves_pending_command_as_superseded() -> None
 async def test_second_overlapping_fast_lane_stop_queues_behind_first() -> None:
     """Concurrent overlapping STOPs never publish out of order.
 
-    The second STOP must see the first fast-lane STOP as in flight and take
-    the ordered queue path instead of racing it to the bridge.
+    The second STOP must see the first fast-lane STOP as in flight and chain
+    behind its completion inside the fast lane instead of racing it to the
+    bridge.
     """
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
@@ -947,3 +948,52 @@ async def test_second_overlapping_fast_lane_stop_queues_behind_first() -> None:
     assert published[1]["command_id"] == "stop-2"
     accept_and_start(hub, "bridge-a", published[1])
     await second
+
+
+@pytest.mark.asyncio
+async def test_overlapping_fast_stop_chains_behind_fast_stop_not_inflight() -> None:
+    """A chained fast STOP never waits behind an unrelated in-flight command.
+
+    While an unrelated channel-3 movement is still awaiting acknowledgement,
+    STOP {1} runs in the fast lane and STOP {1, 2} arrives. The second STOP
+    chains behind the first inside the fast lane and publishes as soon as the
+    first resolves -- dropping to the global queue would park a safety STOP
+    behind the blocker's up-to-30-second acknowledgement wait, leaving
+    channel 2 moving.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_events = [asyncio.Event() for _ in range(3)]
+    ids = iter(("blocker", "stop-1", "stop-12"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        publish_events[len(published) - 1].set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    blocker_config = replace(blind_config(), channels=(3,))
+    single_config = replace(blind_config(), channels=(1,))
+    blocker = asyncio.create_task(hub.async_transmit(blocker_config, "UP"))
+    await publish_events[0].wait()
+
+    first_stop = asyncio.create_task(hub.async_transmit(single_config, "STOP"))
+    await publish_events[1].wait()
+    assert published[1]["command_id"] == "stop-1"
+    second_stop = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await asyncio.sleep(0)
+    # Chained behind the in-flight overlapping fast STOP: not yet published.
+    assert len(published) == 2
+
+    accept_and_start(hub, "bridge-a", published[1])
+    await first_stop
+    # Publishes while the unrelated blocker is STILL unacknowledged.
+    await publish_events[2].wait()
+    assert published[2]["command_id"] == "stop-12"
+    accept_and_start(hub, "bridge-a", published[2])
+    await second_stop
+
+    accept_and_start(hub, "bridge-a", published[0])
+    await blocker

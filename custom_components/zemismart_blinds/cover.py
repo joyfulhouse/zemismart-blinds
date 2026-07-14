@@ -47,6 +47,7 @@ _ATTR_MOTION_DIRECTION = "motion_direction"
 _ATTR_MOTION_STARTED = "motion_started"
 _ATTR_MOTION_START_POSITION = "motion_start_position"
 _ATTR_MOTION_TARGET = "motion_target"
+_ATTR_MOTION_TIMED = "motion_timed"
 WALL_CLOCK = time.time
 _COVERS: weakref.WeakKeyDictionary[ZemismartHub, weakref.WeakSet[ZemismartCover]] = (
     weakref.WeakKeyDictionary()
@@ -161,6 +162,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_START_POSITION: self._motion_start_position,
             _ATTR_MOTION_BRIDGE: self._motion_bridge,
             _ATTR_MOTION_COMMAND_ID: self._motion_command_id,
+            _ATTR_MOTION_TIMED: self._motion_timed,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -233,6 +235,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_duration = deadline - self._motion_started
         self._motion_bridge = bridge
         self._motion_command_id = command_id
+        self._motion_timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
+        if self._motion_timed and self._hub.registry.bridges and not self._bridge_online(bridge):
+            # The restored motion depends on a bridge-armed fail-safe STOP,
+            # and that bridge is already known to be offline: its RAM-only
+            # scheduler state (and the STOP) may be gone. Later drops are
+            # caught by _on_bridge_change via the restored _motion_timed.
+            self._mark_unknown()
+            return
         self._sync_position(now)
         self._create_motion_task("recovered travel")
 
@@ -265,17 +275,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._interrupt_motion(WALL_CLOCK())
             self.async_write_ha_state()
 
+    def _bridge_online(self, bridge_id: str) -> bool:
+        """Return whether the named bridge is currently registered and online."""
+        return any(
+            bridge.online for bridge in self._hub.registry.bridges if bridge.bridge_id == bridge_id
+        )
+
     def _on_bridge_change(self) -> None:
         """Re-evaluate availability and timed-motion safety on bridge changes."""
         if (
             self._direction != 0
             and self._motion_timed
             and self._motion_bridge is not None
-            and not any(
-                bridge.online
-                for bridge in self._hub.registry.bridges
-                if bridge.bridge_id == self._motion_bridge
-            )
+            and not self._bridge_online(self._motion_bridge)
         ):
             # The bridge holding this motion's armed fail-safe STOP dropped
             # offline; its scheduler state is RAM-only, so the STOP may be
@@ -371,18 +383,36 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             and set(cover._config.channels) <= channels
         )
 
-    def _containing_groups(self) -> tuple[ZemismartCover, ...]:
-        """Return registered group covers whose channels include this cover's."""
+    def _overlapping_covers(self) -> tuple[ZemismartCover, ...]:
+        """Return registered covers sharing any channel of this cover's remote."""
         covers = _COVERS.get(self._hub, ())
         channels = set(self._config.channels)
         return tuple(
             cover
             for cover in covers
             if cover is not self
-            and cover._config.is_group
             and cover._config.remote == self._config.remote
-            and channels <= set(cover._config.channels)
+            and channels & set(cover._config.channels)
         )
+
+    def _reconcile_overlaps(self, *, moving: bool) -> None:
+        """Invalidate every overlapping cover this RF frame made stale.
+
+        Members fully inside a group frame are modeled explicitly by the
+        caller and excluded here. Everything else sharing a channel — a group
+        containing an individually driven or stopped channel, or an
+        arbitrarily overlapping group — now has an aggregate estimate that no
+        longer describes its physical members; only unknown is honest. A STOP
+        (moving=False) leaves idle overlapping covers alone: stopping an idle
+        motor does not move anything.
+        """
+        members = set(self._member_covers())
+        for cover in self._overlapping_covers():
+            if cover in members:
+                continue
+            if cover._direction != 0 or (moving and cover._position is not None):
+                cover._mark_unknown()
+                cover.async_write_ha_state()
 
     def _record_ack(self, ack: CommandAck) -> None:
         """Record the bridge selected at worker publish time."""
@@ -427,13 +457,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                     duration=duration,
                     group_target=target,
                 )
-            if not self._config.is_group:
-                # An individually driven channel makes any containing group's
-                # aggregate estimate stale; only unknown is honest there.
-                for group in self._containing_groups():
-                    if group._position is not None or group._direction != 0:
-                        group._mark_unknown()
-                        group.async_write_ha_state()
+            self._reconcile_overlaps(moving=True)
 
     def _start_member_motion(
         self,
@@ -451,11 +475,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """
         if group_target in (0.0, 100.0):
             # A full travel runs each motor to its own limit switch: model it
-            # over this member's OWN calibration, not the group's duration
-            # (a slower member would otherwise report done while moving).
+            # over this member's OWN calibration, not the group's duration (a
+            # slower member would otherwise report done while moving, and a
+            # faster one would report moving long after its limit switch).
             target = group_target
             member_travel = self._config.travel_up if direction > 0 else self._config.travel_down
-            duration = max(duration, member_travel + FULL_TRAVEL_MARGIN_SECONDS)
+            duration = member_travel + FULL_TRAVEL_MARGIN_SECONDS
         elif self._position is None:
             # The member moved with the group but its origin is unknown; only
             # an unknown estimate is honest here.
@@ -571,6 +596,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             member._interrupt_motion(ack.started_at)
             member._record_ack(ack)
             member.async_write_ha_state()
+        self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:

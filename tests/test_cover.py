@@ -666,3 +666,195 @@ async def test_displaced_full_travel_rides_to_endpoint(
         assert entity.current_cover_position == 100
     finally:
         await entity.async_will_remove_from_hass()
+
+
+def member_config(*, channel: int = 1, travel: float = 1.0) -> BlindConfig:
+    """Return one single-channel member configuration on the shared remote."""
+    return BlindConfig(
+        name=f"Living Room channel {channel}",
+        remote=cover_config().remote,
+        channels=(channel,),
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_member_stop_marks_moving_containing_group_unknown(hass: HomeAssistant) -> None:
+    """Stopping one member channel invalidates its moving group's aggregate.
+
+    The STOP frame halts only that channel's motor; the group's remaining
+    members keep moving, so the group estimate no longer describes anything
+    physical. The stopped member itself freezes at its own estimate.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 20.0
+    member._position = 50.0
+    try:
+        await group.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.02)
+        assert group.is_opening
+
+        await member.async_stop_cover()
+
+        assert group.current_cover_position is None
+        assert not group.is_opening
+        assert member.current_cover_position is not None
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_group_movement_marks_other_group_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """Driving group {2,3} while group {1,2} moves invalidates {1,2}.
+
+    Channel 2 physically follows the newer frame, so the older group's
+    aggregate estimate no longer describes its members.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group_a = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    config_b = BlindConfig(
+        name="Living Room Right",
+        remote=cover_config().remote,
+        channels=(2, 3),
+        travel_up=1.0,
+        travel_down=1.0,
+        area_id="living_room",
+        repeats=2,
+    )
+    group_b = await attach_cover(
+        hass,
+        hub,
+        config=config_b,
+        entry_id="entry-3",
+        entity_id="cover.living_room_right",
+    )
+    group_a._position = 20.0
+    try:
+        await group_a.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.02)
+        assert group_a.is_opening
+        # group_a's own start already invalidated the idle overlapping group.
+        assert group_b.current_cover_position is None
+
+        await group_b.async_open_cover()
+        await asyncio.sleep(0.02)
+
+        assert group_a.current_cover_position is None
+        assert not group_a.is_opening
+        assert group_b.is_opening
+    finally:
+        await group_a.async_will_remove_from_hass()
+        await group_b.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_group_endpoint_models_member_over_its_own_calibration(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group full travel models each member over the member's OWN travel time.
+
+    A fast member reaches its limit switch long before a slow group duration;
+    inheriting the group's duration would report it moving long after it
+    physically stopped (and let a follow-up set_position compute from a stale
+    mid-travel estimate).
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(travel=0.1),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 50.0
+    member._position = 50.0
+    try:
+        await group.async_open_cover()
+        await asyncio.sleep(0.02)
+
+        assert member._motion_duration == pytest.approx(0.11)
+        assert group._motion_duration == pytest.approx(1.01)
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_restored_timed_motion_with_offline_bridge_becomes_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """A restored timed motion whose bridge is known offline is not trusted.
+
+    The bridge holding the armed fail-safe STOP keeps it in RAM only; if it
+    is offline when HA comes back, the STOP may be lost and the motor may
+    have run to its limit. Only unknown is honest.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    assert attributes["motion_timed"] is True
+    await original.async_will_remove_from_hass()
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    offline_registry = BridgeRegistry()
+    offline_registry.update_info("bridge-a", {"area": "living_room"})
+    offline_registry.update_availability("bridge-a", "offline")
+    restored = await attach_cover(
+        hass,
+        ZemismartHub(offline_registry, quiet_publish),
+        config=cover_config(travel=10.0),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert restored.current_cover_position is None
+        assert not restored.is_opening
+        assert restored.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await restored.async_will_remove_from_hass()
