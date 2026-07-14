@@ -1,0 +1,13 @@
+{
+  "domain": "zemismart_blinds",
+  "name": "Zemismart Blinds",
+  "codeowners": ["@btli"],
+  "config_flow": true,
+  "dependencies": ["mqtt"],
+  "documentation": "https://github.com/joyfulhouse/zemismart-blinds",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/joyfulhouse/zemismart-blinds/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

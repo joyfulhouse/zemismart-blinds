@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.esphome/
+esphome/secrets.yaml
+*.egg-info/
+
+# Working documents (design briefs, review logs, plans) — not published
+.working/
