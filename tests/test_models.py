@@ -469,8 +469,13 @@ async def test_worker_resolves_bridge_when_queued_command_is_popped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_jumps_queue_and_supersedes_queued_same_cover_movement() -> None:
-    """STOP goes first and drops only unpublished movement for its own cover."""
+async def test_stop_fast_lane_bypasses_unrelated_inflight_command() -> None:
+    """STOP supersedes queued overlapping movement and skips the global lane.
+
+    An in-flight command for unrelated channels must not delay a safety STOP:
+    the STOP publishes immediately while the blocker is still awaiting its
+    acknowledgement, and the queued overlapping movement resolves superseded.
+    """
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
@@ -496,17 +501,52 @@ async def test_stop_jumps_queue_and_supersedes_queued_same_cover_movement() -> N
     await asyncio.sleep(0)
 
     assert await superseded == "superseded"
-    assert len(published) == 1
-    accept_and_start(hub, "bridge-a", published[0])
+    # The STOP does not wait behind the unacknowledged blocker.
     await publish_events[1].wait()
+    assert published[1]["command_id"] == "stop"
     assert published[1]["raw"] == encode_b0(
         make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "STOP", bases=TEST_BASES)
     )
     accept_and_start(hub, "bridge-a", published[1])
+    await stop
+    # The queued unrelated movement still waits for the blocker to finish.
+    assert len(published) == 2
+    accept_and_start(hub, "bridge-a", published[0])
     await publish_events[2].wait()
     assert published[2]["target"] == unrelated_config.target_key
     accept_and_start(hub, "bridge-a", published[2])
-    await asyncio.gather(blocker, stop, unrelated)
+    await asyncio.gather(blocker, unrelated)
+
+
+@pytest.mark.asyncio
+async def test_stop_overlapping_inflight_command_stays_ordered() -> None:
+    """A STOP for the in-flight command's own channels queues behind it."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    publish_events = [asyncio.Event() for _ in range(2)]
+    ids = iter(("move", "stop"))
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        publish_events[len(published) - 1].set()
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
+    move = asyncio.create_task(hub.async_transmit(blind_config(), "UP"))
+    await publish_events[0].wait()
+
+    stop = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
+    await asyncio.sleep(0)
+    # Publishing order must be preserved for the same channels: the STOP may
+    # not reach the bridge before the movement it is stopping.
+    assert len(published) == 1
+    accept_and_start(hub, "bridge-a", published[0])
+    await publish_events[1].wait()
+    assert published[1]["command_id"] == "stop"
+    accept_and_start(hub, "bridge-a", published[1])
+    await asyncio.gather(move, stop)
 
 
 @pytest.mark.asyncio

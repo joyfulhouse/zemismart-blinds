@@ -45,3 +45,4 @@ ATTR_RAW: Final = "raw"
 ATTR_REPEATS: Final = "repeats"
 
 MANUAL_REMOTE: Final = "manual"
+VIRTUAL_REMOTE: Final = "virtual"

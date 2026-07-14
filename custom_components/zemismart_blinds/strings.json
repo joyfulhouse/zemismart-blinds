@@ -18,12 +18,14 @@
           "travel_up": "Up travel time",
           "travel_down": "Down travel time",
           "area_id": "Home Assistant area",
-          "repeats": "RF repeats"
+          "repeats": "RF repeats",
+          "coalesce_window_ms": "Group coalescing window"
         },
         "data_description": {
           "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
           "calibration_base": "Provide this or a captured B0 reference, not both.",
-          "calibration_frame": "The captured identity must match the entered prefix and remote ID."
+          "calibration_frame": "The captured identity must match the entered prefix and remote ID.",
+          "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
         }
       }
     },
@@ -51,7 +53,11 @@
           "travel_up": "Up travel time",
           "travel_down": "Down travel time",
           "area_id": "Home Assistant area",
-          "repeats": "RF repeats"
+          "repeats": "RF repeats",
+          "coalesce_window_ms": "Group coalescing window"
+        },
+        "data_description": {
+          "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
         }
       }
     },

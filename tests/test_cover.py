@@ -439,13 +439,57 @@ async def test_group_motion_updates_each_member_channel_estimate(hass: HomeAssis
     await member.async_internal_added_to_hass()
     await member.async_added_to_hass()
     group._position = 20.0
+    member._position = 50.0
     try:
         await group.async_set_cover_position(**{ATTR_POSITION: 60})
         await asyncio.sleep(0.02)
 
         assert group.current_cover_position is not None
-        assert member.current_cover_position == group.current_cover_position
         assert member.is_opening
+        # The RF frame moves the member for the group's duration from the
+        # member's OWN estimate: +40% of full travel on top of 50, capped 100.
+        assert member._motion_target == pytest.approx(90.0, abs=0.01)
+        assert member._motion_start_position == 50.0
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_group_motion_marks_unknown_member_unknown(hass: HomeAssistant) -> None:
+    """A member with no estimate becomes unknown when its group moves partially."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member_config = BlindConfig(
+        name="Living Room channel 1",
+        remote=group._config.remote,
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        area_id="living_room",
+        repeats=2,
+    )
+    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
+    member.hass = hass
+    member.entity_id = "cover.living_room_channel_1"
+    member.platform = platform_stub()
+    await member.async_internal_added_to_hass()
+    await member.async_added_to_hass()
+    group._position = 20.0
+    member._position = None
+    try:
+        await group.async_set_cover_position(**{ATTR_POSITION: 60})
+        await asyncio.sleep(0.02)
+
+        # The member physically moved with the group but from an unknown
+        # origin — only an unknown estimate is honest.
+        assert member.current_cover_position is None
+        assert not member.is_opening
     finally:
         await group.async_will_remove_from_hass()
         await member.async_will_remove_from_hass()

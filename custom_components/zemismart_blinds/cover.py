@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.components.cover import (
     ATTR_CURRENT_POSITION,
     ATTR_POSITION,
+    CoverDeviceClass,
     CoverEntity,
     CoverEntityFeature,
 )
@@ -73,6 +74,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     """An assumed-state cover committed only after first RF dispatch."""
 
     _attr_assumed_state = True
+    _attr_device_class = CoverDeviceClass.SHADE
     _attr_has_entity_name = True
     _attr_name = None
     _attr_should_poll = False
@@ -112,6 +114,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             manufacturer="Zemismart",
             model="433 MHz blind group" if self._config.is_group else "433 MHz blind",
         )
+
+    @property
+    def available(self) -> bool:
+        """Reflect whether any RF bridge is currently online."""
+        return any(bridge.online for bridge in self._hub.registry.bridges)
 
     @property
     def current_cover_position(self) -> int | None:
@@ -155,6 +162,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Restore a stopped estimate or reconstruct complete started motion."""
         await super().async_added_to_hass()
         _COVERS.setdefault(self._hub, weakref.WeakSet()).add(self)
+        self._hub.displaced_listeners.append(self._on_displaced)
+        self._hub.bridge_listeners.append(self._on_bridge_change)
         state = await self.async_get_last_state()
         if state is None:
             return
@@ -196,14 +205,30 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._position = target
             self._clear_motion()
             return
+        # Prefer the persisted motion origin: interpolating from the original
+        # start keeps the transient estimate accurate across the restart gap
+        # instead of restarting the ramp from the last stored snapshot.
+        started = _number(state.attributes.get(_ATTR_MOTION_STARTED))
+        start_position = _number(state.attributes.get(_ATTR_MOTION_START_POSITION))
+        if (
+            started is not None
+            and start_position is not None
+            and 0 <= start_position <= 100
+            and started < deadline
+            and started <= now
+        ):
+            self._motion_started = started
+            self._motion_start_position = start_position
+        else:
+            self._motion_started = now
+            self._motion_start_position = self._position
         self._direction = direction
         self._motion_target = target
-        self._motion_start_position = self._position
-        self._motion_started = now
         self._motion_deadline = deadline
-        self._motion_duration = deadline - now
+        self._motion_duration = deadline - self._motion_started
         self._motion_bridge = bridge
         self._motion_command_id = command_id
+        self._sync_position(now)
         self._create_motion_task("recovered travel")
 
     async def async_will_remove_from_hass(self) -> None:
@@ -211,8 +236,23 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         covers = _COVERS.get(self._hub)
         if covers is not None:
             covers.discard(self)
+        if self._on_displaced in self._hub.displaced_listeners:
+            self._hub.displaced_listeners.remove(self._on_displaced)
+        if self._on_bridge_change in self._hub.bridge_listeners:
+            self._hub.bridge_listeners.remove(self._on_bridge_change)
         self._cancel_motion_task()
         await super().async_will_remove_from_hass()
+
+    def _on_displaced(self, bridge_id: str, command_id: str) -> None:
+        """Freeze this cover's model when the bridge displaced its command."""
+        del bridge_id
+        if command_id and command_id == self._motion_command_id:
+            self._interrupt_motion(WALL_CLOCK())
+            self.async_write_ha_state()
+
+    def _on_bridge_change(self) -> None:
+        """Re-evaluate availability when retained bridge state changes."""
+        self.async_write_ha_state()
 
     @staticmethod
     def _optional_text(value: object) -> str | None:
@@ -329,15 +369,47 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._create_motion_task("travel")
         if notify_members:
             for member in self._member_covers():
-                member._position = self._motion_start_position
-                member._start_motion(
+                member._start_member_motion(
                     ack,
                     direction=direction,
-                    target=target,
                     duration=duration,
-                    notify_members=False,
+                    group_target=target,
                 )
-                member.async_write_ha_state()
+
+    def _start_member_motion(
+        self,
+        ack: CommandAck,
+        *,
+        direction: int,
+        duration: float,
+        group_target: float,
+    ) -> None:
+        """Model a group command against this member's own position estimate.
+
+        The RF frame moves every member for the same duration, so each member
+        travels the same fraction of full travel from wherever it physically
+        is — not from the group's aggregate estimate.
+        """
+        if group_target in (0.0, 100.0):
+            target = group_target
+        elif self._position is None:
+            # The member moved with the group but its origin is unknown; only
+            # an unknown estimate is honest here.
+            self._mark_unknown()
+            self.async_write_ha_state()
+            return
+        else:
+            full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
+            delta = duration / full_travel * 100.0 * (1 if direction > 0 else -1)
+            target = max(0.0, min(100.0, self._position + delta))
+        self._start_motion(
+            ack,
+            direction=direction,
+            target=target,
+            duration=duration,
+            notify_members=False,
+        )
+        self.async_write_ha_state()
 
     def _create_motion_task(self, label: str) -> None:
         """Start the one local travel-time integration task."""
@@ -428,7 +500,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
         for member in self._member_covers():
-            member._position = self._position
+            # Freeze each member at its OWN integrated estimate; the group's
+            # aggregate says nothing about where an individual blind stopped.
             member._interrupt_motion(ack.started_at)
             member._record_ack(ack)
             member.async_write_ha_state()
@@ -449,13 +522,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             await self._async_move_full("UP", 1, 100.0)
             return
 
+        if self._direction != 0:
+            # Stop first so the travel duration is computed from a settled
+            # estimate: computing it against a still-moving blind would bake
+            # the queue/transit delay into the physical stopping point.
+            await self._async_stop()
         current = self._estimated_position(WALL_CLOCK())
         if current is None:
             msg = "position is unknown; run a full open or close calibration first"
             raise HomeAssistantError(msg)
         if abs(target - current) < 0.5:
-            if self._direction != 0:
-                await self._async_stop()
             return
 
         direction = 1 if target > current else -1

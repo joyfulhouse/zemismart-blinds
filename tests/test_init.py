@@ -14,7 +14,11 @@ from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 
 import custom_components.zemismart_blinds as integration_module
-from custom_components.zemismart_blinds import async_setup_entry, async_unload_entry
+from custom_components.zemismart_blinds import (
+    async_setup,
+    async_setup_entry,
+    async_unload_entry,
+)
 from custom_components.zemismart_blinds.codec import CommandBases, derive_bases_from_base
 from custom_components.zemismart_blinds.const import (
     DOMAIN,
@@ -128,6 +132,7 @@ async def test_concurrent_setup_and_unload_share_one_runtime(
     first = config_entry("one")
     second = config_entry("two")
 
+    assert await async_setup(hass, {})
     setup_results = await asyncio.gather(
         async_setup_entry(hass, first),
         async_setup_entry(hass, second),
@@ -156,8 +161,10 @@ async def test_concurrent_setup_and_unload_share_one_runtime(
 
     assert DOMAIN not in hass.data
     assert sorted(unsubscribed) == sorted(callbacks)
-    assert not hass.services.has_service(DOMAIN, SERVICE_SEND_RAW)
-    assert not hass.services.has_service(DOMAIN, SERVICE_NEW_VIRTUAL_REMOTE)
+    # Domain services persist for the integration's lifetime so the virtual
+    # remote workflow works before/after any entry exists.
+    assert hass.services.has_service(DOMAIN, SERVICE_SEND_RAW)
+    assert hass.services.has_service(DOMAIN, SERVICE_NEW_VIRTUAL_REMOTE)
 
 
 @pytest.mark.asyncio
@@ -362,6 +369,7 @@ async def test_virtual_remote_keeps_known_family_prefix(
     monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     values = iter((0x1234, 0x56, 0x2B))
     monkeypatch.setattr(secrets, "randbelow", lambda _limit: next(values))
+    assert await async_setup(hass, {})
     await async_setup_entry(hass, config_entry("one"))
 
     response = await hass.services.async_call(
@@ -431,6 +439,7 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
+    assert await async_setup(hass, {})
     await async_setup_entry(hass, config_entry("one"))
     callbacks[MQTT_AVAILABILITY_TOPIC](
         message("rf433/bridge-a/availability", "online", retain=True)

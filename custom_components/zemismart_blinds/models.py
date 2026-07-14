@@ -67,24 +67,58 @@ class CommandRejectedError(RuntimeError):
     """Raised when a bridge explicitly rejects a correlated command."""
 
 
-def _parse_hex(value: object, field: str) -> int:
-    """Parse an integer or a user-facing hexadecimal string."""
+def parse_hex(value: object, field: str, bits: int) -> int:
+    """Parse a fixed-width unsigned field from an integer or hex text.
+
+    Shared by config-entry loading and the config flow so stored values and
+    user input go through exactly one width-validated parser.
+    """
     if isinstance(value, bool):
         msg = f"{field} must be hexadecimal"
         raise ValueError(msg)
-    if isinstance(value, int):
-        return value
     if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized.startswith("0x"):
-            normalized = normalized[2:]
+        normalized = value.strip().lower().removeprefix("0x")
         try:
-            return int(normalized, 16)
+            value = int(normalized, 16)
         except ValueError as exc:
             msg = f"{field} must be hexadecimal"
             raise ValueError(msg) from exc
-    msg = f"{field} must be hexadecimal"
-    raise ValueError(msg)
+    if not isinstance(value, int):
+        msg = f"{field} must be hexadecimal"
+        raise ValueError(msg)
+    if not 0 <= value < (1 << bits):
+        msg = f"{field} must fit in {bits} bits"
+        raise ValueError(msg)
+    return value
+
+
+def parse_channels(value: object) -> tuple[int, ...]:
+    """Parse ``1`` or a group such as ``{1,2,3}`` from text or an iterable.
+
+    Shared by config-entry loading and the config flow: one parser defines the
+    accepted channel syntax and the 1..16 uniqueness rules everywhere.
+    """
+    if isinstance(value, str):
+        try:
+            channels: Iterable[int] = tuple(
+                int(part.strip()) for part in value.strip().strip("{}").split(",") if part.strip()
+            )
+        except ValueError as exc:
+            msg = "channels must be comma-separated integers"
+            raise ValueError(msg) from exc
+    elif isinstance(value, Iterable):
+        channels = tuple(int(channel) for channel in value)
+    else:
+        msg = "channels must be text or an iterable of integers"
+        raise ValueError(msg)
+    normalized = tuple(sorted(channels))
+    if not normalized or any(channel < 1 or channel > 16 for channel in normalized):
+        msg = "channels must be in the range 1..16"
+        raise ValueError(msg)
+    if len(normalized) != len(set(normalized)):
+        msg = "channels must be unique"
+        raise ValueError(msg)
+    return normalized
 
 
 def _required(mapping: Mapping[str, object], key: str) -> object:
@@ -217,30 +251,20 @@ class BlindConfig:
     @classmethod
     def from_mapping(cls, values: Mapping[str, object]) -> BlindConfig:
         """Build a typed config from Home Assistant entry data/options."""
-        raw_channels = _required(values, CONF_CHANNELS)
-        if isinstance(raw_channels, str):
-            channels: Iterable[int] = (
-                int(part.strip()) for part in raw_channels.strip("{} ").split(",") if part.strip()
-            )
-        elif isinstance(raw_channels, Iterable):
-            channels = (int(channel) for channel in raw_channels)
-        else:
-            msg = "channels must be an iterable"
-            raise ValueError(msg)
-
-        prefix = _parse_hex(_required(values, CONF_PREFIX), CONF_PREFIX)
-        remote_id = _parse_hex(_required(values, CONF_REMOTE_ID), CONF_REMOTE_ID)
+        channels = parse_channels(_required(values, CONF_CHANNELS))
+        prefix = parse_hex(_required(values, CONF_PREFIX), CONF_PREFIX, 24)
+        remote_id = parse_hex(_required(values, CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
         configured_bases = [key in values for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
         if any(configured_bases) and not all(configured_bases):
             msg = "base_up, base_down, and base_stop must be configured together"
             raise ValueError(msg)
         bases = (
             CommandBases(
-                up=_parse_hex(_required(values, CONF_BASE_UP), CONF_BASE_UP),
-                down=_parse_hex(_required(values, CONF_BASE_DOWN), CONF_BASE_DOWN),
-                stop=_parse_hex(_required(values, CONF_BASE_STOP), CONF_BASE_STOP),
+                up=parse_hex(_required(values, CONF_BASE_UP), CONF_BASE_UP, 16),
+                down=parse_hex(_required(values, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
+                stop=parse_hex(_required(values, CONF_BASE_STOP), CONF_BASE_STOP, 16),
                 trailer=(
-                    _parse_hex(values[CONF_BASE_TRAILER], CONF_BASE_TRAILER)
+                    parse_hex(values[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
                     if values.get(CONF_BASE_TRAILER) not in (None, "")
                     else None
                 ),
@@ -264,7 +288,7 @@ class BlindConfig:
         return cls(
             name=str(_required(values, CONF_NAME)),
             remote=remote,
-            channels=tuple(channels),
+            channels=channels,
             travel_up=_as_float(_required(values, CONF_TRAVEL_UP), CONF_TRAVEL_UP),
             travel_down=_as_float(_required(values, CONF_TRAVEL_DOWN), CONF_TRAVEL_DOWN),
             area_id=str(_required(values, CONF_AREA_ID)),
@@ -435,12 +459,23 @@ class _QueuedCommand:
     stop_after_ms: int | None
     is_movement: bool
     is_stop: bool
-    coalesce_key: tuple[RemoteIdentity, Button] | None
+    remote: RemoteIdentity | None
+    channels: frozenset[int]
+    coalesce_key: tuple[RemoteIdentity, Button, str] | None
     coalesce_config: BlindConfig | None
     coalesce_button: Button | None
     enqueued_at: float
     coalesce_deadline: float | None
     futures: list[asyncio.Future[CommandResult]]
+
+    def overlaps(self, other: _QueuedCommand) -> bool:
+        """Return whether both commands address intersecting channels of one remote."""
+        return (
+            self.remote is not None
+            and other.remote is not None
+            and self.remote.key == other.remote.key
+            and bool(self.channels & other.channels)
+        )
 
 
 class ZemismartHub:
@@ -470,6 +505,15 @@ class ZemismartHub:
         self._queue: deque[_QueuedCommand] = deque()
         self._queue_ready = asyncio.Condition()
         self._worker_task: asyncio.Task[None] | None = None
+        self._inflight: _QueuedCommand | None = None
+        self._fast_stops: set[asyncio.Task[None]] = set()
+        self.displaced_listeners: list[Callable[[str, str], None]] = []
+        self.bridge_listeners: list[Callable[[], None]] = []
+
+    def notify_bridge_change(self) -> None:
+        """Tell registered entities that retained bridge state changed."""
+        for listener in self.bridge_listeners:
+            listener()
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -503,11 +547,18 @@ class ZemismartHub:
         raw_status = decoded.get("status")
         command_id = decoded.get("command_id")
         if (
-            raw_status not in {"accepted", "rejected", "started"}
+            raw_status not in {"accepted", "rejected", "started", "displaced"}
             or not isinstance(command_id, str)
             or not command_id
         ):
             return False
+        if raw_status == "displaced":
+            # Latest-command-wins on the bridge retired this command's RF
+            # state (its fail-safe STOP was flushed on air). Let covers freeze
+            # the corresponding motion model.
+            for listener in self.displaced_listeners:
+                listener(bridge_id, command_id)
+            return True
         pending = self._pending.get((bridge_id, command_id))
         if pending is None:
             return False
@@ -537,31 +588,69 @@ class ZemismartHub:
             )
 
     async def _async_enqueue(self, command: _QueuedCommand) -> CommandResult:
-        """Queue a command, giving STOP front priority and same-cover supersession."""
+        """Queue a command, giving STOP front priority and overlap supersession."""
         future = command.futures[0]
+        fast_lane = False
         async with self._queue_ready:
             if command.is_stop:
+                # A STOP supersedes every queued movement whose channels
+                # intersect its own on the same remote (exact-target and
+                # member-vs-group alike); the bridge's latest-command-wins
+                # replacement handles anything already on air.
                 retained: deque[_QueuedCommand] = deque()
                 while self._queue:
                     queued = self._queue.popleft()
-                    if queued.target == command.target and queued.is_movement:
+                    if queued.is_movement and queued.overlaps(command):
                         for queued_future in queued.futures:
                             if not queued_future.done():
                                 queued_future.set_result("superseded")
                     else:
                         retained.append(queued)
                 self._queue = retained
-                self._queue.appendleft(command)
+                # Safety fast lane: unless the in-flight command addresses the
+                # same channels (publishing order must be preserved), a STOP
+                # skips the global one-at-a-time lane entirely so it cannot
+                # sit behind another cover's slow acknowledgement.
+                inflight = self._inflight
+                if inflight is None or not inflight.overlaps(command):
+                    fast_lane = True
+                else:
+                    self._queue.appendleft(command)
             else:
                 self._queue.append(command)
-            self._ensure_worker()
-            self._queue_ready.notify()
+            if not fast_lane:
+                self._ensure_worker()
+                self._queue_ready.notify()
+        if fast_lane:
+            task = asyncio.create_task(
+                self._async_run_direct(command),
+                name="Zemismart fast-lane STOP",
+            )
+            self._fast_stops.add(task)
+            task.add_done_callback(self._fast_stops.discard)
         try:
             return await future
         except asyncio.CancelledError:
             async with self._queue_ready:
                 self._queue_ready.notify()
             raise
+
+    async def _async_run_direct(self, command: _QueuedCommand) -> None:
+        """Execute one command outside the worker lane, resolving its futures."""
+        try:
+            result = await self._async_execute(command)
+        except asyncio.CancelledError:
+            for future in command.futures:
+                future.cancel()
+            raise
+        except Exception as exc:
+            for future in command.futures:
+                if not future.done():
+                    future.set_exception(exc)
+        else:
+            for future in command.futures:
+                if not future.done():
+                    future.set_result(result)
 
     async def _async_pop(self) -> _QueuedCommand:
         """Wait for the next command and union one expired movement batch."""
@@ -577,13 +666,10 @@ class ZemismartHub:
                 if command.coalesce_deadline is None:
                     return self._queue.popleft()
                 for queued in self._queue:
-                    if (
-                        queued.coalesce_key == command.coalesce_key
-                        and queued.enqueued_at <= command.coalesce_deadline
-                        and queued.stop_after_ms == command.stop_after_ms
-                        and queued.coalesce_deadline is not None
-                        and any(not future.done() for future in queued.futures)
+                    if self._coalesce_eligible(queued, command) and any(
+                        not future.done() for future in queued.futures
                     ):
+                        assert queued.coalesce_deadline is not None
                         command.coalesce_deadline = min(
                             command.coalesce_deadline,
                             queued.coalesce_deadline,
@@ -596,6 +682,17 @@ class ZemismartHub:
                 command = self._queue.popleft()
                 self._coalesce_queued_movements(command)
                 return command
+
+    @staticmethod
+    def _coalesce_eligible(queued: _QueuedCommand, command: _QueuedCommand) -> bool:
+        """Return whether a queued sibling may merge into the leading command."""
+        return (
+            queued.coalesce_key == command.coalesce_key
+            and queued.coalesce_deadline is not None
+            and command.coalesce_deadline is not None
+            and queued.enqueued_at <= command.coalesce_deadline
+            and queued.stop_after_ms == command.stop_after_ms
+        )
 
     def _coalesce_queued_movements(self, command: _QueuedCommand) -> None:
         """Absorb eligible siblings that arrived within the first command's window."""
@@ -614,12 +711,7 @@ class ZemismartHub:
             queued = self._queue.popleft()
             if all(future.done() for future in queued.futures):
                 continue
-            if (
-                queued.coalesce_key == command.coalesce_key
-                and queued.enqueued_at <= command.coalesce_deadline
-                and queued.stop_after_ms == command.stop_after_ms
-                and queued.coalesce_config is not None
-            ):
+            if self._coalesce_eligible(queued, command) and queued.coalesce_config is not None:
                 channels.update(queued.coalesce_config.channels)
                 repeats = max(repeats, queued.coalesce_config.repeats)
                 command.futures.extend(queued.futures)
@@ -635,6 +727,7 @@ class ZemismartHub:
             repeats=repeats,
         )
         command.target = config.target_key
+        command.channels = frozenset(channels)
         command.body = self._command_body(
             config,
             command.coalesce_button,
@@ -648,20 +741,11 @@ class ZemismartHub:
                 command = await self._async_pop()
                 if all(future.done() for future in command.futures):
                     continue
+                self._inflight = command
                 try:
-                    result = await self._async_execute(command)
-                except asyncio.CancelledError:
-                    for future in command.futures:
-                        future.cancel()
-                    raise
-                except Exception as exc:
-                    for future in command.futures:
-                        if not future.done():
-                            future.set_exception(exc)
-                else:
-                    for future in command.futures:
-                        if not future.done():
-                            future.set_result(result)
+                    await self._async_run_direct(command)
+                finally:
+                    self._inflight = None
         finally:
             self._worker_task = None
 
@@ -810,7 +894,12 @@ class ZemismartHub:
                 stop_after_ms=stop_after_ms,
                 is_movement=button in {"UP", "DOWN"},
                 is_stop=button == "STOP",
-                coalesce_key=(config.remote, button) if coalesces else None,
+                remote=config.remote,
+                channels=frozenset(config.channels),
+                # The area is part of the key: merging covers from different
+                # areas would route one RF frame through a bridge that may not
+                # physically reach the other room's blind.
+                coalesce_key=(config.remote, button, config.area_id) if coalesces else None,
                 coalesce_config=config if coalesces else None,
                 coalesce_button=button if coalesces else None,
                 enqueued_at=enqueued_at,
@@ -829,7 +918,7 @@ class ZemismartHub:
         normalized = validate_b0_frame(raw)
         decoded = decode_b0(normalized)
         remote = RemoteIdentity(decoded["prefix"], decoded["remote_id"])
-        decoded_channels = cast("Iterable[int]", decoded["chans"])
+        decoded_channels = tuple(cast("Iterable[int]", decoded["chans"]))
         target = remote.target_key(decoded_channels)
         result = await self._async_enqueue(
             _QueuedCommand(
@@ -840,6 +929,8 @@ class ZemismartHub:
                 stop_after_ms=None,
                 is_movement=False,
                 is_stop=False,
+                remote=remote,
+                channels=frozenset(decoded_channels),
                 coalesce_key=None,
                 coalesce_config=None,
                 coalesce_button=None,
@@ -857,6 +948,9 @@ class ZemismartHub:
         if self._worker_task is not None:
             self._worker_task.cancel()
             self._worker_task = None
+        for task in self._fast_stops:
+            task.cancel()
+        self._fast_stops.clear()
         for command in self._queue:
             for future in command.futures:
                 future.cancel()
@@ -865,6 +959,8 @@ class ZemismartHub:
             pending.admission.cancel()
             pending.started.cancel()
         self._pending.clear()
+        self.displaced_listeners.clear()
+        self.bridge_listeners.clear()
 
 
 @dataclass(slots=True)

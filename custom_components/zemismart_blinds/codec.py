@@ -40,6 +40,14 @@ _SHORT_MAX_US: Final = 450
 _CAPTURE_PADDING_PULSES: Final = 2
 
 
+def _require_uint(value: object, bits: int, name: str) -> int:
+    """Validate one unsigned fixed-width protocol integer (booleans rejected)."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < (1 << bits):
+        msg = f"{name} must be an unsigned {bits}-bit integer"
+        raise ValueError(msg)
+    return value
+
+
 class DecodedFrame(TypedDict):
     """Fields decoded from a Zemismart payload."""
 
@@ -67,11 +75,8 @@ class CommandBases:
             ("stop", self.stop),
             ("trailer", self.trailer),
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFF
-            ):
-                msg = f"{name} base must be an unsigned 16-bit integer"
-                raise ValueError(msg)
+            if value is not None:
+                _require_uint(value, 16, f"{name} base")
 
     def base(self, button: str) -> int:
         """Return the calibrated base for one button."""
@@ -145,12 +150,8 @@ def derive_base(
     if button not in _ACTION_COMMAND_HIGH:
         msg = f"reference button must be one of {', '.join(_ACTION_COMMAND_HIGH)}"
         raise ValueError(msg)
-    if isinstance(ref_cmd, bool) or not isinstance(ref_cmd, int) or not 0 <= ref_cmd <= 0xFFFF:
-        msg = "reference command must be an unsigned 16-bit integer"
-        raise ValueError(msg)
-    if isinstance(remote_id, bool) or not isinstance(remote_id, int) or not 0 <= remote_id <= 0xFF:
-        msg = "remote_id must be an unsigned 8-bit integer"
-        raise ValueError(msg)
+    _require_uint(ref_cmd, 16, "reference command")
+    _require_uint(remote_id, 8, "remote_id")
     return (ref_cmd - remote_id + group_offset(normalized)) & 0xFFFF
 
 
@@ -186,9 +187,7 @@ def derive_bases(
 
 def derive_bases_from_base(button: str, base: int, remote_id: int) -> CommandBases:
     """Complete all action bases from one labeled per-remote action base."""
-    if isinstance(base, bool) or not isinstance(base, int) or not 0 <= base <= 0xFFFF:
-        msg = "command base must be an unsigned 16-bit integer"
-        raise ValueError(msg)
+    _require_uint(base, 16, "command base")
     reference_channels = (1,)
     reference_command = (base + remote_id - group_offset(reference_channels)) & 0xFFFF
     return derive_bases(reference_channels, button, reference_command, remote_id)
@@ -203,9 +202,7 @@ def synthesize_bases(remote_id: int, up_low: int) -> CommandBases:
     observed per-action opcode bytes with a caller-chosen UP low byte, exactly
     as :func:`derive_bases` would derive them from a capture.
     """
-    if isinstance(up_low, bool) or not isinstance(up_low, int) or not 0 <= up_low <= 0xFF:
-        msg = "up_low must be an unsigned 8-bit integer"
-        raise ValueError(msg)
+    _require_uint(up_low, 8, "up_low")
     reference_command = (_ACTION_COMMAND_HIGH["UP"] << 8) | up_low
     return derive_bases(_CALIBRATION_CHANNELS, "UP", reference_command, remote_id)
 
@@ -219,12 +216,8 @@ def make_payload(
     bases: CommandBases,
 ) -> int:
     """Build a 64-bit payload for one channel or an arbitrary group."""
-    if not 0 <= prefix <= 0xFFFFFF:
-        msg = "prefix must be an unsigned 24-bit integer"
-        raise ValueError(msg)
-    if not 0 <= remote_id <= 0xFF:
-        msg = "remote_id must be an unsigned 8-bit integer"
-        raise ValueError(msg)
+    _require_uint(prefix, 24, "prefix")
+    _require_uint(remote_id, 8, "remote_id")
     normalized = _channels_tuple(channels, allow_empty=False)
     if button not in BUTTONS:
         msg = f"button must be one of {', '.join(BUTTONS)}"
@@ -359,6 +352,11 @@ def _raw_parts(frame: str) -> tuple[list[int], str, bool]:
 
     # B1 is the Portisch receive form used by bucket sniffing. It has no B0
     # body-length/header byte: the bucket count immediately follows AAB1.
+    # Bound it like B0 so a pasted oversized capture cannot burn event-loop
+    # CPU/memory in the pulse decoder.
+    if len(frame) // 2 > _MAX_B0_FRAME_BYTES:
+        msg = "B1 frame exceeds the maximum size"
+        raise ValueError(msg)
     if len(frame) < 8:
         msg = "B1 frame header is truncated"
         raise ValueError(msg)
@@ -444,6 +442,11 @@ def _pulse_bits(
         previous = bit
 
     trailer_bits = bits[_FRAME_BITS:]
+    # Reference captures from legacy Hubitat exports truncate the OEM [1, 0]
+    # trailer either entirely ([]) or after its constant-period low half,
+    # which this decoder resolves as a single 0 bit ([0]). Those are the two
+    # truncations observed in real captures; a lone [1] never occurs because
+    # the trailer's 1-bit cannot terminate a capture without its paired low.
     valid_trailer = trailer_bits == [1, 0] or (allow_missing_trailer and trailer_bits in ([], [0]))
     if not valid_trailer:
         msg = "frame must end with the required [1, 0] trailer bits"
