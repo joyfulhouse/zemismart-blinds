@@ -1372,3 +1372,69 @@ def test_parse_channels_rejects_fractional_values() -> None:
     """Stored fractional channels are rejected, never silently truncated."""
     with pytest.raises(ValueError, match="whole number"):
         parse_channels([2.9])
+
+
+@pytest.mark.asyncio
+async def test_stale_overlap_token_supersedes_the_movement() -> None:
+    """A multi-frame operation aborts when its channels moved on since.
+
+    The caller snapshots the per-channel publish state between its STOP and
+    its movement; any overlapping publication in between means a newer
+    intent owns the channels and the stale movement resolves superseded.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    config = blind_config()
+    token = hub.overlap_token(config)
+    # An overlapping command publishes after the snapshot.
+    await hub.async_transmit(replace(config, channels=(2,)), "UP")
+
+    result = await hub.async_transmit(config, "DOWN", overlap_token=token)
+    assert result == "superseded"
+    assert len(published) == 1  # the stale movement never reached the broker
+
+    # A fresh token publishes normally.
+    fresh = await hub.async_transmit(config, "DOWN", overlap_token=hub.overlap_token(config))
+    assert isinstance(fresh, CommandAck)
+    assert len(published) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_contributor_channel_is_dropped_from_the_batch() -> None:
+    """A coalesced batch rebuilds from LIVE contributors before publishing.
+
+    The cancelled caller's channel must not move with the surviving batch.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    first_config = config_with_window(replace(blind_config(), channels=(1,)), 30)
+    second_config = config_with_window(replace(blind_config(), channels=(2,)), 30)
+    first = asyncio.create_task(hub.async_transmit(first_config, "UP"))
+    second = asyncio.create_task(hub.async_transmit(second_config, "UP"))
+    await asyncio.sleep(0)
+
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    assert isinstance(await first, CommandAck)
+
+    assert len(published) == 1
+    assert published[0]["target"] == "a1b2c3:42:1"

@@ -183,15 +183,6 @@ def _as_float(value: object, field: str) -> float:
         raise ValueError(msg) from exc
 
 
-def _as_int(value: object, field: str) -> int:
-    """Coerce a stored JSON scalar to int without accepting arbitrary objects."""
-    try:
-        return int(_number_scalar(value, field, "an integer"))
-    except ValueError as exc:
-        msg = f"{field} must be an integer"
-        raise ValueError(msg) from exc
-
-
 @dataclass(frozen=True, slots=True)
 class RemoteIdentity:
     """The 32-bit identity shared by every channel of one remote."""
@@ -324,8 +315,8 @@ class BlindConfig:
             travel_up=_as_float(_required(values, CONF_TRAVEL_UP), CONF_TRAVEL_UP),
             travel_down=_as_float(_required(values, CONF_TRAVEL_DOWN), CONF_TRAVEL_DOWN),
             area_id=str(_required(values, CONF_AREA_ID)),
-            repeats=_as_int(_required(values, CONF_REPEATS), CONF_REPEATS),
-            coalesce_window_ms=_as_int(
+            repeats=whole_number(_required(values, CONF_REPEATS), CONF_REPEATS),
+            coalesce_window_ms=whole_number(
                 values.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
                 CONF_COALESCE_WINDOW_MS,
             ),
@@ -424,11 +415,14 @@ class BridgeRegistry:
         if not bridge_id:
             return
         current = self._bridges.get(bridge_id, BridgeInfo(bridge_id))
+        # Retained info is the COMPLETE metadata document: missing keys (or
+        # an emptied retained topic, delivered here as an empty mapping)
+        # clear the fields rather than preserving stale area/default values.
         raw_area = payload.get("area_id", payload.get("area"))
-        area_id = str(raw_area).strip() if raw_area is not None else current.area_id
+        area_id = str(raw_area).strip() if raw_area is not None else None
         if not area_id:
             area_id = None
-        raw_default = payload.get("default", current.is_default)
+        raw_default = payload.get("default", False)
         is_default = (
             raw_default.strip().lower() in {"1", "true", "yes", "on"}
             if isinstance(raw_default, str)
@@ -493,6 +487,20 @@ class _PendingStatuses:
     started: asyncio.Future[float]
 
 
+@dataclass(slots=True)
+class _Contributor:
+    """One caller's share of a coalesced movement batch."""
+
+    channels: frozenset[int]
+    repeats: int
+    futures: list[asyncio.Future[CommandResult]]
+
+    @property
+    def live(self) -> bool:
+        """Return whether any caller still awaits this contribution."""
+        return any(not future.done() for future in self.futures)
+
+
 @dataclass(frozen=True, slots=True)
 class CommandAck:
     """Correlated bridge admission and actual first RF dispatch."""
@@ -533,6 +541,14 @@ class _QueuedCommand:
     # acknowledgement lifecycles would park safety STOPs behind slow acks.
     published: asyncio.Event | None = None
     publish_barriers: list[asyncio.Event] = field(default_factory=list)
+    # Coalesced batches keep each contributor's channels/repeats paired with
+    # its futures so the frame can be rebuilt at publish time from LIVE
+    # contributors only (a cancelled caller's channel must not move).
+    contributors: list[_Contributor] = field(default_factory=list)
+    # Optimistic multi-frame operation guard: a snapshot of the per-channel
+    # publish sequence taken by the caller; the hub refuses to publish (as
+    # "superseded") if any overlapping publication happened since.
+    overlap_token: int | None = None
 
     @property
     def coalesce_key(self) -> tuple[str, Button, str] | None:
@@ -592,6 +608,7 @@ class ZemismartHub:
         self._fast_stops: set[asyncio.Task[None]] = set()
         self._recent_displaced: dict[str, float] = {}
         self._bridge_affinity: dict[tuple[str, str], tuple[str, float]] = {}
+        self._publish_seq: dict[tuple[str, int], int] = {}
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -725,6 +742,62 @@ class ZemismartHub:
                 name="Zemismart global command worker",
             )
 
+    def _overlap_seq(self, remote: RemoteIdentity | None, channels: frozenset[int]) -> int:
+        """Sum the publish sequence numbers covering these channels."""
+        if remote is None:
+            return 0
+        return sum(self._publish_seq.get((remote.key, channel), 0) for channel in channels)
+
+    def overlap_token(self, config: BlindConfig) -> int:
+        """Snapshot the publish state of a config's channels.
+
+        A caller running a multi-frame operation (stop, measure, move) takes
+        the token between frames and passes it to the final transmit; the
+        hub refuses to publish (resolving ``superseded``) if any overlapping
+        publication happened in between.
+        """
+        return self._overlap_seq(config.remote, frozenset(config.channels))
+
+    def _record_publish(self, command: _QueuedCommand) -> None:
+        """Advance every published channel's sequence number."""
+        if command.remote is None:
+            return
+        for channel in command.channels:
+            key = (command.remote.key, channel)
+            self._publish_seq[key] = self._publish_seq.get(key, 0) + 1
+
+    def _rebuild_from_live_contributors(self, command: _QueuedCommand) -> None:
+        """Drop cancelled contributors' channels from a coalesced batch.
+
+        Between merge and publish a contributing caller can cancel; its
+        channel must not move with the surviving batch.
+        """
+        if not command.contributors or command.coalesce_config is None:
+            return
+        live = [contributor for contributor in command.contributors if contributor.live]
+        if not live:
+            return
+        channels: set[int] = set()
+        repeats = 0
+        for contributor in live:
+            channels.update(contributor.channels)
+            repeats = max(repeats, contributor.repeats)
+        if frozenset(channels) == command.channels:
+            return
+        config = replace(
+            command.coalesce_config,
+            channels=tuple(sorted(channels)),
+            repeats=repeats,
+        )
+        command.target = config.target_key
+        command.channels = frozenset(channels)
+        assert command.coalesce_button is not None
+        command.body = self._command_body(
+            config,
+            command.coalesce_button,
+            stop_after_ms=command.stop_after_ms,
+        )
+
     def _overlap_publish_barriers(self, command: _QueuedCommand) -> list[asyncio.Event]:
         """Snapshot unpublished earlier overlapping commands' publish events."""
         barriers = [
@@ -784,13 +857,16 @@ class ZemismartHub:
                         not queued_future.done() for queued_future in queued.futures
                     ):
                         last_overlap = index
+                # Snapshot barriers on BOTH paths: the queued path preserves
+                # order against the raw frame via queue position, but still
+                # needs the barrier against an earlier unpublished fast STOP.
+                command.publish_barriers = self._overlap_publish_barriers(command)
                 if last_overlap is not None:
                     # Behind the queued overlap (and therefore also behind
                     # any overlapping in-flight command).
                     self._queue.insert(last_overlap + 1, command)
                 else:
                     fast_lane = True
-                    command.publish_barriers = self._overlap_publish_barriers(command)
                     self._fast_inflight.add(command)
             else:
                 # Movements and raw frames go through the worker in queue
@@ -823,13 +899,7 @@ class ZemismartHub:
     async def _async_run_fast(self, command: _QueuedCommand) -> None:
         """Run a fast-lane STOP once earlier overlapping commands published."""
         try:
-            for barrier in command.publish_barriers:
-                await barrier.wait()
-            # Re-check after the barrier wait: a caller may have canceled or
-            # a newer command superseded every waiter meanwhile — a resolved
-            # STOP must not still reach RF and halt the newer command.
-            if not all(future.done() for future in command.futures):
-                await self._async_run_direct(command)
+            await self._async_run_direct(command)
         finally:
             self._fast_inflight.discard(command)
             if command.published is not None:
@@ -839,6 +909,16 @@ class ZemismartHub:
         """Execute one command, resolving its futures (worker or fast lane)."""
         result: CommandResult
         try:
+            # Request order becomes publish order: wait for earlier
+            # overlapping commands (snapshotted at enqueue) to reach the
+            # broker first — for BOTH lanes.
+            for barrier in command.publish_barriers:
+                await barrier.wait()
+            # Re-check after the barrier wait: a caller may have canceled or
+            # a newer command superseded every waiter meanwhile — a resolved
+            # command must not still reach RF.
+            if all(future.done() for future in command.futures):
+                return
             result = await self._async_execute(command)
         except asyncio.CancelledError:
             for future in command.futures:
@@ -962,6 +1042,22 @@ class ZemismartHub:
                 channels.update(queued.coalesce_config.channels)
                 repeats = max(repeats, queued.coalesce_config.repeats)
                 command.futures.extend(queued.futures)
+                # The sibling's ordering constraints and its identity within
+                # the batch both survive the merge: its barriers gate the
+                # union, and its contributor entry lets a later cancellation
+                # remove exactly its channels before publish.
+                command.publish_barriers.extend(
+                    barrier
+                    for barrier in queued.publish_barriers
+                    if not barrier.is_set() and barrier not in command.publish_barriers
+                )
+                command.contributors.append(
+                    _Contributor(
+                        channels=frozenset(queued.coalesce_config.channels),
+                        repeats=queued.coalesce_config.repeats,
+                        futures=list(queued.futures),
+                    )
+                )
                 merged = True
             else:
                 retained.append(queued)
@@ -1087,10 +1183,15 @@ class ZemismartHub:
 
     async def _async_execute(self, command: _QueuedCommand) -> CommandAck:
         """Resolve, publish, then await admission and first RF dispatch."""
-        # Request order becomes publish order: wait for earlier overlapping
-        # commands (snapshotted at enqueue) to reach the broker first.
-        for barrier in command.publish_barriers:
-            await barrier.wait()
+        self._rebuild_from_live_contributors(command)
+        if command.overlap_token is not None and command.overlap_token != self._overlap_seq(
+            command.remote, command.channels
+        ):
+            # The caller's multi-frame operation (measure -> move) was based
+            # on channel state that a newer overlapping publication has since
+            # replaced; transmitting the stale movement would overwrite the
+            # newer intent.
+            raise CommandDisplacedError(command.target)
         if command.bridge_id is not None:
             bridge = self.registry.online_bridge(command.bridge_id)
         else:
@@ -1112,6 +1213,7 @@ class ZemismartHub:
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
                 json.dumps(body, separators=(",", ":")),
             )
+            self._record_publish(command)
             if command.published is not None:
                 command.published.set()
             status = await self._await_status(pending.admission, command_id)
@@ -1184,6 +1286,7 @@ class ZemismartHub:
         button: Button,
         *,
         stop_after_ms: int | None = None,
+        overlap_token: int | None = None,
     ) -> CommandResult:
         """Queue one validated cover command and await its result."""
         if stop_after_ms is not None and stop_after_ms <= 0:
@@ -1195,6 +1298,7 @@ class ZemismartHub:
         coalesces = (
             button in {"UP", "DOWN"} and not config.is_group and config.coalesce_window_ms > 0
         )
+        future: asyncio.Future[CommandResult] = loop.create_future()
         return await self._async_enqueue(
             _QueuedCommand(
                 target=config.target_key,
@@ -1212,7 +1316,19 @@ class ZemismartHub:
                 coalesce_deadline=(
                     enqueued_at + config.coalesce_window_ms / 1_000 if coalesces else None
                 ),
-                futures=[loop.create_future()],
+                futures=[future],
+                contributors=(
+                    [
+                        _Contributor(
+                            channels=frozenset(config.channels),
+                            repeats=config.repeats,
+                            futures=[future],
+                        )
+                    ]
+                    if coalesces
+                    else []
+                ),
+                overlap_token=overlap_token,
             )
         )
 

@@ -175,6 +175,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         state = await self.async_get_last_state()
         if state is None:
             return
+        if state.attributes.get("remote") != self._config.remote_key or state.attributes.get(
+            "channels"
+        ) != list(self._config.channels):
+            # The entry was re-pointed at different hardware (remote or
+            # channel set changed in options): the persisted position and
+            # motion describe the OLD physical target and must not be
+            # assigned to the new one.
+            return
         restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
         if restored is not None and 0 <= restored <= 100:
             self._position = restored
@@ -462,16 +470,18 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         target: float,
         duration: float,
         notify_members: bool = True,
+        absolute_anchor: bool = False,
     ) -> None:
         """Commit a fresh local model from correlated first RF dispatch."""
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
-        if target in (0.0, 100.0):
-            # Only an ABSOLUTE re-anchor (a travel that ends on the motor's
-            # own limit switch) settles an unverified restore-time anchor. A
-            # relative partial move still derives from the questioned
-            # position, so the anchor stays revocable by a late offline
-            # report from its bridge.
+        if absolute_anchor:
+            # Only an ABSOLUTE re-anchor (a commanded full travel whose
+            # duration guarantees the motor's own limit switch) settles an
+            # unverified restore-time anchor. A relative partial move — even
+            # one whose believed target CLAMPS to an endpoint — still
+            # derives from the questioned position, so the anchor stays
+            # revocable by a late offline report from its bridge.
             self._unverified_anchor_bridge = None
         self._motion_start_position = self._position
         self._motion_target = target
@@ -557,6 +567,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             target=target,
             duration=duration,
             notify_members=False,
+            absolute_anchor=group_target in (0.0, 100.0),
         )
         self.async_write_ha_state()
 
@@ -593,6 +604,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         button: Button,
         *,
         stop_after_ms: int | None = None,
+        overlap_token: int | None = None,
     ) -> CommandAck | None:
         """Await the queued result and translate transport errors into HA state."""
         try:
@@ -600,6 +612,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 self._config,
                 button,
                 stop_after_ms=stop_after_ms,
+                overlap_token=overlap_token,
             )
         except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
             self._mark_unknown_and_notify_members()
@@ -628,6 +641,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             direction=direction,
             target=target,
             duration=configured + FULL_TRAVEL_MARGIN_SECONDS,
+            absolute_anchor=True,
         )
         self.async_write_ha_state()
 
@@ -693,6 +707,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         # abort instead of publishing an older intent over it.
         if self._direction != 0 and not await self._async_stop():
             return
+        # Snapshot channel publish state: if any overlapping command
+        # publishes between this measurement and our movement frame, the
+        # hub resolves the movement as superseded instead of letting the
+        # OLDER intent overwrite the newer command on air.
+        overlap_token = self._hub.overlap_token(self._config)
         current = self._estimated_position(WALL_CLOCK())
         if current is None:
             msg = "position is unknown; run a full open or close calibration first"
@@ -707,6 +726,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         ack = await self._async_transmit(
             "UP" if direction > 0 else "DOWN",
             stop_after_ms=stop_after_ms,
+            overlap_token=overlap_token,
         )
         if ack is None:
             return

@@ -48,7 +48,7 @@ Home Assistant ──(HA MQTT integration)── broker ──(rf433/<bridge>/tx
 
 | Requirement | Details |
 |---|---|
-| **Home Assistant** | Version **2026.5** or newer, with the MQTT integration configured |
+| **Home Assistant** | Version **2026.5** or newer (ships Python 3.14, which this integration's syntax requires), with the MQTT integration configured |
 | **MQTT broker** | Any — the Mosquitto add-on is the easiest |
 | **RF bridge** | Sonoff RF Bridge R2 flashed with [esphome-rf433-mqtt-bridge][bridge-repo] (Portisch RF firmware required) |
 | **Blinds** | AOK OEM 433.92 MHz tubular motors — commonly sold as Zemismart; other AOK resellers are expected to be compatible |

@@ -566,7 +566,12 @@ async def test_incomplete_restart_motion_becomes_unknown(hass: HomeAssistant) ->
     restored_state = State(
         "cover.living_room_left",
         "opening",
-        {ATTR_CURRENT_POSITION: 50, "motion_direction": 1},
+        {
+            ATTR_CURRENT_POSITION: 50,
+            "motion_direction": 1,
+            "remote": cover_config().remote_key,
+            "channels": list(cover_config().channels),
+        },
     )
 
     class IncompleteCover(ZemismartCover):
@@ -1261,3 +1266,36 @@ async def test_partial_move_keeps_the_unverified_anchor_revocable(
         assert restored.current_cover_position is None
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_restored_state_from_different_hardware_is_ignored(
+    hass: HomeAssistant,
+) -> None:
+    """Re-pointing an entry at other hardware discards the old estimate."""
+    restored_state = State(
+        "cover.living_room_left",
+        "closed",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": "beef01:07",
+            "channels": [5],
+        },
+    )
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(online_registry(), publish),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert entity.current_cover_position is None
+    finally:
+        await entity.async_will_remove_from_hass()

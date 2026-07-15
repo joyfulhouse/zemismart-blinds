@@ -94,8 +94,17 @@ def _handle_info(runtime: DomainRuntime, message: ReceiveMessage) -> None:
     if bridge_id is None:
         return
     try:
-        decoded: object = json.loads(_payload_text(message.payload))
-    except UnicodeDecodeError, json.JSONDecodeError:
+        text = _payload_text(message.payload)
+    except UnicodeDecodeError:
+        return
+    if not text.strip():
+        # Retained-topic deletion: clear the stale area/default metadata.
+        runtime.hub.registry.update_info(bridge_id, {})
+        runtime.hub.notify_bridge_change()
+        return
+    try:
+        decoded: object = json.loads(text)
+    except json.JSONDecodeError:
         return
     if isinstance(decoded, Mapping):
         info = {str(key): value for key, value in decoded.items()}
@@ -132,6 +141,14 @@ async def _async_initialize_domain_runtime(
 ) -> None:
     """Install the three shared subscriptions and services exactly once."""
     from homeassistant.components import mqtt
+    from homeassistant.exceptions import ConfigEntryNotReady
+
+    # The MQTT integration being loaded does not mean its client is ready to
+    # accept subscriptions on cold startup; HA requires MQTT-dependent
+    # integrations to wait before subscribing.
+    if not await mqtt.async_wait_for_mqtt_client(hass):
+        msg = "MQTT client is not available"
+        raise ConfigEntryNotReady(msg)
 
     subscriptions = (
         (MQTT_AVAILABILITY_TOPIC, functools.partial(_handle_availability, runtime)),
@@ -187,6 +204,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     import voluptuous as vol
     from homeassistant.core import SupportsResponse
     from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.helpers.service import async_register_admin_service
 
     async def async_send_raw(call: ServiceCall) -> None:
         runtime = cast("DomainRuntime | None", hass.data.get(DOMAIN))
@@ -216,7 +234,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             CONF_BASE_STOP: f"0x{bases.stop:04x}",
         }
 
-    hass.services.async_register(
+    # send_raw can physically operate ANY blind reachable from any bridge:
+    # admin-only, like other raw hardware escape hatches.
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_SEND_RAW,
         async_send_raw,
