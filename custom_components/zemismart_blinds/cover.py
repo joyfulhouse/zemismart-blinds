@@ -48,6 +48,7 @@ _ATTR_MOTION_STARTED = "motion_started"
 _ATTR_MOTION_START_POSITION = "motion_start_position"
 _ATTR_MOTION_TARGET = "motion_target"
 _ATTR_MOTION_TIMED = "motion_timed"
+_ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
 WALL_CLOCK = time.time
 _COVERS: weakref.WeakKeyDictionary[ZemismartHub, weakref.WeakSet[ZemismartCover]] = (
     weakref.WeakKeyDictionary()
@@ -165,6 +166,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_BRIDGE: self._motion_bridge,
             _ATTR_MOTION_COMMAND_ID: self._motion_command_id,
             _ATTR_MOTION_TIMED: self._motion_timed,
+            _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -189,6 +191,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._position = restored
         self._last_bridge = self._optional_text(state.attributes.get(_ATTR_LAST_BRIDGE))
         self._degraded = bool(state.attributes.get(_ATTR_DEGRADED, False))
+        # A questioned restore anchor survives repeated restarts: without
+        # this, a second restart before the anchor bridge's availability
+        # arrives would silently promote the unverified target to trusted.
+        self._unverified_anchor_bridge = self._optional_text(
+            state.attributes.get(_ATTR_UNVERIFIED_ANCHOR)
+        )
 
         raw_direction = state.attributes.get(_ATTR_MOTION_DIRECTION, 0)
         direction = (
@@ -311,7 +319,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 # got to fire: the retained availability that just arrived
                 # says it was offline. The motor may sit at its hard limit.
                 self._unverified_anchor_bridge = None
-                self._mark_unknown()
+                if self._direction == 0:
+                    # No live motion depends on the questioned position, so
+                    # it is now known-bad. A currently RUNNING motion (e.g. a
+                    # full OPEN commanded through another bridge) already owns
+                    # the estimate and must NOT be cancelled here — it will
+                    # settle a genuine anchor on completion or be superseded.
+                    self._mark_unknown()
             elif self._bridge_seen_online(anchor_bridge):
                 self._unverified_anchor_bridge = None
         if (

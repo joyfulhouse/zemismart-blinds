@@ -1370,3 +1370,126 @@ async def test_full_travel_interrupted_before_completion_keeps_anchor_revocable(
         assert restored.current_cover_position is None
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_unverified_anchor_survives_a_second_restart(hass: HomeAssistant) -> None:
+    """The questioned-anchor marker persists so repeated restarts stay honest.
+
+    After the first restart anchors an expired timed motion (clearing the
+    motion, so direction is 0), a second restart before availability arrives
+    must not silently promote that target to trusted: the marker is restored
+    from state and a late offline report still revokes it.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    first_attrs = dict(original.extra_state_attributes)
+    first_attrs[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)  # expire the deadline
+
+    holder: dict[str, State] = {"state": State("cover.living_room_left", "open", first_attrs)}
+
+    class Restored(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return holder["state"]
+
+    async def quiet(_topic: str, _payload: str) -> None:
+        return
+
+    # First restart: empty registry -> anchors at 80, marks it unverified,
+    # clears the motion (direction 0).
+    first = await attach_cover(
+        hass,
+        ZemismartHub(BridgeRegistry(), quiet),
+        config=cover_config(travel=0.02),
+        cover_type=Restored,
+    )
+    assert first.current_cover_position == 80
+    assert first.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+    second_attrs = dict(first.extra_state_attributes)
+    second_attrs[ATTR_CURRENT_POSITION] = first.current_cover_position
+    await first.async_will_remove_from_hass()
+
+    # Second restart from the first restart's persisted (direction-0) state.
+    holder["state"] = State("cover.living_room_left", "open", second_attrs)
+    reg2 = BridgeRegistry()
+    hub2 = ZemismartHub(reg2, quiet)
+    second = await attach_cover(hass, hub2, config=cover_config(travel=0.02), cover_type=Restored)
+    try:
+        assert second.current_cover_position == 80  # restored, still unverified
+        reg2.update_availability("bridge-a", "offline")
+        hub2.notify_bridge_change()
+        assert second.current_cover_position is None  # marker survived -> revoked
+    finally:
+        await second.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_offline_anchor_does_not_cancel_a_running_motion(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late offline for the OLD anchor must not cancel a live full travel.
+
+    While a full OPEN commanded through another bridge is running, the
+    original (undiscovered) anchor bridge reporting offline must leave the
+    active motion alone — it reaches the hard limit and anchors at 100,
+    rather than being cancelled to unknown forever.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.005)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    empty_registry = BridgeRegistry()
+    restored_hub: ZemismartHub
+
+    async def restored_publish(topic: str, payload: str) -> None:
+        acknowledge(restored_hub, topic.split("/")[1], json.loads(payload))
+
+    restored_hub = ZemismartHub(empty_registry, restored_publish)
+    restored = await attach_cover(
+        hass, restored_hub, config=cover_config(travel=0.05), cover_type=RestoredCover
+    )
+    try:
+        assert restored.current_cover_position == 80
+        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_availability("bridge-b", "online")
+        restored_hub.notify_bridge_change()
+
+        await restored.async_open_cover()  # full travel through bridge-b
+        assert restored.is_opening
+        # The anchor bridge reports offline WHILE the OPEN is running.
+        empty_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+        assert restored.is_opening  # not cancelled
+
+        await asyncio.sleep(0.1)  # let the full travel complete
+        assert restored.current_cover_position == 100
+        assert not restored.is_opening
+    finally:
+        await restored.async_will_remove_from_hass()

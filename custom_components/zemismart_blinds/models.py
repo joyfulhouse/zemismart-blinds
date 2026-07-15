@@ -609,6 +609,11 @@ class ZemismartHub:
         self._recent_displaced: dict[str, float] = {}
         self._bridge_affinity: dict[tuple[str, str], tuple[str, float]] = {}
         self._publish_seq: dict[tuple[str, int], int] = {}
+        # Serializes just the synchronous broker enqueue so bridge-receipt
+        # order matches request order without any command holding the order
+        # barrier across a QoS-1 broker acknowledgment.
+        self._publish_lock = asyncio.Lock()
+        self._publish_tasks: set[asyncio.Task[None]] = set()
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -988,13 +993,17 @@ class ZemismartHub:
 
     @staticmethod
     def _coalesce_eligible(queued: _QueuedCommand, command: _QueuedCommand) -> bool:
-        """Return whether a queued sibling may merge into the leading command."""
+        """Return whether a queued sibling may merge into the leading command.
+
+        Only untimed full-travel moves ever set coalesce_deadline, so both
+        commands necessarily share ``stop_after_ms is None`` — no stop-time
+        comparison is needed.
+        """
         return (
             queued.coalesce_key == command.coalesce_key
             and queued.coalesce_deadline is not None
             and command.coalesce_deadline is not None
             and queued.enqueued_at <= command.coalesce_deadline
-            and queued.stop_after_ms == command.stop_after_ms
         )
 
     @staticmethod
@@ -1181,6 +1190,46 @@ class ZemismartHub:
         )
         self._bridge_affinity[key] = (bridge_id, now + hold)
 
+    async def _ordered_publish(self, command: _QueuedCommand, topic: str, payload: str) -> None:
+        """Enqueue one tx message in request order without blocking on its ack.
+
+        paho preserves publish()-call order to the broker, and HA's
+        ``async_publish`` hands the message to paho synchronously before it
+        awaits the QoS-1 PUBACK. Serializing only that synchronous enqueue
+        (one scheduling yield, under the publish lock) fixes bridge-receipt
+        order; the PUBACK then completes in the background, so a later
+        overlapping command — a fast-lane STOP — is never held behind an
+        earlier command's broker acknowledgment. QoS-1 reliability is
+        unaffected: paho retries the already-buffered message on its own.
+        """
+        async with self._publish_lock:
+            task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
+            # Yield once so the task runs up to its PUBACK await — past the
+            # synchronous paho enqueue — before the lock and barrier release.
+            await asyncio.sleep(0)
+            transport_error = task.exception() if task.done() and not task.cancelled() else None
+            if transport_error is None:
+                # Still enqueuing/awaiting its PUBACK: reap it in the
+                # background so ordering never waits on the acknowledgment.
+                self._publish_tasks.add(task)
+                task.add_done_callback(self._on_publish_done)
+        if transport_error is not None:
+            # An immediate transport failure (e.g. broker down) surfaces
+            # fast instead of waiting out the admission timeout. The order
+            # barrier is still released by _async_run_direct's finally.
+            raise transport_error
+        self._record_publish(command)
+        if command.published is not None:
+            command.published.set()
+
+    def _on_publish_done(self, task: asyncio.Task[None]) -> None:
+        """Retire a background publish, surfacing a transport error to the log."""
+        self._publish_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            # The missing admission/started ack is the caller-facing symptom
+            # (a timeout); log the underlying publish failure for diagnosis.
+            _LOGGER.warning("MQTT publish failed: %s", exc)
+
     async def _async_execute(self, command: _QueuedCommand) -> CommandAck:
         """Resolve, publish, then await admission and first RF dispatch."""
         self._rebuild_from_live_contributors(command)
@@ -1208,14 +1257,12 @@ class ZemismartHub:
             bridge.bridge_id,
             bridge.area_id,
         )
+        await self._ordered_publish(
+            command,
+            f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
+            json.dumps(body, separators=(",", ":")),
+        )
         try:
-            await self._publisher(
-                f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
-                json.dumps(body, separators=(",", ":")),
-            )
-            self._record_publish(command)
-            if command.published is not None:
-                command.published.set()
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
         finally:
@@ -1386,6 +1433,9 @@ class ZemismartHub:
         for task in self._fast_stops:
             task.cancel()
         self._fast_stops.clear()
+        for publish_task in self._publish_tasks:
+            publish_task.cancel()
+        self._publish_tasks.clear()
         if self._inflight is not None:
             for future in self._inflight.futures:
                 future.cancel()

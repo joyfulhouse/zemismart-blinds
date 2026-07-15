@@ -1274,25 +1274,31 @@ async def test_stop_publishes_while_overlapping_movement_awaits_ack() -> None:
 async def test_movement_publishes_after_an_earlier_unpublished_fast_stop() -> None:
     """Per-channel request order holds across the fast lane and the worker.
 
-    STOP ch1 (publish withheld), STOP {1,2} chained behind it, then UP ch2:
-    the movement must not reach the broker before the older group STOP, or
-    the STOP would displace the newest intent on the bridge.
+    STOP ch1, STOP {1,2} chained behind it, then UP ch2 must reach the broker
+    in that order (paho preserves publish-call order), or the older STOP would
+    displace the newest intent on the bridge. Crucially, the later commands
+    enqueue in order WITHOUT waiting for STOP ch1's QoS-1 acknowledgment: the
+    publish-order barrier releases on enqueue, not on PUBACK, so a safety STOP
+    is never stranded behind an earlier command's broker ack.
     """
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
-    all_published = asyncio.Event()
-    release_first = asyncio.Event()
+    all_enqueued = asyncio.Event()
+    release_first_ack = asyncio.Event()
     ids = iter(("stop-1", "stop-12", "up-2"))
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
+        # Model real HA/paho: the message is enqueued (ordered broker receipt)
+        # synchronously, then the QoS-1 PUBACK is awaited. Withhold only
+        # STOP ch1's PUBACK.
         body: dict[str, Any] = json.loads(payload)
-        if body["command_id"] == "stop-1":
-            await release_first.wait()
         published.append(body)
         if len(published) == 3:
-            all_published.set()
+            all_enqueued.set()
+        if body["command_id"] == "stop-1":
+            await release_first_ack.wait()
 
     hub = ZemismartHub(registry, publish, command_id_factory=lambda: next(ids))
     stop_one = asyncio.create_task(
@@ -1302,12 +1308,13 @@ async def test_movement_publishes_after_an_earlier_unpublished_fast_stop() -> No
     stop_group = asyncio.create_task(hub.async_transmit(blind_config(), "STOP"))
     await asyncio.sleep(0)
     up_two = asyncio.create_task(hub.async_transmit(replace(blind_config(), channels=(2,)), "UP"))
-    await asyncio.sleep(0)
-    assert published == []
 
-    release_first.set()
-    await all_published.wait()
+    # All three enqueue in request order even though STOP ch1's PUBACK is
+    # still withheld — the barrier did not wait on the acknowledgment.
+    await all_enqueued.wait()
     assert [body["command_id"] for body in published] == ["stop-1", "stop-12", "up-2"]
+
+    release_first_ack.set()
     for body in published:
         accept_and_start(hub, "bridge-a", body)
     await asyncio.gather(stop_one, stop_group, up_two)
