@@ -4,6 +4,7 @@ from typing import Final
 
 DOMAIN: Final = "zemismart_blinds"
 
+CONF_BRIDGE: Final = "bridge"
 CONF_NAME: Final = "name"
 CONF_PREFIX: Final = "prefix"
 CONF_REMOTE_ID: Final = "remote_id"
@@ -26,16 +27,30 @@ DEFAULT_TRAVEL_UP: Final = 15.0
 DEFAULT_TRAVEL_DOWN: Final = 15.0
 DEFAULT_REPEATS: Final = 5
 DEFAULT_COALESCE_WINDOW_MS: Final = 150
+DEFAULT_SNIFF_WINDOW_SECONDS: Final = 30
+MAX_SNIFF_WINDOW_SECONDS: Final = 60
 FULL_TRAVEL_MARGIN_SECONDS: Final = 1.0
 POSITION_UPDATE_INTERVAL_SECONDS: Final = 0.25
 
 # Fixed topic contract shared with the ESPHome RF433 MQTT bridge firmware.
-# The bridge publishes rf433/<bridge>/{availability,info,status} and consumes
-# rf433/<bridge>/tx; both sides must agree, so this is a constant by design.
+# Existing availability/info/status/tx topics remain unchanged. During the
+# guided Learn flow, the bridge publishes non-retained QoS-1 captures to
+# rf433/<bridge>/rx as JSON {"frame":"AAB1…55","t":<uint millis>}. The
+# controller starts a bounded capture by publishing exactly
+# {"action":"sniff","seconds":<0..60>} to rf433/<bridge>/cmd at QoS 1,
+# non-retained; seconds=0 cancels the active sniff. Both sides must keep this
+# onboarding-only contract identical.
 MQTT_ROOT: Final = "rf433"
 MQTT_AVAILABILITY_TOPIC: Final = f"{MQTT_ROOT}/+/availability"
 MQTT_INFO_TOPIC: Final = f"{MQTT_ROOT}/+/info"
 MQTT_STATUS_TOPIC: Final = f"{MQTT_ROOT}/+/status"
+MQTT_RX_TOPIC: Final = f"{MQTT_ROOT}/+/rx"
+MQTT_CMD_TEMPLATE: Final = f"{MQTT_ROOT}/{{bridge}}/cmd"
+
+MQTT_CMD_ACTION_SNIFF: Final = "sniff"
+MQTT_CMD_FIELD_ACTION: Final = "action"
+MQTT_CMD_FIELD_SECONDS: Final = "seconds"
+MQTT_RX_FIELD_FRAME: Final = "frame"
 
 SERVICE_SEND_RAW: Final = "send_raw"
 SERVICE_NEW_VIRTUAL_REMOTE: Final = "new_virtual_remote"

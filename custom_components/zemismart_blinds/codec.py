@@ -142,6 +142,24 @@ def group_offset(channels: Iterable[int]) -> int:
     return _signed8(2 + sum(1 << ((channel - 1) % 8) for channel in normalized))
 
 
+def _recover_base(remote_id: int, chans: Iterable[int], cmd: int) -> int:
+    """Recover a calibrated base using the inverse protocol command formula."""
+    return (cmd - remote_id + group_offset(chans)) & 0xFFFF
+
+
+def infer_action_button(chans: Iterable[int], cmd: int) -> str | None:
+    """Infer an action from a captured command after channel normalization."""
+    normalized = validate_channels(chans, allow_empty=False)
+    _require_uint(cmd, 16, "command")
+    calibration_command = (
+        cmd + group_offset(normalized) - group_offset(_CALIBRATION_CHANNELS)
+    ) & 0xFFFF
+    for button, command_high in _ACTION_COMMAND_HIGH.items():
+        if calibration_command >> 8 == command_high:
+            return button
+    return None
+
+
 def channel_field(channels: Iterable[int]) -> int:
     """Encode channels as the protocol's 16-bit active-low bit field."""
     normalized = validate_channels(channels, allow_empty=True)
@@ -164,7 +182,7 @@ def derive_base(
         raise ValueError(msg)
     _require_uint(ref_cmd, 16, "reference command")
     _require_uint(remote_id, 8, "remote_id")
-    return (ref_cmd - remote_id + group_offset(normalized)) & 0xFFFF
+    return _recover_base(remote_id, normalized, ref_cmd)
 
 
 def derive_bases(

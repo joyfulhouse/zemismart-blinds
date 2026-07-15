@@ -4,7 +4,7 @@ send_raw:
   fields:
     bridge:
       name: Bridge
-      description: Bridge ID from the rf433/<bridge>/info topic.
+      description: Bridge ID from the bridge's rf433 info topic.
       required: true
       example: rf433-bridge-living-room
       selector:
