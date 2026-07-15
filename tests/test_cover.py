@@ -44,11 +44,11 @@ def cover_config(*, travel: float = 0.04) -> BlindConfig:
     )
 
 
-def online_registry() -> BridgeRegistry:
+def online_registry(bridge_id: str = "bridge-a") -> BridgeRegistry:
     """Return one same-area online bridge."""
     registry = BridgeRegistry()
-    registry.update_info("bridge-a", {"area": "living_room"})
-    registry.update_availability("bridge-a", "online")
+    registry.update_info(bridge_id, {"area": "living_room"})
+    registry.update_availability(bridge_id, "online")
     return registry
 
 
@@ -76,6 +76,32 @@ async def attach_cover(
     await entity.async_internal_added_to_hass()
     await entity.async_added_to_hass()
     return entity
+
+
+def restored_cover_type(restored_state: State) -> type[ZemismartCover]:
+    """Return a cover type that restores one supplied HA state."""
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    return RestoredCover
+
+
+def stopped_unverified_anchor_state() -> State:
+    """Return a stopped estimate whose restore-time anchor is questioned."""
+    config = cover_config()
+    return State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 80,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 0,
+            "unverified_anchor_bridge": "bridge-a",
+        },
+    )
 
 
 def acknowledge(hub: ZemismartHub, bridge_id: str, body: Mapping[str, Any]) -> None:
@@ -1493,3 +1519,345 @@ async def test_offline_anchor_does_not_cancel_a_running_motion(
         assert not restored.is_opening
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_offline_anchor_cancels_running_relative_motion(
+    hass: HomeAssistant,
+) -> None:
+    """A live partial move still depends on its questioned origin."""
+    registry = online_registry("bridge-b")
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=cover_config(travel=5.0),
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert entity.is_closing
+
+        registry.update_availability("bridge-a", "offline")
+        hub.notify_bridge_change()
+
+        assert entity.current_cover_position is None
+        assert not entity.is_closing
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_offline_anchor_remains_revocable_when_absolute_motion_is_stopped(
+    hass: HomeAssistant,
+) -> None:
+    """An offline report is deferred only while a full travel stays live."""
+    registry = online_registry("bridge-b")
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=cover_config(travel=5.0),
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        await entity.async_open_cover()
+        assert entity.is_opening
+
+        registry.update_availability("bridge-a", "offline")
+        hub.notify_bridge_change()
+
+        assert entity.is_opening
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+
+        await entity.async_stop_cover()
+
+        assert entity.current_cover_position is None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["degraded_bridge"] is True
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_timed_motion_is_unknown_when_ack_bridge_is_already_offline(
+    hass: HomeAssistant,
+) -> None:
+    """A raced offline LWT prevents a timed model from being committed."""
+    registry = online_registry()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        bridge_id = topic.split("/")[1]
+        acknowledge(hub, bridge_id, json.loads(payload))
+        registry.update_availability(bridge_id, "offline")
+        hub.notify_bridge_change()
+
+    hub = ZemismartHub(registry, publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 80})
+
+        assert entity.current_cover_position is None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["last_bridge"] == "bridge-a"
+        assert entity.extra_state_attributes["motion_target"] is None
+        assert entity.extra_state_attributes["motion_timed"] is False
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_stopped_unverified_anchor_reconciles_preexisting_offline_bridge(
+    hass: HomeAssistant,
+) -> None:
+    """Restore observes an offline LWT that arrived before last state."""
+    registry = online_registry()
+    registry.update_availability("bridge-a", "offline")
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(registry, quiet_publish),
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        assert entity.current_cover_position is None
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_stopped_unverified_anchor_reconciles_preexisting_online_bridge(
+    hass: HomeAssistant,
+) -> None:
+    """Restore confirms a questioned anchor from existing online state."""
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(online_registry(), quiet_publish),
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        assert entity.current_cover_position == 80
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_relative_restore_reconciles_persisted_offline_anchor_first(
+    hass: HomeAssistant,
+) -> None:
+    """An expired relative target cannot replace an already-invalid origin."""
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "closing",
+        {
+            ATTR_CURRENT_POSITION: 80,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": -1,
+            "motion_target": 60,
+            "motion_started": now - 2.0,
+            "motion_deadline": now - 1.0,
+            "motion_start_position": 80,
+            "motion_bridge": "bridge-b",
+            "motion_command_id": "relative-command",
+            "motion_timed": True,
+            "unverified_anchor_bridge": "bridge-a",
+        },
+    )
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "offline")
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(registry, quiet_publish),
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert entity.current_cover_position is None
+        assert entity.extra_state_attributes["motion_direction"] == 0
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_restarted_absolute_motion_settles_unverified_anchor(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarted full travel retains its hard-limit anchoring semantics."""
+    clock = [1_000.0]
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock[0])
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.001)
+    registry = online_registry("bridge-b")
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish, now=lambda: clock[0])
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.2))
+    original._position = 80.0
+    original._unverified_anchor_bridge = "bridge-a"
+    try:
+        await original.async_open_cover()
+        attributes = dict(original.extra_state_attributes)
+        attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+        assert attributes["motion_absolute_anchor"] is True
+    finally:
+        await original.async_will_remove_from_hass()
+
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    restored_registry = online_registry("bridge-b")
+    restored_hub = ZemismartHub(restored_registry, quiet_publish, now=lambda: clock[0])
+    restored = await attach_cover(
+        hass,
+        restored_hub,
+        config=cover_config(travel=0.2),
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert restored.is_opening
+        assert restored.extra_state_attributes["motion_absolute_anchor"] is True
+        assert restored.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+
+        clock[0] = 1_001.0
+        await asyncio.sleep(0.02)
+
+        assert restored.current_cover_position == 100
+        assert restored.extra_state_attributes["motion_absolute_anchor"] is False
+        assert restored.extra_state_attributes["unverified_anchor_bridge"] is None
+
+        restored_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+        assert restored.current_cover_position == 100
+    finally:
+        await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_timed_restore_has_coherent_unverified_anchor_state(
+    hass: HomeAssistant,
+) -> None:
+    """An expired partial restore is stopped, questioned, and non-absolute."""
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 50,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 1,
+            "motion_target": 80,
+            "motion_started": now - 2.0,
+            "motion_deadline": now - 1.0,
+            "motion_start_position": 50,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "timed-command",
+            "motion_timed": True,
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(BridgeRegistry(), quiet_publish),
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        attributes = entity.extra_state_attributes
+        assert entity.current_cover_position == 80
+        assert attributes["motion_direction"] == 0
+        assert attributes["motion_target"] is None
+        assert attributes["motion_absolute_anchor"] is False
+        assert attributes["unverified_anchor_bridge"] == "bridge-a"
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_absolute_restore_settles_unverified_anchor(
+    hass: HomeAssistant,
+) -> None:
+    """A full travel completed during downtime replaces the old anchor."""
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 80,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 1,
+            "motion_target": 100,
+            "motion_started": now - 2.0,
+            "motion_deadline": now - 1.0,
+            "motion_start_position": 80,
+            "motion_bridge": "bridge-b",
+            "motion_command_id": "absolute-command",
+            "motion_timed": False,
+            "motion_absolute_anchor": True,
+            "unverified_anchor_bridge": "bridge-a",
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    registry = online_registry("bridge-b")
+    hub = ZemismartHub(registry, quiet_publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        attributes = entity.extra_state_attributes
+        assert entity.current_cover_position == 100
+        assert attributes["motion_direction"] == 0
+        assert attributes["motion_absolute_anchor"] is False
+        assert attributes["unverified_anchor_bridge"] is None
+
+        registry.update_availability("bridge-a", "offline")
+        hub.notify_bridge_change()
+        assert entity.current_cover_position == 100
+    finally:
+        await entity.async_will_remove_from_hass()

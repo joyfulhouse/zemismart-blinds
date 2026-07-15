@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
 _ATTR_DEGRADED = "degraded_bridge"
 _ATTR_LAST_BRIDGE = "last_bridge"
+_ATTR_MOTION_ABSOLUTE_ANCHOR = "motion_absolute_anchor"
 _ATTR_MOTION_BRIDGE = "motion_bridge"
 _ATTR_MOTION_COMMAND_ID = "motion_command_id"
 _ATTR_MOTION_DEADLINE = "motion_deadline"
@@ -166,6 +167,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_BRIDGE: self._motion_bridge,
             _ATTR_MOTION_COMMAND_ID: self._motion_command_id,
             _ATTR_MOTION_TIMED: self._motion_timed,
+            _ATTR_MOTION_ABSOLUTE_ANCHOR: self._motion_absolute_anchor,
             _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
         }
 
@@ -207,6 +209,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if direction not in {-1, 1}:
             if state.state in {"opening", "closing"}:
                 self._mark_unknown()
+            else:
+                self._reconcile_unverified_anchor()
             return
 
         target = _number(state.attributes.get(_ATTR_MOTION_TARGET))
@@ -226,6 +230,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
         self._last_bridge = bridge
         timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
+        absolute_anchor = (
+            state.attributes.get(_ATTR_MOTION_ABSOLUTE_ANCHOR, False) is True
+            and not timed
+            and target in {0.0, 100.0}
+        )
+        self._direction = direction
+        self._motion_absolute_anchor = absolute_anchor
+        self._reconcile_unverified_anchor()
+        if self._direction == 0:
+            return
         if timed and self._hub.registry.is_known_offline(bridge):
             # The restored motion depends on a bridge-armed fail-safe STOP,
             # and that bridge has explicitly reported itself offline: its
@@ -239,14 +253,18 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if now >= deadline:
             self._position = target
             self._clear_motion()
-            if timed and not self._bridge_seen_online(bridge):
+            if absolute_anchor:
+                # A full travel that finished during downtime reached its hard
+                # limit just like one completed by _async_track_motion.
+                self._unverified_anchor_bridge = None
+            elif timed and not self._bridge_seen_online(bridge):
                 # The anchored target assumed the bridge's armed STOP fired
                 # while HA was down, but retained availability has not
                 # arrived yet on this cold start. Remember the bridge: if it
                 # later reports offline, the STOP may never have fired and
-                # the anchor is invalidated. (Not persisted — a second
-                # restart before any availability arrives loses the marker.)
+                # the anchor is invalidated.
                 self._unverified_anchor_bridge = bridge
+            self._reconcile_unverified_anchor()
             return
         # Prefer the persisted motion origin: interpolating from the original
         # start keeps the transient estimate accurate across the restart gap
@@ -265,7 +283,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         else:
             self._motion_started = now
             self._motion_start_position = self._position
-        self._direction = direction
         self._motion_target = target
         self._motion_deadline = deadline
         self._motion_duration = deadline - self._motion_started
@@ -312,22 +329,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     def _on_bridge_change(self) -> None:
         """Re-evaluate availability and timed-motion safety on bridge changes."""
-        if self._unverified_anchor_bridge is not None:
-            anchor_bridge = self._unverified_anchor_bridge
-            if self._hub.registry.is_known_offline(anchor_bridge):
-                # The restore-time anchor trusted a STOP this bridge never
-                # got to fire: the retained availability that just arrived
-                # says it was offline. The motor may sit at its hard limit.
-                self._unverified_anchor_bridge = None
-                if self._direction == 0:
-                    # No live motion depends on the questioned position, so
-                    # it is now known-bad. A currently RUNNING motion (e.g. a
-                    # full OPEN commanded through another bridge) already owns
-                    # the estimate and must NOT be cancelled here — it will
-                    # settle a genuine anchor on completion or be superseded.
-                    self._mark_unknown()
-            elif self._bridge_seen_online(anchor_bridge):
-                self._unverified_anchor_bridge = None
+        self._reconcile_unverified_anchor()
         if (
             self._direction != 0
             and self._motion_timed
@@ -341,6 +343,21 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # not offline — during startup, unrelated bridges announce first.)
             self._mark_unknown()
         self.async_write_ha_state()
+
+    def _reconcile_unverified_anchor(self) -> None:
+        """Apply existing bridge state to a questioned restore-time anchor."""
+        anchor_bridge = self._unverified_anchor_bridge
+        if anchor_bridge is None:
+            return
+        if self._hub.registry.is_known_offline(anchor_bridge):
+            # A relative motion still derives from the questioned origin and
+            # must be revoked with it. Only a live commanded full travel is
+            # exempt: completing at the hard limit will establish a genuine
+            # physical anchor independent of that origin.
+            if self._direction == 0 or not self._motion_absolute_anchor:
+                self._mark_unknown()
+        elif self._bridge_seen_online(anchor_bridge):
+            self._unverified_anchor_bridge = None
 
     @staticmethod
     def _optional_text(value: object) -> str | None:
@@ -491,6 +508,18 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Commit a fresh local model from correlated first RF dispatch."""
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
+        if ack.deadline is not None and self._hub.registry.is_known_offline(ack.bridge.bridge_id):
+            # The started status and retained offline LWT can be delivered in
+            # one broker batch. The bridge's RAM-only armed STOP may already
+            # be gone, so committing the partial target would be false trust.
+            self._mark_unknown()
+            if notify_members:
+                for member in self._member_covers():
+                    member._record_ack(ack)
+                    member._mark_unknown()
+                    member.async_write_ha_state()
+                self._reconcile_overlaps(moving=True)
+            return
         # An absolute anchor settles an unverified restore-time anchor only
         # when the full travel COMPLETES at the motor's own limit switch (in
         # _async_track_motion), never at its start: a travel interrupted by a
@@ -690,11 +719,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return False
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
+        self._reconcile_unverified_anchor()
         for member in self._member_covers():
             # Freeze each member at its OWN integrated estimate; the group's
             # aggregate says nothing about where an individual blind stopped.
             member._interrupt_motion(ack.started_at)
             member._record_ack(ack)
+            member._reconcile_unverified_anchor()
             member.async_write_ha_state()
         self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
