@@ -1297,6 +1297,13 @@ class ZemismartHub:
 
     async def _async_execute(self, command: _QueuedCommand) -> CommandAck:
         """Resolve, publish, then await admission and first RF dispatch."""
+        # Rebuild from live contributors before resolution. The AUTHORITATIVE
+        # rebuild runs under _publish_lock in _ordered_publish (the final
+        # no-await point before enqueue); this earlier call's channel view is
+        # redundant with it, but it is deliberately kept: it is the pre-lock
+        # point at which a mid-flight contributor-cancellation test synchronizes
+        # (that test holds the publish lock and waits for this call), so removing
+        # it deadlocks the coalesced-cancel path's coverage for no real gain.
         self._rebuild_from_live_contributors(command)
         if command.overlap_token is not None and command.overlap_token != self._overlap_seq(
             command.remote, command.channels

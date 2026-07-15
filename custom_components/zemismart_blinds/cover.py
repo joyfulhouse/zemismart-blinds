@@ -759,8 +759,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         publish an older intent over the newer command.
         """
         ack = await self._async_transmit("STOP")
-        if ack is None or self._hub.was_displaced(ack.command_id):
+        if ack is None:
             return False
+        # A displaced STOP still STARTED — its frame went on air and halted the
+        # motors — before a newer command replaced it. Freeze self + members at
+        # that instant REGARDLESS of displacement: a full-travel group member is
+        # untimed, so the timed-only _on_displaced never freezes it, and nothing
+        # else would correct a member the displacer does not re-drive. Only the
+        # RETURN VALUE reports the displacement, so a chained set-position caller
+        # still aborts rather than publishing an older intent over the newer one.
+        displaced = self._hub.was_displaced(ack.command_id)
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
         self._reconcile_unverified_anchor()
@@ -773,7 +781,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             member.async_write_ha_state()
         self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
-        return True
+        return not displaced
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Queue a priority STOP and commit interruption after RF dispatch."""

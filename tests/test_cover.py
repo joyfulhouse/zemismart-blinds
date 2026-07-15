@@ -775,6 +775,54 @@ async def test_raced_group_displacement_stops_members_and_reconciles_overlaps(
 
 
 @pytest.mark.asyncio
+async def test_displaced_user_stop_still_freezes_group_members(hass: HomeAssistant) -> None:
+    """A user STOP displaced after STARTED still freezes the group and its members.
+
+    A full-travel group member is untimed, so the timed-only _on_displaced never
+    freezes it; before the round-14 fix _async_stop returned on displacement
+    BEFORE the freeze, leaving a non-re-driven member tracking a stale full travel.
+    """
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        bridge_id = topic.split("/")[1]
+        acknowledge(hub, bridge_id, body)
+        # Displace the STOP (the 2nd published frame) right after it starts.
+        if len(published) == 2:
+            hub.handle_status(
+                bridge_id,
+                {"status": "displaced", "command_id": body["command_id"]},
+            )
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    group._position = 20.0
+    member._position = 20.0
+    try:
+        await group.async_open_cover()
+        assert group.is_opening
+        assert member.is_opening
+
+        await group.async_stop_cover()
+
+        assert not group.is_opening
+        assert not member.is_opening
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
 async def test_member_stop_marks_moving_containing_group_unknown(hass: HomeAssistant) -> None:
     """Stopping one member channel invalidates its moving group's aggregate.
 
