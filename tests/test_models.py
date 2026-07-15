@@ -1438,3 +1438,60 @@ async def test_cancelled_contributor_channel_is_dropped_from_the_batch() -> None
 
     assert len(published) == 1
     assert published[0]["target"] == "a1b2c3:42:1"
+
+
+@pytest.mark.asyncio
+async def test_timed_partial_moves_never_coalesce() -> None:
+    """Two simultaneous timed partial moves publish independent frames.
+
+    Merging them would force one stop_after_ms on both and, before that,
+    made the overlap-token check compare the head's per-channel sequence
+    against the merged union — silently superseding the whole batch. Timed
+    moves are excluded from coalescing entirely.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    one = config_with_window(replace(blind_config(), channels=(1,)), 30)
+    two = config_with_window(replace(blind_config(), channels=(2,)), 30)
+    results = await asyncio.gather(
+        hub.async_transmit(one, "UP", stop_after_ms=500),
+        hub.async_transmit(two, "UP", stop_after_ms=500),
+    )
+
+    assert all(isinstance(result, CommandAck) for result in results)
+    assert [body["target"] for body in published] == ["a1b2c3:42:1", "a1b2c3:42:2"]
+    assert all("stop_after_ms" in body for body in published)
+
+
+@pytest.mark.asyncio
+async def test_untimed_full_travels_still_coalesce() -> None:
+    """The coalescing optimization still merges simultaneous open/close."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    one = config_with_window(replace(blind_config(), channels=(1,)), 30)
+    two = config_with_window(replace(blind_config(), channels=(2,)), 30)
+    await asyncio.gather(
+        hub.async_transmit(one, "DOWN"),
+        hub.async_transmit(two, "DOWN"),
+    )
+
+    assert len(published) == 1
+    assert published[0]["target"] == "a1b2c3:42:1,2"

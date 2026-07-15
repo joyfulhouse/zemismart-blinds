@@ -1299,3 +1299,74 @@ async def test_restored_state_from_different_hardware_is_ignored(
         assert entity.current_cover_position is None
     finally:
         await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_full_travel_interrupted_before_completion_keeps_anchor_revocable(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full travel STOPped before it completes does not settle the anchor.
+
+    Only a full travel that runs its whole configured duration reaches the
+    hard limit and settles a questioned restore anchor. If it is interrupted
+    early, the position still derives from the questioned origin, so a late
+    offline report from the anchor bridge must still revoke it.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    original = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    original._position = 50.0
+    await original.async_set_cover_position(**{ATTR_POSITION: 80})
+    attributes = dict(original.extra_state_attributes)
+    attributes[ATTR_CURRENT_POSITION] = original.current_cover_position
+    await original.async_will_remove_from_hass()
+    await asyncio.sleep(0.05)  # let the persisted deadline expire
+    restored_state = State("cover.living_room_left", "opening", attributes)
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    empty_registry = BridgeRegistry()
+    restored_hub: ZemismartHub
+
+    async def restored_publish(topic: str, payload: str) -> None:
+        acknowledge(restored_hub, topic.split("/")[1], json.loads(payload))
+
+    restored_hub = ZemismartHub(empty_registry, restored_publish)
+    restored = await attach_cover(
+        hass,
+        restored_hub,
+        config=cover_config(travel=5.0),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert restored.current_cover_position == 80  # anchored, unverified
+        # The anchor bridge is bridge-a (served the original move). A
+        # DIFFERENT bridge comes online to serve the OPEN, so bridge-a stays
+        # undiscovered — its later offline report is what tests the fix.
+        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_availability("bridge-b", "online")
+        restored_hub.notify_bridge_change()
+        assert restored.current_cover_position == 80  # bridge-b online != anchor confirmed
+
+        # Begin a full OPEN (5s travel) and STOP it almost immediately.
+        open_task = asyncio.create_task(restored.async_open_cover())
+        await asyncio.sleep(0.02)
+        assert restored.is_opening
+        await restored.async_stop_cover()
+        await open_task
+
+        # The full travel never completed, so the anchor is still in doubt:
+        # the anchor bridge going offline must invalidate the estimate.
+        empty_registry.update_availability("bridge-a", "offline")
+        restored_hub.notify_bridge_change()
+        assert restored.current_cover_position is None
+    finally:
+        await restored.async_will_remove_from_hass()

@@ -102,6 +102,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_bridge: str | None = None
         self._motion_command_id: str | None = None
         self._motion_timed = False
+        self._motion_absolute_anchor = False
         self._unverified_anchor_bridge: str | None = None
         self._motion_token: object | None = None
         self._motion_task: asyncio.Task[None] | None = None
@@ -381,6 +382,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_bridge = None
         self._motion_command_id = None
         self._motion_timed = False
+        self._motion_absolute_anchor = False
 
     def _interrupt_motion(self, at: float) -> None:
         """Freeze prior tracking only after the replacing command starts."""
@@ -475,14 +477,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Commit a fresh local model from correlated first RF dispatch."""
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
-        if absolute_anchor:
-            # Only an ABSOLUTE re-anchor (a commanded full travel whose
-            # duration guarantees the motor's own limit switch) settles an
-            # unverified restore-time anchor. A relative partial move — even
-            # one whose believed target CLAMPS to an endpoint — still
-            # derives from the questioned position, so the anchor stays
-            # revocable by a late offline report from its bridge.
-            self._unverified_anchor_bridge = None
+        # An absolute anchor settles an unverified restore-time anchor only
+        # when the full travel COMPLETES at the motor's own limit switch (in
+        # _async_track_motion), never at its start: a travel interrupted by a
+        # STOP before completion did not reach the limit, so the questioned
+        # position stays revocable by a late offline report. A relative
+        # partial move — even one whose target clamps to an endpoint — is not
+        # an absolute anchor at all.
+        self._motion_absolute_anchor = absolute_anchor
         self._motion_start_position = self._position
         self._motion_target = target
         self._motion_duration = duration
@@ -594,6 +596,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if self._motion_token is not token:
             return
         self._position = self._motion_target
+        if self._motion_absolute_anchor:
+            # A commanded full travel ran its whole configured duration plus
+            # margin and is now at the hard limit: the questioned restore
+            # anchor is settled by a genuine physical reference.
+            self._unverified_anchor_bridge = None
         self._motion_token = None
         self._motion_task = None
         self._clear_motion()

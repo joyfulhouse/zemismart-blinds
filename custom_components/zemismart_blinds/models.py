@@ -1295,8 +1295,17 @@ class ZemismartHub:
         body = self._command_body(config, button, stop_after_ms=stop_after_ms)
         loop = asyncio.get_running_loop()
         enqueued_at = loop.time()
+        # Only untimed full-travel opens/closes coalesce: merging two precise
+        # timed partial moves into one shared frame would force one
+        # stop_after_ms on both, and a timed move carries an overlap_token
+        # whose per-channel sequence sum cannot be reconciled once the merge
+        # expands the frame to the contributor-channel union.
         coalesces = (
-            button in {"UP", "DOWN"} and not config.is_group and config.coalesce_window_ms > 0
+            button in {"UP", "DOWN"}
+            and stop_after_ms is None
+            and overlap_token is None
+            and not config.is_group
+            and config.coalesce_window_ms > 0
         )
         future: asyncio.Future[CommandResult] = loop.create_future()
         return await self._async_enqueue(
