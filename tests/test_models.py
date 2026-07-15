@@ -666,6 +666,31 @@ async def test_batch_flushes_at_earliest_contributing_window() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enqueue_racing_close_on_contended_lock_is_superseded() -> None:
+    """A command reaching _queue_ready after close() supersedes; no worker resurrection."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    # Hold _queue_ready so the transmit blocks on a CONTENDED acquire (the entry
+    # _closed check only covers the uncontended fast path), then close() while
+    # it waits. On acquiring the lock it must re-check _closed and supersede
+    # rather than queue the command and resurrect the worker via _ensure_worker.
+    async with hub._queue_ready:
+        pending = asyncio.create_task(hub.async_transmit(blind_config(), "UP"))
+        await asyncio.sleep(0.01)
+        hub.close()
+    result = await asyncio.wait_for(pending, timeout=0.1)
+    assert result == "superseded"
+    assert published == []
+    assert hub._worker_task is None
+
+
+@pytest.mark.asyncio
 async def test_opposite_directions_on_same_remote_publish_two_frames() -> None:
     """The coalescing key keeps UP and DOWN batches separate."""
     registry = BridgeRegistry()
@@ -1369,6 +1394,19 @@ def test_empty_availability_payload_is_not_an_offline_report() -> None:
     assert registry.is_known_offline("bridge-a")
 
 
+def test_bridge_registry_prunes_tombstones_and_bounds_wildcard_discovery() -> None:
+    """Withdrawn and forged wildcard IDs cannot grow the registry forever."""
+    registry = BridgeRegistry()
+    registry.update_availability("availability-tombstone", "")
+    registry.update_info("info-tombstone", {})
+    assert registry.bridges == ()
+
+    for index in range(300):
+        registry.update_availability(f"bridge-{index}", "online")
+
+    assert len(registry.bridges) == 256
+
+
 def test_coalesce_window_is_bounded() -> None:
     """A hand-edited giant window cannot delay every command."""
     with pytest.raises(ValueError, match="coalesce_window_ms"):
@@ -1443,6 +1481,46 @@ async def test_cancelled_contributor_channel_is_dropped_from_the_batch() -> None
         await second
     assert isinstance(await first, CommandAck)
 
+    assert len(published) == 1
+    assert published[0]["target"] == "a1b2c3:42:1"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_contributor_is_rechecked_after_publish_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation while waiting to publish removes that caller's channel."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    rebuilt = asyncio.Event()
+    original_rebuild = hub._rebuild_from_live_contributors
+
+    def record_rebuild(command: Any) -> None:
+        original_rebuild(command)
+        rebuilt.set()
+
+    monkeypatch.setattr(hub, "_rebuild_from_live_contributors", record_rebuild)
+    first_config = config_with_window(replace(blind_config(), channels=(1,)), 10)
+    second_config = config_with_window(replace(blind_config(), channels=(2,)), 10)
+
+    async with hub._publish_lock:
+        first = asyncio.create_task(hub.async_transmit(first_config, "UP"))
+        second = asyncio.create_task(hub.async_transmit(second_config, "UP"))
+        await rebuilt.wait()
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+    assert isinstance(await first, CommandAck)
     assert len(published) == 1
     assert published[0]["target"] == "a1b2c3:42:1"
 

@@ -63,6 +63,8 @@ _DISPLACED_MEMORY_SECONDS: Final = 60.0
 _DISPLACED_MAX_ID_LENGTH: Final = 64
 _DISPLACED_MAX_ENTRIES: Final = 256
 _BRIDGE_AFFINITY_SECONDS: Final = 120.0
+_BRIDGE_MAX_ID_LENGTH: Final = 64
+_BRIDGE_MAX_ENTRIES: Final = 256
 
 
 class NoOnlineBridgeError(RuntimeError):
@@ -388,12 +390,36 @@ class BridgeRegistry:
         """Return a stable snapshot ordered by bridge id."""
         return tuple(self._bridges[key] for key in sorted(self._bridges))
 
+    def _update_target(self, bridge_id: str) -> tuple[str, BridgeInfo] | None:
+        """Normalize one bounded wildcard id and return its current state."""
+        bridge_id = bridge_id.strip()
+        if not bridge_id or len(bridge_id) > _BRIDGE_MAX_ID_LENGTH:
+            return None
+        current = self._bridges.get(bridge_id)
+        if current is None:
+            if len(self._bridges) >= _BRIDGE_MAX_ENTRIES:
+                return None
+            current = BridgeInfo(bridge_id)
+        return bridge_id, current
+
+    def _store(self, bridge: BridgeInfo) -> None:
+        """Store meaningful retained state, pruning a complete withdrawal."""
+        if (
+            bridge.area_id is None
+            and not bridge.online
+            and not bridge.is_default
+            and not bridge.availability_seen
+        ):
+            self._bridges.pop(bridge.bridge_id, None)
+            return
+        self._bridges[bridge.bridge_id] = bridge
+
     def update_availability(self, bridge_id: str, payload: str) -> None:
         """Apply a retained LWT availability message."""
-        bridge_id = bridge_id.strip()
-        if not bridge_id:
+        target = self._update_target(bridge_id)
+        if target is None:
             return
-        current = self._bridges.get(bridge_id, BridgeInfo(bridge_id))
+        bridge_id, current = target
         normalized = payload.strip().lower()
         # An empty payload is a retained-topic deletion, not an explicit
         # offline report: all availability knowledge for the bridge is gone.
@@ -401,20 +427,22 @@ class BridgeRegistry:
         online = normalized == "online"
         if online != current.online:
             _LOGGER.debug("Bridge %s is now %s", bridge_id, "online" if online else "offline")
-        self._bridges[bridge_id] = BridgeInfo(
-            bridge_id=bridge_id,
-            area_id=current.area_id,
-            online=online,
-            is_default=current.is_default,
-            availability_seen=availability_seen,
+        self._store(
+            BridgeInfo(
+                bridge_id=bridge_id,
+                area_id=current.area_id,
+                online=online,
+                is_default=current.is_default,
+                availability_seen=availability_seen,
+            )
         )
 
     def update_info(self, bridge_id: str, payload: Mapping[str, object]) -> None:
         """Apply retained bridge metadata, including its HA area tag."""
-        bridge_id = bridge_id.strip()
-        if not bridge_id:
+        target = self._update_target(bridge_id)
+        if target is None:
             return
-        current = self._bridges.get(bridge_id, BridgeInfo(bridge_id))
+        bridge_id, current = target
         # Retained info is the COMPLETE metadata document: missing keys (or
         # an emptied retained topic, delivered here as an empty mapping)
         # clear the fields rather than preserving stale area/default values.
@@ -428,12 +456,14 @@ class BridgeRegistry:
             if isinstance(raw_default, str)
             else bool(raw_default)
         )
-        self._bridges[bridge_id] = BridgeInfo(
-            bridge_id=bridge_id,
-            area_id=area_id,
-            online=current.online,
-            is_default=is_default,
-            availability_seen=current.availability_seen,
+        self._store(
+            BridgeInfo(
+                bridge_id=bridge_id,
+                area_id=area_id,
+                online=current.online,
+                is_default=is_default,
+                availability_seen=current.availability_seen,
+            )
         )
 
     def resolve(self, area_id: str) -> BridgeInfo:
@@ -833,6 +863,13 @@ class ZemismartHub:
         fast_lane = False
         command.published = asyncio.Event()
         async with self._queue_ready:
+            if self._closed:
+                # close() may have run while this caller waited on a CONTENDED
+                # _queue_ready acquire (the entry check above only covers an
+                # uncontended fast path). Re-check under the lock so a
+                # teardown-race command neither queues nor resurrects the
+                # worker via _ensure_worker() below.
+                return "superseded"
             if command.is_stop:
                 # A STOP supersedes every queued movement whose channels
                 # intersect its own on the same remote (exact-target and
@@ -1195,7 +1232,12 @@ class ZemismartHub:
         )
         self._bridge_affinity[key] = (bridge_id, now + hold)
 
-    async def _ordered_publish(self, command: _QueuedCommand, topic: str, payload: str) -> None:
+    async def _ordered_publish(
+        self,
+        command: _QueuedCommand,
+        topic: str,
+        command_id: str,
+    ) -> None:
         """Enqueue one tx message in request order without blocking on its ack.
 
         paho preserves publish()-call order to the broker, and HA's
@@ -1208,6 +1250,14 @@ class ZemismartHub:
         unaffected: paho retries the already-buffered message on its own.
         """
         async with self._publish_lock:
+            if all(future.done() for future in command.futures):
+                raise CommandDisplacedError(command.target)
+            # A contributor can cancel while this command waits for the publish
+            # lock. Rebuild again at the final no-await point before enqueue.
+            self._rebuild_from_live_contributors(command)
+            body = dict(command.body)
+            body["command_id"] = command_id
+            payload = json.dumps(body, separators=(",", ":"))
             task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
             # Track the task BEFORE the yield so a cancellation during it
             # (e.g. final unload) cannot orphan an untracked publish that then
@@ -1261,8 +1311,6 @@ class ZemismartHub:
         else:
             bridge = self._resolve_with_affinity(command)
         command_id = self._new_command_id()
-        body = dict(command.body)
-        body["command_id"] = command_id
         pending = self._register_pending(bridge, command_id)
         key = (bridge.bridge_id, command_id)
         _LOGGER.debug(
@@ -1276,7 +1324,7 @@ class ZemismartHub:
             await self._ordered_publish(
                 command,
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
-                json.dumps(body, separators=(",", ":")),
+                command_id,
             )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)

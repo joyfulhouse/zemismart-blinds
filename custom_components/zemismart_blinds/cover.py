@@ -50,6 +50,7 @@ _ATTR_MOTION_START_POSITION = "motion_start_position"
 _ATTR_MOTION_TARGET = "motion_target"
 _ATTR_MOTION_TIMED = "motion_timed"
 _ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
+_ATTR_UNVERIFIED_ANCHOR_OFFLINE = "unverified_anchor_offline"
 WALL_CLOCK = time.time
 _COVERS: weakref.WeakKeyDictionary[ZemismartHub, weakref.WeakSet[ZemismartCover]] = (
     weakref.WeakKeyDictionary()
@@ -106,6 +107,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_timed = False
         self._motion_absolute_anchor = False
         self._unverified_anchor_bridge: str | None = None
+        self._unverified_anchor_offline = False
         self._motion_token: object | None = None
         self._motion_task: asyncio.Task[None] | None = None
         self._last_bridge: str | None = None
@@ -169,6 +171,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_TIMED: self._motion_timed,
             _ATTR_MOTION_ABSOLUTE_ANCHOR: self._motion_absolute_anchor,
             _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
+            _ATTR_UNVERIFIED_ANCHOR_OFFLINE: self._unverified_anchor_offline,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -198,6 +201,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         # arrives would silently promote the unverified target to trusted.
         self._unverified_anchor_bridge = self._optional_text(
             state.attributes.get(_ATTR_UNVERIFIED_ANCHOR)
+        )
+        self._unverified_anchor_offline = (
+            self._unverified_anchor_bridge is not None
+            and state.attributes.get(_ATTR_UNVERIFIED_ANCHOR_OFFLINE) is True
         )
 
         raw_direction = state.attributes.get(_ATTR_MOTION_DIRECTION, 0)
@@ -230,6 +237,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
         self._last_bridge = bridge
         timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
+        if timed and self._hub.was_displaced(command_id):
+            # The status listener was installed before awaiting last state, so
+            # a displaced report can arrive while the command id is not yet
+            # restored. The hub's bounded recent-id memory closes that gap.
+            self._mark_unknown()
+            return
         absolute_anchor = (
             state.attributes.get(_ATTR_MOTION_ABSOLUTE_ANCHOR, False) is True
             and not timed
@@ -257,13 +270,15 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 # A full travel that finished during downtime reached its hard
                 # limit just like one completed by _async_track_motion.
                 self._unverified_anchor_bridge = None
+                self._unverified_anchor_offline = False
             elif timed and not self._bridge_seen_online(bridge):
                 # The anchored target assumed the bridge's armed STOP fired
                 # while HA was down, but retained availability has not
                 # arrived yet on this cold start. Remember the bridge: if it
                 # later reports offline, the STOP may never have fired and
                 # the anchor is invalidated.
-                self._unverified_anchor_bridge = bridge
+                if self._unverified_anchor_bridge is None:
+                    self._unverified_anchor_bridge = bridge
             self._reconcile_unverified_anchor()
             return
         # Prefer the persisted motion origin: interpolating from the original
@@ -348,6 +363,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Apply existing bridge state to a questioned restore-time anchor."""
         anchor_bridge = self._unverified_anchor_bridge
         if anchor_bridge is None:
+            self._unverified_anchor_offline = False
             return
         if self._hub.registry.is_known_offline(anchor_bridge):
             # A relative motion still derives from the questioned origin and
@@ -356,8 +372,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # physical anchor independent of that origin.
             if self._direction == 0 or not self._motion_absolute_anchor:
                 self._mark_unknown()
+            else:
+                # Keep the offline evidence even if this bridge reconnects
+                # before the full travel either reaches its limit or stops.
+                self._unverified_anchor_offline = True
+        elif self._unverified_anchor_offline:
+            if self._direction == 0 or not self._motion_absolute_anchor:
+                self._mark_unknown()
         elif self._bridge_seen_online(anchor_bridge):
             self._unverified_anchor_bridge = None
+            self._unverified_anchor_offline = False
 
     @staticmethod
     def _optional_text(value: object) -> str | None:
@@ -427,6 +451,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._position = None
         self._clear_motion()
         self._unverified_anchor_bridge = None
+        self._unverified_anchor_offline = False
         self._degraded = True
 
     def _mark_unknown_and_notify_members(self) -> None:
@@ -520,6 +545,23 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                     member.async_write_ha_state()
                 self._reconcile_overlaps(moving=True)
             return
+        if not absolute_anchor:
+            # Interrupting an exempt full travel can expose a questioned
+            # origin that went offline while the hard-limit motion was live.
+            # A relative replacement must revalidate before it can establish
+            # another position derived from that origin.
+            self._reconcile_unverified_anchor()
+            if self._position is None:
+                if notify_members:
+                    for member in self._member_covers():
+                        member._start_member_motion(
+                            ack,
+                            direction=direction,
+                            duration=duration,
+                            group_target=target,
+                        )
+                    self._reconcile_overlaps(moving=True)
+                return
         # An absolute anchor settles an unverified restore-time anchor only
         # when the full travel COMPLETES at the motor's own limit switch (in
         # _async_track_motion), never at its start: a travel interrupted by a
@@ -544,15 +586,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_bridge = ack.bridge.bridge_id
         self._motion_command_id = ack.command_id
         self._motion_timed = ack.deadline is not None
-        if self._motion_timed and self._hub.was_displaced(ack.command_id):
+        displaced = self._motion_timed and self._hub.was_displaced(ack.command_id)
+        if displaced:
             # The displaced status raced ahead of this model commit: the
             # bridge already flushed this timed motion's fail-safe STOP, so
             # freeze immediately instead of tracking a retired command. (A
             # displaced FULL travel still rides to its endpoint on the
             # motor's own limit switch, so its model proceeds normally.)
             self._interrupt_motion(WALL_CLOCK())
-            return
-        self._create_motion_task("travel")
+        else:
+            self._create_motion_task("travel")
         if notify_members:
             for member in self._member_covers():
                 member._start_member_motion(
@@ -644,6 +687,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # margin and is now at the hard limit: the questioned restore
             # anchor is settled by a genuine physical reference.
             self._unverified_anchor_bridge = None
+            self._unverified_anchor_offline = False
         self._motion_token = None
         self._motion_task = None
         self._clear_motion()
@@ -715,7 +759,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         publish an older intent over the newer command.
         """
         ack = await self._async_transmit("STOP")
-        if ack is None:
+        if ack is None or self._hub.was_displaced(ack.command_id):
             return False
         self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
