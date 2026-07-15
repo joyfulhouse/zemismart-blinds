@@ -26,6 +26,8 @@ or more inexpensive Sonoff RF Bridge R2 units.
 - **Virtual remotes**: mint identities that never existed as hardware and pair motors to them.
 - **Reliable delivery**: correlated bridge acknowledgements, bridge-side STOP deadlines for
   partial movement, and area-aware multi-bridge failover.
+- **Guided remote learning**: a time-boxed bridge capture identifies the remote, action, and
+  channels automatically during onboarding or reconfiguration.
 
 ## Architecture
 
@@ -41,7 +43,8 @@ your Home Assistant already uses** — the Mosquitto add-on works out of the box
 broker (standalone Mosquitto, EMQX, a NAS container) works identically.
 
 ```
-Home Assistant ──(HA MQTT integration)── broker ──(rf433/<bridge>/tx)── Sonoff RF Bridge ──📡── blinds
+Home Assistant ──(MQTT tx)── broker ──(rf433/<bridge>/tx)── RF Bridge ──📡── blinds
+Learn wizard   ◀─(MQTT rx)── broker ◀─(rf433/<bridge>/rx)── RF Bridge ◀─📡── remote button
 ```
 
 ## Prerequisites
@@ -66,19 +69,24 @@ calibration.
 
 ## Configuration
 
-Each run of the add-integration flow creates exactly one device with one cover entity:
+Each run of the add-integration flow creates exactly one device with one cover entity. The guided
+**Learn** path is the default:
 
-1. **Name** the blind or group.
-2. **Choose a remote**: reuse an already-calibrated identity, or enter one manually (24-bit prefix
-   and 8-bit remote ID as hex).
-3. **Calibrate a new remote** with either one captured Portisch B0/B1 reference (labeled UP, DOWN,
-   or STOP) or that action's direct 16-bit base — the flow derives all three action bases. The
-   optional OEM TRAILER base should be left blank unless captured.
-4. **Channels**: one channel (`1`) or an arbitrary group (`1,2,3`). Channels 1–16 are supported.
-5. **Travel times** for full up/down travel, and the blind's Home Assistant **area**.
+1. Enter a **name** and Home Assistant **area**, then use the automatically selected online bridge
+   or choose another one.
+2. Press **Up**, **Down**, or **Stop** on the physical remote during the 30-second capture window.
+   The flow decodes the first valid action frame and detects its prefix, remote ID, channels, and
+   button automatically.
+3. Confirm the detected identity, then edit the captured **channels** if needed (`1` for one blind,
+   or `1,2,3` for a group) and enter the full up/down **travel times**.
 
-Use **Configure** on an existing entry to edit identity, channels, timing, area, or RF repeats.
-The flow accepts hex with or without the `0x` prefix.
+**Advanced** setup can reuse an already-calibrated remote, enter a remote manually from one labeled
+B0/B1 reference or direct 16-bit action base, or allocate a virtual remote. The optional OEM
+TRAILER base should be left blank unless captured.
+
+Use **Configure** on an existing entry to edit channels, timing, area, or RF settings while keeping
+the current remote identity. To change the identity or calibration, use **Reconfigure → Relearn from
+remote**. The flow accepts hex with or without the `0x` prefix.
 
 ### Position behavior
 
@@ -177,8 +185,8 @@ logger:
 
 ## Known Limitations
 
-- **No RX/state sync yet**: presses on the physical remote are not observed (stock ESPHome cannot
-  surface Portisch B1 captures as events). Planned as Phase 2 — see [PROTOCOL.md](PROTOCOL.md).
+- **No live RX/state sync yet**: sniffing is time-boxed and used only by the Learn wizard. Physical
+  remote presses are not observed after setup; live state sync is planned as a follow-up.
 - **Assumed position**: there is no motor feedback; position is modeled from travel time.
 - **Bridge isolated from MQTT mid-command**: a bridge that loses its network link (but not power)
   keeps executing its already-armed fail-safe STOP locally. With multiple bridges, commands fail

@@ -47,23 +47,21 @@ A healthy bridge shows retained `rf433/<bridge_id>/availability` = `online` on t
 
 Each run of the add-integration flow creates exactly one device and one cover entity.
 
-1. Put a bridge into capture mode: press its **Start bucket sniffing** diagnostic button, press a
-   button (UP, DOWN, or STOP) on the blind's physical remote, and copy the `AAB1...55` line from
-   the bridge's ESPHome logs.
-2. **Settings → Devices & services → Add integration → Zemismart Blinds.**
-3. Name the blind, choose **Enter a remote manually**, and paste:
-   - the remote's 24-bit prefix and 8-bit remote ID (decoded from the capture — the first three
-     bytes and the fourth byte of the 64-bit payload; see
-     [PROTOCOL.md](PROTOCOL.md#learning-a-remotes-identity)),
-   - which button the capture was (UP/DOWN/STOP), and the captured frame itself. The flow derives
-     the complete calibration.
-4. Enter one channel (`1`) or an arbitrary group (`1,2,3`); channels 1–16 are supported.
-5. Enter up/down full-travel seconds and select the blind's Home Assistant area.
-6. Repeat for the next blind. Additional blinds on the **same remote** can reuse the calibrated
-   identity from the dropdown — no new capture needed.
+1. Open **Settings → Devices & services → Add integration → Zemismart Blinds**, then choose
+   **Learn from remote**.
+2. Name the blind, select its Home Assistant area, and accept the automatically selected online RF
+   bridge or choose another one.
+3. During the 30-second capture window, press **Up**, **Down**, or **Stop** on the physical remote.
+   The flow detects the remote prefix, remote ID, channels, and button automatically.
+4. Confirm the detected identity, then enter one channel (`1`) or an arbitrary group (`1,2,3`) and
+   the up/down full-travel seconds. Channels 1–16 are supported.
+5. Repeat for the next blind. Under **Advanced**, additional blinds on the same remote can reuse the
+   calibrated identity without another capture; manual capture entry and virtual remotes remain
+   available there too.
 
-Use **Configure** on an existing entry to edit its identity, channels, timing, area, or RF repeat
-count.
+Use **Configure** on an existing entry to edit channels, timing, area, or RF settings while keeping
+its remote identity. Use **Reconfigure → Relearn from remote** to replace the identity or
+calibration.
 
 ## Verify
 

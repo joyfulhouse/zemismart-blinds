@@ -23,6 +23,7 @@ from custom_components.zemismart_blinds.codec import (
     derive_bases_from_base,
     encode_b0,
     group_offset,
+    infer_action_button,
     make_payload,
     synthesize_bases,
     validate_b0_frame,
@@ -138,6 +139,26 @@ def test_all_channel_reference_derives_single_channel_command() -> None:
     payload = make_payload(prefix, remote_id, [1], "UP", bases=derived)
 
     assert payload == expected_ch1
+
+
+@pytest.mark.parametrize(
+    ("channels", "command", "expected"),
+    (
+        ((1, 2, 3, 4, 5, 6), 0xF42B, "UP"),
+        ((1, 2), 0xF467, "UP"),
+        ((1, 2), 0xBD2F, "DOWN"),
+        ((1, 2), 0xDC4F, "STOP"),
+        ((1,), 0xF53C, "UP"),
+        ((1, 2), 0xAA45, None),
+    ),
+)
+def test_infer_action_button_normalizes_golden_commands(
+    channels: tuple[int, ...],
+    command: int,
+    expected: str | None,
+) -> None:
+    """Captured commands identify their action after channel normalization."""
+    assert infer_action_button(channels, command) == expected
 
 
 def test_uncalibrated_trailer_is_rejected() -> None:
@@ -366,7 +387,8 @@ def test_strict_b0_validation_mirrors_firmware_repeat_and_airtime_limits() -> No
     with pytest.raises(ValueError, match="airtime"):
         validate_b0_frame("AAB0050110FFFF0855")
     # The same frame at the controller's embedded repeat of 8 (~1 s) passes.
-    assert validate_b0_frame("AAB0050108FFFF0855") == "AAB0050108FFFF0855"
+    frame = "AAB0050108FFFF0855"
+    assert validate_b0_frame(frame) == frame
 
 
 def test_strict_b0_input_validation_normalizes_a_frame() -> None:

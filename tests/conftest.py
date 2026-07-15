@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import TYPE_CHECKING
 
 import pytest
@@ -11,6 +12,26 @@ from homeassistant.core import HomeAssistant
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Work around a CPython 3.14.6 crash in the interpreter-shutdown GC.
+
+    After the full suite passes, CPython 3.14.6 (both Homebrew and
+    python-build-standalone builds) segfaults during ``Py_Finalize`` —
+    ``gc_collect_main`` -> ``subtype_dealloc`` -> ``PyObject_ClearManagedDict``
+    (confirmed with ``PYTHONFAULTHANDLER=1``) while tearing down the large Home
+    Assistant object graph left by combining the config-flow tests with a
+    full-integration test file (e.g. ``test_init``/``test_cover``). Every test
+    passes; only the finalization collection crashes, which still fails CI with
+    exit 139. A per-test ``gc.collect()`` does not help (the survivors are held
+    until shutdown). Freezing them into the permanent generation once the
+    session result is known excludes them from that final collection, so the
+    process exits cleanly without changing any test outcome. Remove this when
+    the upstream CPython finalization bug is fixed.
+    """
+    del session, exitstatus
+    gc.freeze()
 
 
 @pytest_asyncio.fixture
