@@ -1502,3 +1502,66 @@ async def test_untimed_full_travels_still_coalesce() -> None:
 
     assert len(published) == 1
     assert published[0]["target"] == "a1b2c3:42:1,2"
+
+
+@pytest.mark.asyncio
+async def test_closed_hub_rejects_new_commands() -> None:
+    """A command that arrives after close() cannot resurrect the worker.
+
+    A caller blocked on its entity command lock during teardown must resolve
+    as superseded rather than publishing on the torn-down hub.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+    hub.close()
+    result = await hub.async_transmit(blind_config(), "UP")
+    assert result == "superseded"
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_publish_transport_error_pops_pending() -> None:
+    """An immediate publish failure never leaks its pending-status entry."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+
+    async def publish(_topic: str, _payload: str) -> None:
+        msg = "broker unavailable"
+        raise OSError(msg)
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: "leak-check")
+    with pytest.raises(OSError, match="broker unavailable"):
+        await hub.async_transmit(blind_config(), "UP")
+    assert hub._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_background_publish_tasks() -> None:
+    """close() cancels a still-pending background publish (no orphan)."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    release = asyncio.Event()
+    enqueued = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        enqueued.set()  # "enqueue" happens synchronously
+        await release.wait()  # withhold the PUBACK
+
+    hub = ZemismartHub(registry, publish, command_id_factory=lambda: "bg-1")
+    task = asyncio.create_task(hub.async_transmit(blind_config(), "UP"))
+    await enqueued.wait()
+    background = set(hub._publish_tasks)
+    assert background  # a background publish is in flight
+    hub.close()
+    await asyncio.sleep(0)
+    assert all(publish_task.cancelled() for publish_task in background)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()

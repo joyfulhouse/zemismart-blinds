@@ -614,6 +614,7 @@ class ZemismartHub:
         # barrier across a QoS-1 broker acknowledgment.
         self._publish_lock = asyncio.Lock()
         self._publish_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
         self.displaced_listeners: list[Callable[[str, str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
@@ -824,6 +825,10 @@ class ZemismartHub:
 
     async def _async_enqueue(self, command: _QueuedCommand) -> CommandResult:
         """Queue a command, giving STOP front priority and overlap supersession."""
+        if self._closed:
+            # The entry was unloaded; a caller that was blocked on its command
+            # lock during teardown must not resurrect the worker or publish.
+            return "superseded"
         future = command.futures[0]
         fast_lane = False
         command.published = asyncio.Event()
@@ -1204,15 +1209,25 @@ class ZemismartHub:
         """
         async with self._publish_lock:
             task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
-            # Yield once so the task runs up to its PUBACK await — past the
-            # synchronous paho enqueue — before the lock and barrier release.
-            await asyncio.sleep(0)
+            # Track the task BEFORE the yield so a cancellation during it
+            # (e.g. final unload) cannot orphan an untracked publish that then
+            # enqueues after teardown; close() cancels the tracked set.
+            self._publish_tasks.add(task)
+            try:
+                # Yield once so the task runs up to its PUBACK await — past the
+                # synchronous paho enqueue — before the lock and barrier release.
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                task.cancel()
+                self._publish_tasks.discard(task)
+                raise
             transport_error = task.exception() if task.done() and not task.cancelled() else None
             if transport_error is None:
                 # Still enqueuing/awaiting its PUBACK: reap it in the
                 # background so ordering never waits on the acknowledgment.
-                self._publish_tasks.add(task)
                 task.add_done_callback(self._on_publish_done)
+            else:
+                self._publish_tasks.discard(task)
         if transport_error is not None:
             # An immediate transport failure (e.g. broker down) surfaces
             # fast instead of waiting out the admission timeout. The order
@@ -1257,15 +1272,17 @@ class ZemismartHub:
             bridge.bridge_id,
             bridge.area_id,
         )
-        await self._ordered_publish(
-            command,
-            f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
-            json.dumps(body, separators=(",", ":")),
-        )
         try:
+            await self._ordered_publish(
+                command,
+                f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
+                json.dumps(body, separators=(",", ":")),
+            )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
         finally:
+            # Pop on EVERY exit, including an immediate publish transport
+            # error, so a failed command never leaks its pending entry.
             self._pending.pop(key, None)
         _LOGGER.debug(
             "Command %s %s by bridge %s; RF started",
@@ -1427,6 +1444,7 @@ class ZemismartHub:
 
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
+        self._closed = True
         if self._worker_task is not None:
             self._worker_task.cancel()
             self._worker_task = None
