@@ -1840,6 +1840,73 @@ async def test_generic_timeout_hook_does_not_fan_out_to_unthreatened_members(
 
 
 @pytest.mark.asyncio
+async def test_lost_disarm_invalidates_unmodeled_covers_outside_the_press(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost disarm marks every cover on the command's channels unknown.
+
+    A raw send is never modeled by any cover, so its covers hold no motion
+    command; a press on a subset must still leave the OUTSIDE-the-press cover
+    honestly unknown when the disarm is lost — the aborted command latched
+    its motor and the un-disarmed frames may keep driving it.
+    """
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "raw-group-up",
+    )
+    member_one = await attach_cover(hass, hub, config=member_config(channel=1))
+    member_two = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_2",
+    )
+    member_one._position = 50.0
+    member_two._position = 50.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+        assert member_two._motion_command_id is None
+
+        dispatch_heard_press(
+            hub,
+            member_one._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert member_one.is_closing
+        request = hub._disarm_requests[("bridge-a", "raw-group-up")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert member_one.current_cover_position is None
+        assert member_two.current_cover_position is None
+    finally:
+        await member_two.async_will_remove_from_hass()
+        await member_one.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_confirmed_stop_takeover_disarm_ack_keeps_mirrored_motion(
     hass: HomeAssistant,
 ) -> None:

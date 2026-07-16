@@ -948,12 +948,19 @@ class ZemismartHub:
         event: HeardEvent,
         command: LiveCommand,
     ) -> Callable[[], None]:
-        """Snapshot pressed cover hooks for one generic confirmed disarm."""
+        """Snapshot threatened cover hooks for one generic confirmed disarm.
+
+        Every cover on the command's channels is threatened by a lost disarm
+        — including covers OUTSIDE the press (a not-yet-modeling member in
+        the started-to-commit window, or any cover under a raw send): the
+        aborted command latched their motors, so on timeout their positions
+        are genuinely uncertain. Restricting this to pressed covers would
+        leave them confidently stale (round-7 finding).
+        """
         timeout_hooks = tuple(
             hook
             for listener in self._rx_listeners
             if listener.remote_key == event.remote_key
-            and not listener.channels.isdisjoint(event.chans)
             and not listener.channels.isdisjoint(command.channels)
             if (hook := listener.disarm_timeout) is not None
         )
