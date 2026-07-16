@@ -344,12 +344,14 @@ def test_ledger_finds_only_live_overlapping_commands() -> None:
             bridge_id=_BRIDGE_A,
             command_id="matching",
             channels=frozenset({1}),
+            button="DOWN",
             confirmed=False,
         ),
         state_sync_module.LiveCommand(
             bridge_id=_BRIDGE_B,
             command_id="started",
             channels=frozenset({1}),
+            button="DOWN",
             confirmed=True,
         ),
     )

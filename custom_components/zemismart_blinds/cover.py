@@ -419,7 +419,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     @callback
     def _on_command_invalidated(self, command_id: str) -> None:
         """Discard a model whose whole command was aborted by another channel."""
-        if command_id and command_id == self._motion_command_id:
+        if command_id and (
+            command_id == self._motion_command_id or self._motion_command_id is None
+        ):
             self._mark_unknown()
             self.async_write_ha_state()
 
@@ -756,7 +758,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         The whole-command fan-out stays with cover-owned requests
         (_on_disarm_timeout above).
         """
-        if self._unsubscribe_rx_listener is None:
+        if self._unsubscribe_rx_listener is None or self._motion_command_id is not None:
             return
         self._mark_unknown()
         self.async_write_ha_state()

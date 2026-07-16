@@ -1151,7 +1151,13 @@ async def test_partial_heard_press_disarms_timed_command_before_unknown(
 async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
     hass: HomeAssistant,
 ) -> None:
-    """A whole-command abort makes an unpressed bound member honestly unknown."""
+    """A whole-command abort invalidates idle and bound unpressed members.
+
+    The round-8 panel ruled that an idle cover on an unpressed command channel
+    is also honestly unknown: disarming the old movement erases its fail-safe
+    STOP, so that motor can keep running. A different live commanded model owns
+    its cover and remains governed by its own lifecycle.
+    """
     published: list[tuple[str, dict[str, Any]]] = []
     disarm_published = asyncio.Event()
     hub: ZemismartHub
@@ -1191,7 +1197,14 @@ async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
         entry_id="entry-4",
         entity_id="cover.unbound_channel_2",
     )
-    for cover in (group, first, second, unbound):
+    protected = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-5",
+        entity_id="cover.protected_channel_2",
+    )
+    for cover in (group, first, second, unbound, protected):
         cover._position = 20.0
     try:
         await group.async_set_cover_position(**{ATTR_POSITION: 40})
@@ -1199,6 +1212,12 @@ async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
         unbound._position = 65.0
         unbound._clear_motion()
         unbound._degraded = False
+        protected._cancel_motion_task()
+        protected._clear_motion()
+        protected._position = 75.0
+        protected._motion_command_id = "newer-command"
+        protected._direction = 1
+        protected._degraded = False
 
         dispatch_heard_press(
             hub,
@@ -1212,8 +1231,11 @@ async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
         assert first.is_opening
         assert group.current_cover_position is None
         assert second.current_cover_position is None
-        assert unbound.current_cover_position == 65
-        assert unbound.extra_state_attributes["degraded_bridge"] is False
+        assert unbound.current_cover_position is None
+        assert unbound.extra_state_attributes["degraded_bridge"] is True
+        assert protected.current_cover_position == 75
+        assert protected._motion_command_id == "newer-command"
+        assert protected.extra_state_attributes["degraded_bridge"] is False
         assert [item for item in published if item[0].endswith("/cmd")] == [
             (
                 "rf433/bridge-a/cmd",
@@ -1225,6 +1247,7 @@ async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
             {"status": "disarmed", "command_id": "group-timed"},
         )
     finally:
+        await protected.async_will_remove_from_hass()
         await group.async_will_remove_from_hass()
         await first.async_will_remove_from_hass()
         await second.async_will_remove_from_hass()
@@ -1903,6 +1926,251 @@ async def test_lost_disarm_invalidates_unmodeled_covers_outside_the_press(
     finally:
         await member_two.async_will_remove_from_hass()
         await member_one.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_displaced_raw_command_settles_takeover_disarm_timeout(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Displacement settles the obsolete disarm without erasing a new mirror."""
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "raw-group-up",
+    )
+    entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    entity._position = 50.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert entity.is_closing
+        request = hub._disarm_requests[("bridge-a", "raw-group-up")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "displaced", "command_id": "raw-group-up"},
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.sleep(_GENERIC_DISARM_DEADLINE_SECONDS)
+
+        assert request.waiter.done() and not request.waiter.cancelled()
+        assert entity.is_closing
+        assert entity.current_cover_position is not None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_takeover_timeout_preserves_newer_commanded_model(
+    hass: HomeAssistant,
+) -> None:
+    """A captured generic timeout cannot erase a newer commanded model."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "raw-group-up",
+    )
+    mirroring = await attach_cover(hass, hub, config=member_config(channel=1))
+    commanded = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_2",
+    )
+    mirroring._position = 40.0
+    mirroring._direction = -1
+    commanded._position = 65.0
+    commanded._direction = 1
+    commanded._motion_command_id = "newer-command"
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+        command = hub._ledger.live_overlapping(
+            mirroring._config.remote_key,
+            frozenset({1}),
+        )[0]
+        on_timeout = hub._pressed_disarm_timeout(
+            HeardEvent(
+                button="DOWN",
+                chans=frozenset({1}),
+                remote_key=mirroring._config.remote_key,
+                heard_at=cover_module.WALL_CLOCK(),
+                bridge_id="synthetic-rx-bridge",
+            ),
+            command,
+        )
+
+        on_timeout()
+
+        assert mirroring.current_cover_position is None
+        assert commanded.current_cover_position == 65
+        assert commanded._motion_command_id == "newer-command"
+    finally:
+        await commanded.async_will_remove_from_hass()
+        await mirroring.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_group_stop_timeout_preserves_unpressed_idle_member(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost confirmed STOP disarm threatens only the pressed mirror."""
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "confirmed-group-stop",
+    )
+    group = await attach_cover(hass, hub, config=channel_group_config((1, 2)))
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1))
+    unpressed = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_2",
+    )
+    group._position = 50.0
+    pressed._position = 40.0
+    unpressed._position = 60.0
+    try:
+        assert await group._async_stop()
+        assert pressed._motion_command_id is None
+        assert unpressed._motion_command_id is None
+
+        dispatch_heard_press(
+            hub,
+            group._config,
+            "UP",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "confirmed-group-stop")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert pressed.current_cover_position is None
+        assert unpressed.current_cover_position == 60
+    finally:
+        await unpressed.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
+        await group.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_takeover_disarm_ack_invalidates_unpressed_idle_member(
+    hass: HomeAssistant,
+) -> None:
+    """A successful raw-movement abort invalidates its idle unpressed cover."""
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "raw-group-up",
+    )
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    unpressed = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_2",
+    )
+    pressed._position = 50.0
+    unpressed._position = 60.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+        assert pressed._motion_command_id is None
+        assert unpressed._motion_command_id is None
+
+        dispatch_heard_press(
+            hub,
+            pressed._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "raw-group-up")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "raw-group-up"},
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert pressed.is_closing
+        assert unpressed.current_cover_position is None
+    finally:
+        await unpressed.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
         hub.close()
 
 

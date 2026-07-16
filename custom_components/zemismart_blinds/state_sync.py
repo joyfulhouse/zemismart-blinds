@@ -229,6 +229,7 @@ class LiveCommand:
     bridge_id: str
     command_id: str
     channels: frozenset[int]
+    button: str
     confirmed: bool
 
 
@@ -308,6 +309,7 @@ class CommandLedger:
                 bridge_id=entry.bridge_id,
                 command_id=entry.command_id,
                 channels=frozenset(entry.channels),
+                button=entry.button,
                 confirmed=entry.phase == "confirmed",
             )
             for entry in self._entries.values()

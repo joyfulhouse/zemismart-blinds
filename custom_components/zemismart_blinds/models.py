@@ -924,7 +924,8 @@ class ZemismartHub:
             pressed = event.button in {"UP", "DOWN"} and command.confirmed
             on_timeout = self._ignore_takeover_disarm_timeout
             if pressed:
-                self._invalidate_unpressed_listeners(event, command)
+                if command.button in {"UP", "DOWN"}:
+                    self._invalidate_unpressed_listeners(event, command)
                 on_timeout = self._pressed_disarm_timeout(event, command)
             existing = self._disarm_requests.get((command.bridge_id, command.command_id))
             if existing is not None and not existing.waiter.done():
@@ -950,18 +951,19 @@ class ZemismartHub:
     ) -> Callable[[], None]:
         """Snapshot threatened cover hooks for one generic confirmed disarm.
 
-        Every cover on the command's channels is threatened by a lost disarm
-        — including covers OUTSIDE the press (a not-yet-modeling member in
-        the started-to-commit window, or any cover under a raw send): the
-        aborted command latched their motors, so on timeout their positions
-        are genuinely uncertain. Restricting this to pressed covers would
-        leave them confidently stale (round-7 finding).
+        A movement command threatens every cover on its channels, including
+        covers outside the press: its motors latched travel and losing the
+        disarm can preserve the old fail-safe STOP. A STOP command cannot move
+        an unpressed motor, so only listeners also intersecting the physical
+        press are threatened by its remaining frames.
         """
+        movement_command = command.button in {"UP", "DOWN"}
         timeout_hooks = tuple(
             hook
             for listener in self._rx_listeners
             if listener.remote_key == event.remote_key
             and not listener.channels.isdisjoint(command.channels)
+            and (movement_command or not listener.channels.isdisjoint(event.chans))
             if (hook := listener.disarm_timeout) is not None
         )
 
@@ -1071,6 +1073,9 @@ class ZemismartHub:
                 self._ledger.confirm(command_id, displaced_pending.started.result())
         self._ledger.displace(command_id, self._now())
         self._state_sync.resume_holds(command_id)
+        disarm_request = self._disarm_requests.get((bridge_id, command_id))
+        if disarm_request is not None and not disarm_request.waiter.done():
+            disarm_request.waiter.set_result(None)
         self._remember_displaced(command_id)
         _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
         for listener in self.displaced_listeners:
