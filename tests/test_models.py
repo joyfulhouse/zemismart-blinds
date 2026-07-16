@@ -17,6 +17,7 @@ from custom_components.zemismart_blinds.codec import (
 from custom_components.zemismart_blinds.models import (
     BlindConfig,
     BridgeRegistry,
+    Button,
     CommandAck,
     CommandAckTimeoutError,
     CommandRejectedError,
@@ -565,6 +566,58 @@ async def test_rf_start_records_commanded_start_for_press_staleness(
         )
     ]
     hub.close()
+
+
+@pytest.mark.parametrize(
+    ("raw_button", "expected_stamp_count", "expected_buttons"),
+    [
+        pytest.param("TRAILER", 0, ("DOWN",), id="non-movement-dispatched"),
+        pytest.param("UP", 1, (), id="movement-dropped"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_raw_command_stamps_start_only_for_movement_frames(
+    raw_button: Button,
+    expected_stamp_count: int,
+    expected_buttons: tuple[str, ...],
+) -> None:
+    """Only a movement raw frame may outrank an older physical press."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    events: list[HeardEvent] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        accept_and_start(hub, "bridge-a", json.loads(payload))
+
+    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    channels = frozenset({1})
+    config = blind_config()
+    raw = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            channels,
+            raw_button,
+            bases=TEST_BASES,
+        )
+    )
+    hub.register_rx_listener(config.remote.key, channels, events.append)
+    try:
+        await hub.async_send_raw("bridge-a", raw, 1)
+
+        assert len(hub._state_sync._commanded_starts) == expected_stamp_count
+
+        hub._state_sync._dispatch_press(
+            (config.remote.key, channels, "DOWN"),
+            _STATE_SYNC_RECV_TIME - 1.0,
+            "bridge-b",
+            _STATE_SYNC_RECV_TIME + 1.0,
+        )
+
+        assert tuple(event.button for event in events) == expected_buttons
+    finally:
+        hub.close()
 
 
 @pytest.mark.asyncio

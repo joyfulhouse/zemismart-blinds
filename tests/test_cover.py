@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
 from homeassistant.components.cover import ATTR_CURRENT_POSITION, ATTR_POSITION
@@ -13,6 +13,7 @@ from homeassistant.core import State
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.zemismart_blinds import cover as cover_module
+from custom_components.zemismart_blinds import models as models_module
 from custom_components.zemismart_blinds.codec import encode_b0, make_payload
 from custom_components.zemismart_blinds.cover import ZemismartCover
 from custom_components.zemismart_blinds.models import (
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import EntityPlatform
+
+_GENERIC_DISARM_DEADLINE_SECONDS: Final = 0.02
 
 
 def cover_config(*, travel: float = 0.04) -> BlindConfig:
@@ -1657,6 +1660,114 @@ async def test_heard_up_disarm_timeout_marks_mirrored_motion_unknown(
         assert entity.current_cover_position is None
         assert not entity.is_opening
         assert entity.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_stop_takeover_disarm_timeout_marks_mirror_unknown(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost generic disarm invalidates a mirror after a commanded STOP."""
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "confirmed-stop",
+    )
+    entity = await attach_cover(hass, hub, config=member_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        assert await entity._async_stop()
+        assert entity._motion_command_id is None
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "confirmed-stop")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "confirmed-stop"},
+            )
+        ]
+        assert entity.current_cover_position is None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_stop_takeover_disarm_ack_keeps_mirrored_motion(
+    hass: HomeAssistant,
+) -> None:
+    """A timely generic disarm ack preserves the mirrored physical UP."""
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "confirmed-stop",
+    )
+    entity = await attach_cover(hass, hub, config=member_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        assert await entity._async_stop()
+        assert entity._motion_command_id is None
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "confirmed-stop")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "confirmed-stop"},
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert entity.is_opening
+        assert entity._motion_target == 100.0
+        assert entity.current_cover_position is not None
     finally:
         await entity.async_will_remove_from_hass()
         hub.close()

@@ -207,6 +207,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._on_heard_press,
             prepare=self._prepare_heard_press,
             invalidate=self._on_command_invalidated,
+            disarm_timeout=self._on_disarm_timeout,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)

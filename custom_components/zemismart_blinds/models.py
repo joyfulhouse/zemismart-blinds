@@ -583,6 +583,7 @@ class _RxListener:
     callback: Callable[[HeardEvent], None]
     prepare: Callable[[HeardEvent], None] | None = None
     invalidate: Callable[[str], None] | None = None
+    disarm_timeout: Callable[[], None] | None = None
 
 
 @dataclass(slots=True)
@@ -808,9 +809,17 @@ class ZemismartHub:
         *,
         prepare: Callable[[HeardEvent], None] | None = None,
         invalidate: Callable[[str], None] | None = None,
+        disarm_timeout: Callable[[], None] | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
-        listener = _RxListener(remote_key, channels, callback, prepare, invalidate)
+        listener = _RxListener(
+            remote_key,
+            channels,
+            callback,
+            prepare,
+            invalidate,
+            disarm_timeout,
+        )
 
         def unsubscribe() -> None:
             with suppress(ValueError):
@@ -912,8 +921,10 @@ class ZemismartHub:
         ):
             if event.button == "STOP" and command.confirmed:
                 continue
+            on_timeout = self._ignore_takeover_disarm_timeout
             if event.button in {"UP", "DOWN"} and command.confirmed:
                 self._invalidate_unpressed_listeners(event, command)
+                on_timeout = self._pressed_disarm_timeout(event, command)
             existing = self._disarm_requests.get((command.bridge_id, command.command_id))
             if existing is not None and not existing.waiter.done():
                 continue
@@ -921,8 +932,29 @@ class ZemismartHub:
                 command.bridge_id,
                 command.command_id,
                 deadline,
-                self._ignore_takeover_disarm_timeout,
+                on_timeout,
             )
+
+    def _pressed_disarm_timeout(
+        self,
+        event: HeardEvent,
+        command: LiveCommand,
+    ) -> Callable[[], None]:
+        """Snapshot pressed cover hooks for one generic confirmed disarm."""
+        timeout_hooks = tuple(
+            hook
+            for listener in self._rx_listeners
+            if listener.remote_key == event.remote_key
+            and not listener.channels.isdisjoint(event.chans)
+            and not listener.channels.isdisjoint(command.channels)
+            if (hook := listener.disarm_timeout) is not None
+        )
+
+        def on_timeout() -> None:
+            for hook in timeout_hooks:
+                hook()
+
+        return on_timeout
 
     def _invalidate_unpressed_listeners(
         self,
@@ -1897,10 +1929,18 @@ class ZemismartHub:
         else:
             bridge = self._resolve_with_affinity(command)
         command_id = self._new_command_id()
+        action_raw = command.body.get("raw")
+        pending_remote_key = (
+            command.remote.key
+            if command.remote is not None
+            and isinstance(action_raw, str)
+            and frame_signature(action_raw) is not None
+            else None
+        )
         pending = self._register_pending(
             bridge,
             command_id,
-            command.remote.key if command.remote is not None else None,
+            pending_remote_key,
             command.channels,
         )
         key = (bridge.bridge_id, command_id)
