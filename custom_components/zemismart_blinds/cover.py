@@ -129,6 +129,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_task: asyncio.Task[None] | None = None
         self._last_bridge: str | None = None
         self._degraded = False
+        self._intent_generation = 0
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
         # Serializes this entity's own commands: without it, a set_position
         # racing an unstarted open/close computes travel from a stale
@@ -352,11 +353,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if channels.isdisjoint(event.chans):
             return
         if not channels <= event.chans:
+            self._intent_generation += 1
             self._mark_unknown()
             self.async_write_ha_state()
             return
         if self._heard_press_owned_by_group(event):
+            self._intent_generation += 1
             return
+        self._intent_generation += 1
         self._start_heard_motion(event)
 
     def _heard_press_owned_by_group(self, event: HeardEvent) -> bool:
@@ -854,8 +858,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         target: float,
     ) -> None:
         """Run a full configured calibration regardless of the prior estimate."""
+        intent_generation = self._intent_generation
         ack = await self._async_transmit(button)
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return
         configured = self._config.travel_up if direction > 0 else self._config.travel_down
         self._start_motion(
@@ -902,8 +907,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         command: the caller's multi-frame operation must abort rather than
         publish an older intent over the newer command.
         """
+        intent_generation = self._intent_generation
         ack = await self._async_transmit("STOP")
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return False
         # A displaced STOP still STARTED — its frame went on air and halted the
         # motors — before a newer command replaced it. Freeze self + members at
@@ -963,12 +969,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
         duration = abs(target - current) / 100 * full_travel
         stop_after_ms = max(1, round(duration * 1_000))
+        intent_generation = self._intent_generation
         ack = await self._async_transmit(
             "UP" if direction > 0 else "DOWN",
             stop_after_ms=stop_after_ms,
             overlap_token=overlap_token,
         )
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return
         acknowledged_duration = (
             max(0.001, ack.deadline - ack.started_at) if ack.deadline is not None else duration

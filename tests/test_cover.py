@@ -775,6 +775,66 @@ async def test_heard_up_starts_exact_cover_without_routing_or_publish(
 
 
 @pytest.mark.asyncio
+async def test_heard_up_supersedes_timed_down_awaiting_started(
+    hass: HomeAssistant,
+) -> None:
+    """A delayed commanded ack cannot overwrite a newer physical press."""
+    published: list[dict[str, Any]] = []
+    admitted = asyncio.Event()
+    allow_started = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        bridge_id = topic.split("/")[1]
+        assert hub.handle_status(
+            bridge_id,
+            {"status": "accepted", "command_id": body["command_id"]},
+        )
+        admitted.set()
+        await allow_started.wait()
+        assert hub.handle_status(
+            bridge_id,
+            {"status": "started", "command_id": body["command_id"]},
+        )
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 80.0
+    command = asyncio.create_task(
+        entity.async_set_cover_position(**{ATTR_POSITION: 20}),
+    )
+    try:
+        await admitted.wait()
+        assert entity._intent_generation == 0
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert entity._intent_generation == 1
+        assert entity.is_opening
+        assert entity._motion_command_id is None
+
+        allow_started.set()
+        await command
+
+        assert len(published) == 1
+        assert entity.is_opening
+        assert entity._motion_target == 100.0
+        assert entity._motion_command_id is None
+    finally:
+        if not command.done():
+            command.cancel()
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_heard_group_move_models_members_once_without_double_invalidation(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,

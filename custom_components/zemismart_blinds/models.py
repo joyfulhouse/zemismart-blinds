@@ -40,7 +40,14 @@ from .const import (
     DEFAULT_COALESCE_WINDOW_MS,
     MQTT_ROOT,
 )
-from .state_sync import BridgeClock, CommandLedger, HeardEvent, StateSyncConsumer
+from .state_sync import (
+    BridgeClock,
+    CommandLedger,
+    HeardEvent,
+    LedgerFrameSpec,
+    StateSyncConsumer,
+    frame_signature,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +76,7 @@ _BRIDGE_MAX_ENTRIES: Final = 256
 _EMISSION_PROOF_MEMORY_SECONDS: Final = 60.0
 _EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
 _EMISSION_PROOF_MAX_ENTRIES: Final = 256
+_LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _UINT32_MAX: Final = (1 << 32) - 1
 
 
@@ -815,6 +823,7 @@ class ZemismartHub:
 
     def _dispatch_heard(self, event: HeardEvent) -> None:
         """Invoke a snapshot of matching listeners intersecting the press."""
+        self._supersede_channels(event.remote_key, event.chans)
         callbacks = tuple(
             listener.callback
             for listener in self._rx_listeners
@@ -944,6 +953,12 @@ class ZemismartHub:
         publication happened in between.
         """
         return self._overlap_seq(config.remote, frozenset(config.channels))
+
+    def _supersede_channels(self, remote_key: str, channels: frozenset[int]) -> None:
+        """Advance each physically pressed channel's publish generation."""
+        for channel in channels:
+            key = (remote_key, channel)
+            self._publish_seq[key] = self._publish_seq.get(key, 0) + 1
 
     def _record_publish(self, command: _QueuedCommand) -> None:
         """Advance every published channel's sequence number."""
@@ -1312,6 +1327,42 @@ class ZemismartHub:
         self._pending[key] = pending
         return pending
 
+    @staticmethod
+    def _ledger_registration(
+        command: _QueuedCommand,
+    ) -> tuple[str, list[LedgerFrameSpec]] | None:
+        """Build one movement command's complete classifiable RF envelope."""
+        action_raw = command.body.get("raw")
+        if not isinstance(action_raw, str):
+            return None
+        action_signature = frame_signature(action_raw)
+        if action_signature is None:
+            return None
+        frames = [
+            LedgerFrameSpec(
+                signature=action_signature,
+                offset_ms=0,
+                airtime_ms=_LEDGER_FRAME_AIRTIME_MS,
+            )
+        ]
+        for body_field in ("trailer_raw", "stop_raw"):
+            raw = command.body.get(body_field)
+            if not isinstance(raw, str) or (signature := frame_signature(raw)) is None:
+                continue
+            offset_ms = (
+                command.stop_after_ms
+                if body_field == "stop_raw" and command.stop_after_ms is not None
+                else 0
+            )
+            frames.append(
+                LedgerFrameSpec(
+                    signature=signature,
+                    offset_ms=offset_ms,
+                    airtime_ms=_LEDGER_FRAME_AIRTIME_MS,
+                )
+            )
+        return action_signature[2], frames
+
     async def _await_status(
         self,
         future: asyncio.Future[_BridgeStatus],
@@ -1471,6 +1522,9 @@ class ZemismartHub:
         command_id = self._new_command_id()
         pending = self._register_pending(bridge, command_id)
         key = (bridge.bridge_id, command_id)
+        ledger_registration = self._ledger_registration(command)
+        ledger_registered = False
+        ledger_confirmed = False
         _LOGGER.debug(
             "Publishing command %s (target %s) via bridge %s (area %s)",
             command_id,
@@ -1479,6 +1533,16 @@ class ZemismartHub:
             bridge.area_id,
         )
         try:
+            if ledger_registration is not None:
+                button, frames = ledger_registration
+                self._ledger.register_pending(
+                    command_id,
+                    bridge.bridge_id,
+                    tuple(sorted(command.channels)),
+                    button,
+                    frames,
+                )
+                ledger_registered = True
             await self._ordered_publish(
                 command,
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
@@ -1486,10 +1550,17 @@ class ZemismartHub:
             )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
+            if ledger_registered:
+                self._ledger.confirm(command_id, started_at)
+                ledger_confirmed = True
+                self._state_sync.resume_holds(command_id)
         finally:
             # Pop on EVERY exit, including an immediate publish transport
             # error, so a failed command never leaks its pending entry.
             self._pending.pop(key, None)
+            if ledger_registered and not ledger_confirmed:
+                self._ledger.retire(command_id)
+                self._state_sync.resume_holds(command_id)
         _LOGGER.debug(
             "Command %s %s by bridge %s; RF started",
             command_id,

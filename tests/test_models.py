@@ -43,6 +43,8 @@ _name, OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES, _payload = SYNTHETIC_REMOTES[
 _STATE_SYNC_BOOT: Final = 7
 _STATE_SYNC_T: Final = 2_000
 _STATE_SYNC_RECV_TIME: Final = 100.0
+_LEDGER_STOP_AFTER_MS: Final = 3_250
+_MILLISECONDS_PER_SECOND: Final = 1_000
 _BRIDGE_STATE_CAP: Final = 256
 _FORGED_BRIDGE_COUNT: Final = 300
 
@@ -565,6 +567,138 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     assert group_events == [expected]
     assert partial_events == [expected]
     assert disjoint_events == []
+
+
+@pytest.mark.asyncio
+async def test_pending_command_holds_peer_echo_until_started_confirmation() -> None:
+    """A peer capture before STARTED is held, then classified as our echo."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    enqueued = asyncio.Event()
+    clock = {"now": _STATE_SYNC_RECV_TIME}
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        enqueued.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "ledger-confirmed",
+        now=lambda: clock["now"],
+    )
+    events: list[HeardEvent] = []
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
+    transmit = asyncio.create_task(
+        hub.async_transmit(
+            config,
+            "DOWN",
+            stop_after_ms=_LEDGER_STOP_AFTER_MS,
+        )
+    )
+    try:
+        await enqueued.wait()
+        body = published[0]
+        hub.handle_rx(
+            "bridge-b",
+            {
+                "frame": body["raw"],
+                "t": _STATE_SYNC_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+            clock["now"],
+        )
+
+        assert events == []
+        assert len(hub._state_sync._holds) == 1
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status("bridge-a", started(body))
+        assert isinstance(await transmit, CommandAck)
+
+        assert events == []
+        assert not hub._state_sync._holds
+        assert "ledger-confirmed" in hub._recent_emission_proofs
+
+        clock["now"] += _LEDGER_STOP_AFTER_MS / _MILLISECONDS_PER_SECOND
+        hub.handle_rx(
+            "bridge-b",
+            {
+                "frame": body["stop_raw"],
+                "t": _STATE_SYNC_T + _LEDGER_STOP_AFTER_MS,
+                "boot": _STATE_SYNC_BOOT,
+            },
+            clock["now"],
+        )
+        assert events == []
+    finally:
+        if not transmit.done():
+            transmit.cancel()
+        hub.close()
+
+
+@pytest.mark.parametrize("terminal_status", ("rejected", "displaced"))
+@pytest.mark.asyncio
+async def test_unconfirmed_command_retires_ledger_and_releases_peer_hold(
+    terminal_status: str,
+) -> None:
+    """A command that never starts releases a held peer capture as a press."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    enqueued = asyncio.Event()
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        enqueued.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: f"ledger-{terminal_status}",
+        now=lambda: _STATE_SYNC_RECV_TIME,
+    )
+    events: list[HeardEvent] = []
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
+    transmit = asyncio.create_task(hub.async_transmit(config, "DOWN"))
+    try:
+        await enqueued.wait()
+        body = published[0]
+        hub.handle_rx(
+            "bridge-b",
+            {
+                "frame": body["raw"],
+                "t": _STATE_SYNC_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+            _STATE_SYNC_RECV_TIME,
+        )
+        assert events == []
+        assert len(hub._state_sync._holds) == 1
+
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": terminal_status,
+                "command_id": body["command_id"],
+            },
+        )
+        if terminal_status == "rejected":
+            with pytest.raises(CommandRejectedError):
+                await transmit
+        else:
+            assert await transmit == "superseded"
+
+        assert not hub._state_sync._holds
+        assert len(events) == 1
+        assert events[0].button == "DOWN"
+        assert events[0].chans == frozenset(config.channels)
+    finally:
+        if not transmit.done():
+            transmit.cancel()
+        hub.close()
 
 
 def test_handle_rx_bounds_forged_bridge_ids() -> None:
@@ -1691,6 +1825,53 @@ async def test_stale_overlap_token_supersedes_the_movement() -> None:
     fresh = await hub.async_transmit(config, "DOWN", overlap_token=hub.overlap_token(config))
     assert isinstance(fresh, CommandAck)
     assert len(published) == 2
+
+
+@pytest.mark.asyncio
+async def test_heard_press_invalidates_overlap_token_before_publish() -> None:
+    """A physical press makes a pre-press set-position movement stale."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    config = blind_config()
+    token = hub.overlap_token(config)
+    physical_up = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            config.channels,
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": physical_up,
+            "t": _STATE_SYNC_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+        _STATE_SYNC_RECV_TIME,
+    )
+    result = await hub.async_transmit(
+        config,
+        "DOWN",
+        stop_after_ms=_LEDGER_STOP_AFTER_MS,
+        overlap_token=token,
+    )
+
+    assert result == "superseded"
+    assert published == []
+    hub.close()
 
 
 @pytest.mark.asyncio
