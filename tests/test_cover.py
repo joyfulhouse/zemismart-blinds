@@ -36,6 +36,7 @@ _GENERIC_DISARM_DEADLINE_SECONDS: Final = 0.02
 _LATE_LISTENER_DISARM_DEADLINE_SECONDS: Final = 0.2
 _TIMED_COMMAND_STOP_AFTER_MS: Final = 5_000
 _COMPLETED_COMMAND_ADVANCE_SECONDS: Final = 8.0
+_UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS: Final = 5.0
 
 
 def cover_config(*, travel: float = 0.04) -> BlindConfig:
@@ -1991,6 +1992,55 @@ async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
 
 
 @pytest.mark.asyncio
+async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeover(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cover-owned takeover ignores a command whose RF window has ended."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "untimed-member-up",
+        now=lambda: clock["now"],
+    )
+    entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    entity._position = 50.0
+    try:
+        await entity.async_open_cover()
+        assert entity.is_opening
+        assert entity._motion_command_id == "untimed-member-up"
+        clock["now"] += _UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "DOWN",
+            (1,),
+            at=clock["now"],
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert [item for item in published if item[0].endswith("/cmd")] == []
+        assert entity.is_closing
+        assert entity.current_cover_position is not None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_raw_takeover_invalidates_partially_contained_unpressed_aggregate(
     hass: HomeAssistant,
 ) -> None:
@@ -2108,6 +2158,82 @@ async def test_takeover_timeout_invalidates_listener_attached_after_request(
 
 
 @pytest.mark.asyncio
+async def test_takeover_disarm_ack_invalidates_listener_attached_after_request(
+    hass: HomeAssistant,
+) -> None:
+    """Successful disarm rechecks unpressed listeners added during the drain."""
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "late-ack-group-up",
+    )
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    late_config = member_config(channel=2, travel=5.0)
+    restored_state = State(
+        "cover.late_ack_channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 60,
+            "remote": late_config.remote_key,
+            "channels": list(late_config.channels),
+            "motion_direction": 0,
+        },
+    )
+    late: ZemismartCover | None = None
+    pressed._position = 50.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+        dispatch_heard_press(
+            hub,
+            pressed._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "late-ack-group-up")]
+        task = request.task
+        assert task is not None
+
+        late = await attach_cover(
+            hass,
+            hub,
+            config=late_config,
+            cover_type=restored_cover_type(restored_state),
+            entry_id="entry-2",
+            entity_id="cover.late_ack_channel_2",
+        )
+        assert late.current_cover_position == 60
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "late-ack-group-up"},
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert late.current_cover_position is None
+        assert pressed.is_closing
+        assert pressed.current_cover_position is not None
+    finally:
+        if late is not None:
+            await late.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_displaced_timed_command_fires_takeover_consequence_immediately(
     hass: HomeAssistant,
 ) -> None:
@@ -2151,6 +2277,65 @@ async def test_displaced_timed_command_fires_takeover_consequence_immediately(
         assert entity.current_cover_position is None
         assert not entity.is_closing
         await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_survives_displaced_timed_takeover_consequence(
+    hass: HomeAssistant,
+) -> None:
+    """A flushed STOP cannot invalidate a mirror already halted by heard STOP."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "timed-member-up",
+    )
+    entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    entity._position = 50.0
+    try:
+        await hub.async_transmit(
+            member_config(channel=1, travel=5.0),
+            "UP",
+            stop_after_ms=_TIMED_COMMAND_STOP_AFTER_MS,
+        )
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert entity.is_closing
+        request = hub._disarm_requests[("bridge-a", "timed-member-up")]
+        task = request.task
+        assert task is not None
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "STOP",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        stopped_position = entity.current_cover_position
+        assert stopped_position is not None
+        assert not entity.is_closing
+
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "displaced", "command_id": "timed-member-up"},
+        )
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert entity.current_cover_position == stopped_position
     finally:
         await entity.async_will_remove_from_hass()
         hub.close()
@@ -2880,6 +3065,45 @@ async def test_restore_rejects_recently_displaced_timed_motion(
         assert not entity.is_opening
     finally:
         await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_takeover_timeout_during_restore_wins_over_stopped_position(
+    hass: HomeAssistant,
+) -> None:
+    """A consequence delivered during restore cannot be clobbered by cache."""
+    config = member_config(channel=1)
+    restored_state = State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 60,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 0,
+        },
+    )
+
+    class InvalidatedDuringRestore(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            self._on_takeover_disarm_timeout()
+            return restored_state
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=InvalidatedDuringRestore,
+    )
+    try:
+        assert entity.current_cover_position is None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
 
 
 @pytest.mark.asyncio

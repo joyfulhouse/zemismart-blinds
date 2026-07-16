@@ -134,6 +134,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._degraded = False
         self._intent_generation = 0
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
+        self._stopped_by_heard = False
+        self._restoring = False
+        self._restore_invalidated = False
         # Serializes this entity's own commands: without it, a set_position
         # racing an unstarted open/close computes travel from a stale
         # estimate and physically overshoots.
@@ -212,6 +215,18 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
+        self._restoring = True
+        try:
+            await self._async_restore_state()
+        finally:
+            self._restoring = False
+            if self._restore_invalidated:
+                self._mark_unknown()
+                self.async_write_ha_state()
+                self._restore_invalidated = False
+
+    async def _async_restore_state(self) -> None:
+        """Restore one stopped estimate or complete started motion."""
         state = await self.async_get_last_state()
         if state is None:
             return
@@ -422,6 +437,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if command_id and (
             command_id == self._motion_command_id or self._motion_command_id is None
         ):
+            if self._restoring:
+                self._restore_invalidated = True
+                return
             self._mark_unknown()
             self.async_write_ha_state()
 
@@ -544,6 +562,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     def _clear_motion(self) -> None:
         """Clear completed or interrupted motion metadata."""
+        self._stopped_by_heard = False
         self._direction = 0
         self._motion_started = 0.0
         self._motion_start_position = self._position
@@ -729,6 +748,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         command_id = self._motion_command_id
         if bridge_id is None or command_id is None:
             return
+        if not self._hub.command_takeover_live(command_id):
+            return
         deadline = (
             self._motion_deadline
             if self._motion_timed
@@ -746,6 +767,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Invalidate a takeover if the old fail-safe STOP may have fired."""
         if self._unsubscribe_rx_listener is None:
             return
+        if self._restoring:
+            self._restore_invalidated = True
+            return
         self._mark_unknown_and_notify_members()
 
     @callback
@@ -758,7 +782,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         The whole-command fan-out stays with cover-owned requests
         (_on_disarm_timeout above).
         """
-        if self._unsubscribe_rx_listener is None or self._motion_command_id is not None:
+        if (
+            self._unsubscribe_rx_listener is None
+            or self._motion_command_id is not None
+            or self._stopped_by_heard
+        ):
+            return
+        if self._restoring:
+            self._restore_invalidated = True
             return
         self._mark_unknown()
         self.async_write_ha_state()
@@ -1002,6 +1033,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # callback in the same batch; owner-side invalidation is harmful.
             self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
+        if provenance == "heard":
+            self._stopped_by_heard = True
 
     async def _async_stop(self) -> bool:
         """Stop and freeze tracking only when STOP first dispatches.

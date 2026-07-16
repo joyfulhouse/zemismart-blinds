@@ -326,6 +326,13 @@ class CommandLedger:
             and any(frame.signature[0] == remote_key for frame in entry.frames)
         )
 
+    def command_live_for_takeover(self, command_id: str, now: float) -> bool:
+        """Return whether one command can still affect a physical takeover."""
+        entry = self._entries.get(command_id)
+        if entry is None or entry.phase == "pending":
+            return True
+        return not entry.displaced and any(window.ends_at >= now for window in entry.windows)
+
     def retire(self, command_id: str) -> None:
         """Remove all frame state for one command."""
         self._entries.pop(command_id, None)

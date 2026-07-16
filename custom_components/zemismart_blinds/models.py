@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Final, Literal, cast
 
 from .calibrations import KNOWN_CALIBRATIONS
@@ -571,6 +572,7 @@ class _DisarmRequest:
     deadline: float
     loop_deadline: float
     on_timeouts: list[Callable[[], None]]
+    on_resolves: list[Callable[[], None]]
     task: asyncio.Task[None] | None = None
 
 
@@ -777,6 +779,10 @@ class ZemismartHub:
         seen = self._recent_displaced.get(command_id)
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
+    def command_takeover_live(self, command_id: str) -> bool:
+        """Return whether a cover-owned command can still affect takeover."""
+        return self._ledger.command_live_for_takeover(command_id, self._now())
+
     def _record_emission_proof(self, command_id: str) -> None:
         """Remember proof and notify only command-id-aware cover listeners."""
         if self._closed or len(command_id) > _EMISSION_PROOF_MAX_ID_LENGTH:
@@ -925,11 +931,14 @@ class ZemismartHub:
                 continue
             pressed = event.button in {"UP", "DOWN"} and command.confirmed
             on_timeout = self._ignore_takeover_disarm_timeout
+            on_resolve: Callable[[], None] | None = None
             if pressed:
                 if command.button in {"UP", "DOWN"}:
                     self._invalidate_unpressed_listeners(event, command)
+                    on_resolve = partial(self._invalidate_unpressed_listeners, event, command)
                 on_timeout = self._pressed_disarm_timeout(event, command)
-            existing = self._disarm_requests.get((command.bridge_id, command.command_id))
+            key = (command.bridge_id, command.command_id)
+            existing = self._disarm_requests.get(key)
             if existing is not None and not existing.waiter.done():
                 # Merge the pressed-cover consequence into the live request
                 # instead of discarding it: a cover-owned request only carries
@@ -938,6 +947,8 @@ class ZemismartHub:
                 # deliberately untouched (never widened to the generic bound).
                 if pressed:
                     existing.on_timeouts.append(on_timeout)
+                if on_resolve is not None:
+                    existing.on_resolves.append(on_resolve)
                 continue
             self.request_disarm(
                 command.bridge_id,
@@ -945,6 +956,9 @@ class ZemismartHub:
                 deadline,
                 on_timeout,
             )
+            request = self._disarm_requests.get(key)
+            if request is not None and on_resolve is not None:
+                request.on_resolves.append(on_resolve)
 
     def _pressed_disarm_timeout(
         self,
@@ -1152,6 +1166,8 @@ class ZemismartHub:
         self._resolve_disarmed_pending(bridge_id, command_id)
         self._ledger.release(command_id)
         self._state_sync.resume_holds(command_id)
+        for on_resolve in tuple(request.on_resolves):
+            on_resolve()
         request.waiter.set_result(None)
 
     def _resolve_disarmed_pending(self, bridge_id: str, command_id: str) -> None:
@@ -1193,6 +1209,7 @@ class ZemismartHub:
             deadline=deadline,
             loop_deadline=loop.time() + remaining,
             on_timeouts=[on_timeout],
+            on_resolves=[],
         )
         self._disarm_requests[key] = request
         request.task = asyncio.create_task(
@@ -1228,6 +1245,8 @@ class ZemismartHub:
                     _DISARM_RETRY_MAX_SECONDS,
                 )
             if not self._closed and not request.waiter.done():
+                for on_resolve in tuple(request.on_resolves):
+                    on_resolve()
                 for on_timeout in tuple(request.on_timeouts):
                     on_timeout()
         finally:

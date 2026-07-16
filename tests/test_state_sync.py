@@ -398,6 +398,27 @@ def test_ledger_excludes_completed_confirmed_overlap_during_echo_tail() -> None:
     )
 
 
+def test_ledger_reports_command_liveness_for_cover_owned_takeover() -> None:
+    """Command-scoped takeover stays conservative except after RF completion."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+
+    assert ledger.command_live_for_takeover("missing", _LEDGER_AFTER_WINDOW_TIME)
+    assert ledger.command_live_for_takeover("command-1", _LEDGER_AFTER_WINDOW_TIME)
+
+    ledger.confirm("command-1", _LEDGER_HANDOFF_TIME)
+
+    assert ledger.command_live_for_takeover("command-1", _LEDGER_HANDOFF_TIME)
+    assert not ledger.command_live_for_takeover("command-1", _LEDGER_AFTER_WINDOW_TIME)
+
+
 def test_ledger_enforces_per_bridge_and_global_caps() -> None:
     """Old commands are evicted under both per-bridge and global pressure."""
     signature = _required_signature((1,), "UP")
