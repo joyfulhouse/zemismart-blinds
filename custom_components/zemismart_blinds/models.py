@@ -78,6 +78,7 @@ _EMISSION_PROOF_MEMORY_SECONDS: Final = 60.0
 _EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
 _EMISSION_PROOF_MAX_ENTRIES: Final = 256
 _DISARM_RETRY_SECONDS: Final = 0.25
+_DISARM_RETRY_MAX_SECONDS: Final = 5.0
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _UINT32_MAX: Final = (1 << 32) - 1
 _MAX_STARTED_AGE_MS: Final = 7_200_000
@@ -639,6 +640,9 @@ class _QueuedCommand:
     # publish sequence taken by the caller; the hub refuses to publish (as
     # "superseded") if any overlapping publication happened since.
     overlap_token: int | None = None
+    # Set only after the final under-lock frame is registered immediately
+    # before enqueue; execute cleanup uses it to confirm or retire the entry.
+    ledger_registered: bool = False
 
     @property
     def coalesce_key(self) -> tuple[str, Button, str] | None:
@@ -858,15 +862,23 @@ class ZemismartHub:
 
     def _dispatch_heard(self, event: HeardEvent) -> None:
         """Invoke a snapshot of matching listeners intersecting the press."""
-        self._supersede_channels(event.remote_key, event.chans)
-        callbacks = tuple(
-            listener.callback
+        listeners = tuple(
+            listener
             for listener in self._rx_listeners
             if listener.remote_key == event.remote_key
             and not listener.channels.isdisjoint(event.chans)
         )
-        for listener_callback in callbacks:
-            listener_callback(event)
+        if not listeners:
+            return
+        configured_channels = frozenset(
+            channel for listener in listeners for channel in listener.channels
+        )
+        self._supersede_channels(
+            event.remote_key,
+            event.chans & configured_channels,
+        )
+        for listener in listeners:
+            listener.callback(event)
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -935,6 +947,8 @@ class ZemismartHub:
                 displaced_pending.admission.set_exception(CommandDisplacedError(command_id))
             elif not displaced_pending.started.done():
                 displaced_pending.started.set_exception(CommandDisplacedError(command_id))
+        self._ledger.displace(command_id, self._now())
+        self._state_sync.resume_holds(command_id)
         self._remember_displaced(command_id)
         _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
         for listener in self.displaced_listeners:
@@ -1003,13 +1017,18 @@ class ZemismartHub:
         """Schedule or join one deadline-bounded bridge disarm request."""
         if self._closed:
             return
+        loop = asyncio.get_running_loop()
         key = (bridge_id, command_id)
         existing = self._disarm_requests.get(key)
         if existing is not None:
+            existing.deadline = max(existing.deadline, deadline)
+            existing.loop_deadline = max(
+                existing.loop_deadline,
+                loop.time() + max(0.0, deadline - self._now()),
+            )
             if on_timeout not in existing.on_timeouts:
                 existing.on_timeouts.append(on_timeout)
             return
-        loop = asyncio.get_running_loop()
         remaining = max(0.0, deadline - self._now())
         request = _DisarmRequest(
             waiter=loop.create_future(),
@@ -1019,25 +1038,37 @@ class ZemismartHub:
         )
         self._disarm_requests[key] = request
         request.task = asyncio.create_task(
-            self._disarm(bridge_id, command_id, deadline),
+            self._disarm(bridge_id, command_id, request),
             name=f"Zemismart disarm {bridge_id}/{command_id}",
         )
 
-    async def _disarm(self, bridge_id: str, command_id: str, deadline: float) -> None:
+    async def _disarm(
+        self,
+        bridge_id: str,
+        command_id: str,
+        request: _DisarmRequest,
+    ) -> None:
         """Retry one deduped control publish until ack or the old STOP deadline."""
         key = (bridge_id, command_id)
-        request = self._disarm_requests.get(key)
-        if request is None or request.deadline != deadline:
+        if self._disarm_requests.get(key) is not request:
             return
+        last_publish: asyncio.Task[None] | None = None
+        retry_seconds = _DISARM_RETRY_SECONDS
         try:
             while (
                 not self._closed
                 and not request.waiter.done()
                 and request.waiter.get_loop().time() < request.loop_deadline
             ):
-                if not await self._publish_disarm(bridge_id, command_id):
-                    return
-                await self._wait_for_disarm_retry(request)
+                if last_publish is None or last_publish.done():
+                    last_publish = await self._publish_disarm(bridge_id, command_id)
+                    if last_publish is None:
+                        return
+                await self._wait_for_disarm_retry(request, retry_seconds)
+                retry_seconds = min(
+                    retry_seconds * 2,
+                    _DISARM_RETRY_MAX_SECONDS,
+                )
             if not self._closed and not request.waiter.done():
                 for on_timeout in tuple(request.on_timeouts):
                     on_timeout()
@@ -1047,7 +1078,11 @@ class ZemismartHub:
             if not request.waiter.done():
                 request.waiter.cancel()
 
-    async def _wait_for_disarm_retry(self, request: _DisarmRequest) -> None:
+    async def _wait_for_disarm_retry(
+        self,
+        request: _DisarmRequest,
+        retry_seconds: float,
+    ) -> None:
         """Wait for the ack, one retry interval, or the absolute deadline."""
         remaining = request.loop_deadline - request.waiter.get_loop().time()
         if remaining <= 0 or request.waiter.done():
@@ -1055,10 +1090,14 @@ class ZemismartHub:
         with suppress(TimeoutError):
             await asyncio.wait_for(
                 asyncio.shield(request.waiter),
-                timeout=min(_DISARM_RETRY_SECONDS, remaining),
+                timeout=min(retry_seconds, remaining),
             )
 
-    async def _publish_disarm(self, bridge_id: str, command_id: str) -> bool:
+    async def _publish_disarm(
+        self,
+        bridge_id: str,
+        command_id: str,
+    ) -> asyncio.Task[None] | None:
         """Enqueue one QoS-1 control message through the shared publish path."""
         topic = f"{MQTT_ROOT}/{bridge_id}/cmd"
         payload = json.dumps(
@@ -1067,11 +1106,11 @@ class ZemismartHub:
         )
         async with self._publish_lock:
             if self._closed:
-                return False
-            transport_error = await self._enqueue_publish(topic, payload)
+                return None
+            publish_task, transport_error = await self._enqueue_publish(topic, payload)
         if transport_error is not None:
             _LOGGER.warning("MQTT disarm publish failed: %s", transport_error)
-        return True
+        return publish_task
 
     def _ensure_worker(self) -> None:
         """Start the one queue worker lazily on the current event loop."""
@@ -1086,6 +1125,14 @@ class ZemismartHub:
         if remote is None:
             return 0
         return sum(self._publish_seq.get((remote.key, channel), 0) for channel in channels)
+
+    def _raise_if_overlap_displaced(self, command: _QueuedCommand) -> None:
+        """Reject a multi-frame movement whose channel generation is stale."""
+        if command.overlap_token is not None and command.overlap_token != self._overlap_seq(
+            command.remote,
+            command.channels,
+        ):
+            raise CommandDisplacedError(command.target)
 
     def overlap_token(self, config: BlindConfig) -> int:
         """Snapshot the publish state of a config's channels.
@@ -1506,6 +1553,26 @@ class ZemismartHub:
             )
         return action_signature[2], frames
 
+    def _register_command_ledger(
+        self,
+        command: _QueuedCommand,
+        bridge_id: str,
+        command_id: str,
+    ) -> None:
+        """Register the final under-lock RF envelope immediately before enqueue."""
+        registration = self._ledger_registration(command)
+        if registration is None:
+            return
+        button, frames = registration
+        self._ledger.register_pending(
+            command_id,
+            bridge_id,
+            tuple(sorted(command.channels)),
+            button,
+            frames,
+        )
+        command.ledger_registered = True
+
     async def _await_status(
         self,
         future: asyncio.Future[_BridgeStatus],
@@ -1581,6 +1648,7 @@ class ZemismartHub:
         self,
         command: _QueuedCommand,
         topic: str,
+        bridge_id: str,
         command_id: str,
     ) -> None:
         """Enqueue one tx message in request order without blocking on its ack.
@@ -1600,10 +1668,12 @@ class ZemismartHub:
             # A contributor can cancel while this command waits for the publish
             # lock. Rebuild again at the final no-await point before enqueue.
             self._rebuild_from_live_contributors(command)
+            self._raise_if_overlap_displaced(command)
             body = dict(command.body)
             body["command_id"] = command_id
             payload = json.dumps(body, separators=(",", ":"))
-            transport_error = await self._enqueue_publish(topic, payload)
+            self._register_command_ledger(command, bridge_id, command_id)
+            _, transport_error = await self._enqueue_publish(topic, payload)
         if transport_error is not None:
             # An immediate transport failure (e.g. broker down) surfaces
             # fast instead of waiting out the admission timeout. The order
@@ -1613,7 +1683,11 @@ class ZemismartHub:
         if command.published is not None:
             command.published.set()
 
-    async def _enqueue_publish(self, topic: str, payload: str) -> BaseException | None:
+    async def _enqueue_publish(
+        self,
+        topic: str,
+        payload: str,
+    ) -> tuple[asyncio.Task[None], BaseException | None]:
         """Start and track one broker enqueue without awaiting its QoS-1 ack."""
         task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
         # Track the task BEFORE the yield so a cancellation during it
@@ -1635,7 +1709,7 @@ class ZemismartHub:
             task.add_done_callback(self._on_publish_done)
         else:
             self._publish_tasks.discard(task)
-        return transport_error
+        return task, transport_error
 
     def _on_publish_done(self, task: asyncio.Task[None]) -> None:
         """Retire a background publish, surfacing a transport error to the log."""
@@ -1655,14 +1729,11 @@ class ZemismartHub:
         # (that test holds the publish lock and waits for this call), so removing
         # it deadlocks the coalesced-cancel path's coverage for no real gain.
         self._rebuild_from_live_contributors(command)
-        if command.overlap_token is not None and command.overlap_token != self._overlap_seq(
-            command.remote, command.channels
-        ):
-            # The caller's multi-frame operation (measure -> move) was based
-            # on channel state that a newer overlapping publication has since
-            # replaced; transmitting the stale movement would overwrite the
-            # newer intent.
-            raise CommandDisplacedError(command.target)
+        # The caller's multi-frame operation (measure -> move) was based on
+        # channel state that a newer overlapping publication may have replaced.
+        # Keep this cheap pre-lock fast-fail; _ordered_publish repeats it at the
+        # authoritative final no-await point before enqueue.
+        self._raise_if_overlap_displaced(command)
         if command.bridge_id is not None:
             bridge = self.registry.online_bridge(command.bridge_id)
         else:
@@ -1670,8 +1741,6 @@ class ZemismartHub:
         command_id = self._new_command_id()
         pending = self._register_pending(bridge, command_id)
         key = (bridge.bridge_id, command_id)
-        ledger_registration = self._ledger_registration(command)
-        ledger_registered = False
         ledger_confirmed = False
         _LOGGER.debug(
             "Publishing command %s (target %s) via bridge %s (area %s)",
@@ -1681,24 +1750,15 @@ class ZemismartHub:
             bridge.area_id,
         )
         try:
-            if ledger_registration is not None:
-                button, frames = ledger_registration
-                self._ledger.register_pending(
-                    command_id,
-                    bridge.bridge_id,
-                    tuple(sorted(command.channels)),
-                    button,
-                    frames,
-                )
-                ledger_registered = True
             await self._ordered_publish(
                 command,
                 f"{MQTT_ROOT}/{bridge.bridge_id}/tx",
+                bridge.bridge_id,
                 command_id,
             )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
-            if ledger_registered:
+            if command.ledger_registered:
                 self._ledger.confirm(command_id, started_at)
                 ledger_confirmed = True
                 self._state_sync.resume_holds(command_id)
@@ -1706,7 +1766,7 @@ class ZemismartHub:
             # Pop on EVERY exit, including an immediate publish transport
             # error, so a failed command never leaks its pending entry.
             self._pending.pop(key, None)
-            if ledger_registered and not ledger_confirmed:
+            if command.ledger_registered and not ledger_confirmed:
                 self._ledger.retire(command_id)
                 self._state_sync.resume_holds(command_id)
         _LOGGER.debug(

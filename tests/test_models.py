@@ -50,6 +50,17 @@ _BRIDGE_STATE_CAP: Final = 256
 _FORGED_BRIDGE_COUNT: Final = 300
 _DISARM_RETRY_TEST_SECONDS: Final = 0.005
 _DISARM_TEST_DEADLINE_SECONDS: Final = 1.0
+_DISARM_SHORT_DEADLINE_SECONDS: Final = 0.05
+_DISARM_LONG_DEADLINE_SECONDS: Final = 0.15
+_DISARM_ACK_DELAY_SECONDS: Final = 0.1
+_DISARM_TIMEOUT_LOWER_BOUND_SECONDS: Final = 0.12
+_DISARM_PENDING_DEADLINE_SECONDS: Final = 0.08
+_DISARM_BACKOFF_SCHEDULE: Final = (0.25, 0.5, 1.0, 2.0, 4.0, 5.0, 5.0)
+_DISPLACED_STOP_AFTER_MS: Final = 120_000
+_DISPLACED_AT: Final = 140.0
+_DISPLACED_FLUSH_AT: Final = 140.1
+_DISPLACED_ORIGINAL_STOP_AT: Final = 220.0
+_DISPLACED_ORIGINAL_STOP_T: Final = 81_900
 _SEEDED_BRIDGE_T: Final = 10_000
 _STARTED_STATUS_T: Final = 10_250
 _STARTED_STATUS_AGE_MS: Final = 250
@@ -593,6 +604,44 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     assert disjoint_events == []
 
 
+def test_dispatch_heard_supersedes_only_matched_configured_channels() -> None:
+    """Unmatched identities and unconfigured channels cannot grow generations."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    foreign_key = f"{OTHER_PREFIX:06x}:{OTHER_REMOTE_ID:02x}"
+    hub._dispatch_heard(
+        HeardEvent(
+            button="UP",
+            chans=frozenset({1}),
+            remote_key=foreign_key,
+            heard_at=_STATE_SYNC_RECV_TIME,
+            bridge_id="bridge-a",
+        )
+    )
+    assert hub._publish_seq == {}
+
+    events: list[HeardEvent] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(remote_key, frozenset({1, 2}), events.append)
+    event = HeardEvent(
+        button="DOWN",
+        chans=frozenset({1, 2, 9}),
+        remote_key=remote_key,
+        heard_at=_STATE_SYNC_RECV_TIME,
+        bridge_id="bridge-a",
+    )
+    hub._dispatch_heard(event)
+
+    assert events == [event]
+    assert hub._publish_seq == {
+        (remote_key, 1): 1,
+        (remote_key, 2): 1,
+    }
+
+
 def test_handle_rx_maintains_independent_bridge_clocks() -> None:
     """Alternating bridge boots cannot replace one another's correlation."""
 
@@ -960,6 +1009,166 @@ async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
             * 3
         )
         assert timeout_calls == []
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_joined_disarm_extends_deadline_for_a_late_ack() -> None:
+    """A shared waiter accepts an ack after the first requester's deadline."""
+    timeout_calls: list[str] = []
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    now = hub._now()
+
+    def short_timeout() -> None:
+        timeout_calls.append("short")
+
+    def long_timeout() -> None:
+        timeout_calls.append("long")
+
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        now + _DISARM_SHORT_DEADLINE_SECONDS,
+        short_timeout,
+    )
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        now + _DISARM_LONG_DEADLINE_SECONDS,
+        long_timeout,
+    )
+    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    task = request.task
+    assert task is not None
+    try:
+        await asyncio.sleep(_DISARM_ACK_DELAY_SECONDS)
+        hub.on_disarmed("bridge-a", "timed-command")
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert request.waiter.done() and not request.waiter.cancelled()
+        assert timeout_calls == []
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_joined_disarm_fires_all_timeouts_at_widest_deadline() -> None:
+    """Every deduped requester times out at the maximum shared deadline."""
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    timeout_calls: list[tuple[str, float]] = []
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    now = hub._now()
+
+    def record_timeout(name: str) -> None:
+        timeout_calls.append((name, loop.time() - started_at))
+
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        now + _DISARM_SHORT_DEADLINE_SECONDS,
+        lambda: record_timeout("short"),
+    )
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        now + _DISARM_LONG_DEADLINE_SECONDS,
+        lambda: record_timeout("long"),
+    )
+    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    task = request.task
+    assert task is not None
+    try:
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert [name for name, _elapsed in timeout_calls] == ["short", "long"]
+        assert all(
+            elapsed >= _DISARM_TIMEOUT_LOWER_BOUND_SECONDS for _name, elapsed in timeout_calls
+        )
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_disarm_does_not_republish_while_puback_is_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unacknowledged QoS-1 publish serves every retry cycle."""
+    monkeypatch.setattr(
+        models_module,
+        "_DISARM_RETRY_SECONDS",
+        _DISARM_RETRY_TEST_SECONDS,
+    )
+    published: list[str] = []
+    puback = asyncio.Event()
+    timed_out = asyncio.Event()
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(payload)
+        await puback.wait()
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        hub._now() + _DISARM_PENDING_DEADLINE_SECONDS,
+        timed_out.set,
+    )
+    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    task = request.task
+    assert task is not None
+    try:
+        await asyncio.wait_for(timed_out.wait(), timeout=_DISARM_TEST_DEADLINE_SECONDS)
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert len(published) == 1
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_disarm_retry_backoff_doubles_and_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acked retries follow the bounded exponential backoff schedule."""
+    published: list[str] = []
+    retry_schedule: list[float] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(payload)
+
+    async def record_retry(_request: Any, retry_seconds: float) -> None:
+        retry_schedule.append(retry_seconds)
+        if len(retry_schedule) == len(_DISARM_BACKOFF_SCHEDULE):
+            hub.on_disarmed("bridge-a", "timed-command")
+        await asyncio.sleep(0)
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    monkeypatch.setattr(hub, "_wait_for_disarm_retry", record_retry)
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
+        lambda: None,
+    )
+    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    task = request.task
+    assert task is not None
+    try:
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert retry_schedule == list(_DISARM_BACKOFF_SCHEDULE)
+        assert len(published) == len(_DISARM_BACKOFF_SCHEDULE)
     finally:
         hub.close()
 
@@ -1543,6 +1752,66 @@ async def test_displaced_status_resolves_pending_command_as_superseded() -> None
 
     assert await transmit == "superseded"
     assert hub.was_displaced("victim")
+
+
+@pytest.mark.asyncio
+async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
+    """Flushed STOPs are echoes, while a STOP at the freed deadline is physical."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    clock = {"now": _STATE_SYNC_RECV_TIME}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "displaced-confirmed",
+        now=lambda: clock["now"],
+    )
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
+    result = await hub.async_transmit(
+        config,
+        "DOWN",
+        stop_after_ms=_DISPLACED_STOP_AFTER_MS,
+    )
+    assert isinstance(result, CommandAck)
+    body = published[0]
+
+    clock["now"] = _DISPLACED_AT
+    assert hub.handle_status(
+        "bridge-a",
+        {"status": "displaced", "command_id": "displaced-confirmed"},
+    )
+    clock["now"] = _DISPLACED_FLUSH_AT
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": body["stop_raw"],
+            "t": _STATE_SYNC_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+    assert events == []
+
+    clock["now"] = _DISPLACED_ORIGINAL_STOP_AT
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": body["stop_raw"],
+            "t": _DISPLACED_ORIGINAL_STOP_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+    assert [event.button for event in events] == ["STOP"]
+    hub.close()
 
 
 @pytest.mark.asyncio
@@ -2203,6 +2472,7 @@ async def test_heard_press_invalidates_overlap_token_before_publish() -> None:
 
     hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
     config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
     token = hub.overlap_token(config)
     physical_up = encode_b0(
         make_payload(
@@ -2230,6 +2500,59 @@ async def test_heard_press_invalidates_overlap_token_before_publish() -> None:
     )
 
     assert result == "superseded"
+    assert published == []
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_overlap_token_is_rechecked_after_waiting_for_publish_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A physical press during lock contention prevents the stale timed RF."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    rebuilt = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    original_rebuild = hub._rebuild_from_live_contributors
+
+    def record_rebuild(command: Any) -> None:
+        original_rebuild(command)
+        rebuilt.set()
+
+    monkeypatch.setattr(hub, "_rebuild_from_live_contributors", record_rebuild)
+    config = blind_config()
+    token = hub.overlap_token(config)
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
+
+    async with hub._publish_lock:
+        transmit = asyncio.create_task(
+            hub.async_transmit(
+                config,
+                "DOWN",
+                stop_after_ms=_LEDGER_STOP_AFTER_MS,
+                overlap_token=token,
+            )
+        )
+        await rebuilt.wait()
+        hub._dispatch_heard(
+            HeardEvent(
+                button="UP",
+                chans=frozenset(config.channels),
+                remote_key=config.remote.key,
+                heard_at=_STATE_SYNC_RECV_TIME,
+                bridge_id="bridge-b",
+            )
+        )
+
+    assert await transmit == "superseded"
     assert published == []
     hub.close()
 
@@ -2304,6 +2627,83 @@ async def test_cancelled_contributor_is_rechecked_after_publish_lock(
     assert isinstance(await first, CommandAck)
     assert len(published) == 1
     assert published[0]["target"] == "a1b2c3:42:1"
+
+
+@pytest.mark.asyncio
+async def test_ledger_registers_the_final_under_lock_coalesced_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled contributor cannot leave a stale union echo envelope."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    enqueued = asyncio.Event()
+    rebuilt = asyncio.Event()
+    prelock_channels: list[frozenset[int]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        enqueued.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "ledger-final-frame",
+        now=lambda: _STATE_SYNC_RECV_TIME,
+    )
+    original_rebuild = hub._rebuild_from_live_contributors
+
+    def record_rebuild(command: Any) -> None:
+        original_rebuild(command)
+        prelock_channels.append(command.channels)
+        rebuilt.set()
+
+    monkeypatch.setattr(hub, "_rebuild_from_live_contributors", record_rebuild)
+    first_config = config_with_window(replace(blind_config(), channels=(1,)), 10)
+    second_config = config_with_window(replace(blind_config(), channels=(2,)), 10)
+    hub.register_rx_listener(
+        first_config.remote.key,
+        frozenset({1, 2}),
+        events.append,
+    )
+
+    async with hub._publish_lock:
+        first = asyncio.create_task(hub.async_transmit(first_config, "UP"))
+        second = asyncio.create_task(hub.async_transmit(second_config, "UP"))
+        await rebuilt.wait()
+        assert prelock_channels[0] == frozenset({1, 2})
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+    await enqueued.wait()
+    entry = hub._ledger._entries["ledger-final-frame"]
+    assert entry.channels == (1,)
+    assert {frame.signature[1] for frame in entry.frames} == {frozenset({1})}
+    original_union_frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1, 2),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": original_union_frame,
+            "t": _STATE_SYNC_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+    accept_and_start(hub, "bridge-a", published[0])
+
+    assert isinstance(await first, CommandAck)
+    assert [event.chans for event in events] == [frozenset({1, 2})]
+    hub.close()
 
 
 @pytest.mark.asyncio

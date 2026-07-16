@@ -30,6 +30,11 @@ _INTERMEDIATE_PROJECTION_RECV_TIME: Final = 40.0
 _LONG_QUIET_GAP_SECONDS: Final = 30 * 24 * 60 * 60
 _MILLISECONDS_PER_SECOND: Final = 1_000
 _OVERSIZED_RAW_FRAME_LENGTH: Final = 5 * 1_024 * 1_024
+_LEDGER_HANDOFF_TIME: Final = 10.0
+_LEDGER_DISPLACED_TIME: Final = 30.0
+_LEDGER_FLUSH_STOP_TIME: Final = 30.1
+_LEDGER_STOP_OFFSET_MS: Final = 60_000
+_LEDGER_ORIGINAL_STOP_TIME: Final = 70.1
 
 
 def _frame(channels: tuple[int, ...], button: str) -> str:
@@ -183,6 +188,59 @@ def test_ledger_pending_then_confirmed_matches_full_envelope() -> None:
     assert ledger.match(action, 10.25) == ("confirmed", "command-1", _BRIDGE_A)
     assert ledger.match(stop, 12.25) == ("confirmed", "command-1", _BRIDGE_A)
     assert ledger.match(action, 100.0) is None
+
+
+def test_ledger_displace_rewindows_only_confirmed_stop_frames() -> None:
+    """Displacement recognizes flushed STOPs without hiding the old deadline."""
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=500),
+            LedgerFrameSpec(
+                stop,
+                offset_ms=_LEDGER_STOP_OFFSET_MS,
+                airtime_ms=500,
+            ),
+        ],
+    )
+    ledger.confirm("command-1", _LEDGER_HANDOFF_TIME)
+
+    ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
+
+    assert ledger.match(action, _LEDGER_HANDOFF_TIME) == (
+        "confirmed",
+        "command-1",
+        _BRIDGE_A,
+    )
+    assert ledger.match(stop, _LEDGER_FLUSH_STOP_TIME) == (
+        "confirmed",
+        "command-1",
+        _BRIDGE_A,
+    )
+    assert ledger.match(stop, _LEDGER_ORIGINAL_STOP_TIME) is None
+
+
+def test_ledger_displace_retires_a_pending_command() -> None:
+    """A never-started displaced command cannot leave a pending echo hold."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+
+    ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
+
+    assert ledger.match(signature, _LEDGER_DISPLACED_TIME) is None
 
 
 def test_ledger_retire_and_gc_remove_entries() -> None:

@@ -28,6 +28,7 @@ _CLOCK_MAX_PROJECTION_LAG_SECONDS: Final = 30.0
 _LEDGER_WINDOW_SLACK_SECONDS: Final = 0.75
 _LEDGER_ENTRY_TTL_SECONDS: Final = 60.0
 _LEDGER_PENDING_TTL_SECONDS: Final = 30.0
+_DISPLACED_STOP_DRAIN_SECONDS: Final = 30.0
 _LEDGER_PER_BRIDGE_CAP: Final = 64
 _LEDGER_GLOBAL_CAP: Final = 256
 
@@ -283,6 +284,27 @@ class CommandLedger:
     def retire(self, command_id: str) -> None:
         """Remove all frame state for one command."""
         self._entries.pop(command_id, None)
+
+    def displace(self, command_id: str, now: float) -> None:
+        """Retire unstarted RF or re-window a confirmed command's flushed STOPs."""
+        entry = self._entries.get(command_id)
+        if entry is None:
+            return
+        if entry.phase == "pending":
+            self.retire(command_id)
+            return
+        entry.windows = tuple(
+            _LedgerWindow(
+                signature=window.signature,
+                starts_at=now - _LEDGER_WINDOW_SLACK_SECONDS,
+                ends_at=(now + _DISPLACED_STOP_DRAIN_SECONDS + _LEDGER_WINDOW_SLACK_SECONDS),
+            )
+            if window.signature[2] == "STOP"
+            else window
+            for window in entry.windows
+        )
+        latest_end = max((window.ends_at for window in entry.windows), default=now)
+        entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the newest pending or windowed confirmed command match."""
