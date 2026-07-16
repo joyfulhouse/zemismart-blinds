@@ -207,7 +207,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._on_heard_press,
             prepare=self._prepare_heard_press,
             invalidate=self._on_command_invalidated,
-            disarm_timeout=self._on_disarm_timeout,
+            disarm_timeout=self._on_takeover_disarm_timeout,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
@@ -745,6 +745,21 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if self._unsubscribe_rx_listener is None:
             return
         self._mark_unknown_and_notify_members()
+
+    @callback
+    def _on_takeover_disarm_timeout(self) -> None:
+        """Invalidate ONLY this entity when a generic takeover disarm is lost.
+
+        The hub's pressed-listener snapshot already selects exactly the covers
+        the un-disarmed command threatens; fanning out to members here would
+        re-invalidate covers the intersect-both filter deliberately excluded.
+        The whole-command fan-out stays with cover-owned requests
+        (_on_disarm_timeout above).
+        """
+        if self._unsubscribe_rx_listener is None:
+            return
+        self._mark_unknown()
+        self.async_write_ha_state()
 
     def _commit_motion(
         self,

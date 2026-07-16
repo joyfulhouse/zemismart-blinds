@@ -1723,6 +1723,123 @@ async def test_confirmed_stop_takeover_disarm_timeout_marks_mirror_unknown(
 
 
 @pytest.mark.asyncio
+async def test_second_press_merges_timeout_hook_into_live_disarm_request(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later press on a live disarm request keeps its failure consequence.
+
+    The dedup-skip must merge the new pressed-cover hooks into the existing
+    request instead of discarding them: with the disarm lost, BOTH pressed
+    covers must end unknown, not only the first.
+    """
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "group-stop",
+    )
+    group = await attach_cover(hass, hub, config=channel_group_config((1, 2)))
+    member_one = await attach_cover(hass, hub, config=member_config(channel=1))
+    member_two = await attach_cover(hass, hub, config=member_config(channel=2))
+    group._position = 50.0
+    member_one._position = 50.0
+    member_two._position = 50.0
+    try:
+        assert await group._async_stop()
+        assert group._motion_command_id is None
+
+        dispatch_heard_press(hub, group._config, "UP", (1,), at=cover_module.WALL_CLOCK())
+        dispatch_heard_press(hub, group._config, "UP", (2,), at=cover_module.WALL_CLOCK())
+        assert member_one.is_opening
+        assert member_two.is_opening
+        request = hub._disarm_requests[("bridge-a", "group-stop")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        disarms = [item for item in published if item[0].endswith("/cmd")]
+        assert len(disarms) == 1
+        assert member_one.current_cover_position is None
+        assert member_two.current_cover_position is None
+    finally:
+        await member_two.async_will_remove_from_hass()
+        await member_one.async_will_remove_from_hass()
+        await group.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_timeout_hook_does_not_fan_out_to_unthreatened_members(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost generic disarm invalidates only the covers the command threatens.
+
+    The listener hook must be self-only: the group's whole-command fan-out
+    would re-invalidate a member the hub's intersect-both filter deliberately
+    excluded (its channel is untouched by the un-disarmed command).
+    """
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _GENERIC_DISARM_DEADLINE_SECONDS,
+    )
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "channel-one-stop",
+    )
+    member_one = await attach_cover(hass, hub, config=member_config(channel=1))
+    member_two = await attach_cover(hass, hub, config=member_config(channel=2))
+    group = await attach_cover(hass, hub, config=channel_group_config((1, 2)))
+    member_one._position = 50.0
+    member_two._position = 50.0
+    group._position = 50.0
+    try:
+        assert await member_one._async_stop()
+        assert member_one._motion_command_id is None
+
+        dispatch_heard_press(hub, group._config, "UP", (1, 2), at=cover_module.WALL_CLOCK())
+        assert member_two.is_opening
+        request = hub._disarm_requests[("bridge-a", "channel-one-stop")]
+        task = request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+        # The command only ever addressed channel 1: covers on it go unknown,
+        # while member 2's mirrored motion is never threatened and survives.
+        assert member_one.current_cover_position is None
+        assert group.current_cover_position is None
+        assert member_two.is_opening
+    finally:
+        await group.async_will_remove_from_hass()
+        await member_two.async_will_remove_from_hass()
+        await member_one.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_confirmed_stop_takeover_disarm_ack_keeps_mirrored_motion(
     hass: HomeAssistant,
 ) -> None:

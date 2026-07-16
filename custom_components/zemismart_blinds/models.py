@@ -921,12 +921,20 @@ class ZemismartHub:
         ):
             if event.button == "STOP" and command.confirmed:
                 continue
+            pressed = event.button in {"UP", "DOWN"} and command.confirmed
             on_timeout = self._ignore_takeover_disarm_timeout
-            if event.button in {"UP", "DOWN"} and command.confirmed:
+            if pressed:
                 self._invalidate_unpressed_listeners(event, command)
                 on_timeout = self._pressed_disarm_timeout(event, command)
             existing = self._disarm_requests.get((command.bridge_id, command.command_id))
             if existing is not None and not existing.waiter.done():
+                # Merge the pressed-cover consequence into the live request
+                # instead of discarding it: a cover-owned request only carries
+                # the covers still modeling the command at prepare time, and a
+                # later press must not lose its failure hook. The deadline is
+                # deliberately untouched (never widened to the generic bound).
+                if pressed:
+                    existing.on_timeouts.append(on_timeout)
                 continue
             self.request_disarm(
                 command.bridge_id,
