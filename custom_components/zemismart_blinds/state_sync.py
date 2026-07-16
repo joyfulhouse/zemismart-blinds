@@ -302,8 +302,9 @@ class CommandLedger:
         self,
         remote_key: str,
         channels: frozenset[int],
+        now: float,
     ) -> tuple[LiveCommand, ...]:
-        """Return identities and phases for live overlapping transmissions."""
+        """Return pending or still-airing confirmed overlapping transmissions."""
         return tuple(
             LiveCommand(
                 bridge_id=entry.bridge_id,
@@ -313,7 +314,14 @@ class CommandLedger:
                 confirmed=entry.phase == "confirmed",
             )
             for entry in self._entries.values()
-            if (entry.phase == "pending" or (entry.phase == "confirmed" and not entry.displaced))
+            if (
+                entry.phase == "pending"
+                or (
+                    entry.phase == "confirmed"
+                    and not entry.displaced
+                    and any(window.ends_at >= now for window in entry.windows)
+                )
+            )
             and not channels.isdisjoint(entry.channels)
             and any(frame.signature[0] == remote_key for frame in entry.frames)
         )
@@ -328,14 +336,15 @@ class CommandLedger:
         if entry is not None and not entry.displaced:
             self.retire(command_id)
 
-    def displace(self, command_id: str, now: float) -> None:
-        """Retire unstarted RF or re-window a confirmed command's flushed STOPs."""
+    def displace(self, command_id: str, now: float) -> bool:
+        """Retire or re-window RF, reporting whether confirmed STOPs flushed."""
         entry = self._entries.get(command_id)
         if entry is None:
-            return
+            return False
         if entry.phase == "pending":
             self.retire(command_id)
-            return
+            return False
+        flushed = any(window.signature[2] == "STOP" for window in entry.windows)
         entry.windows = tuple(
             _LedgerWindow(
                 signature=window.signature,
@@ -349,6 +358,7 @@ class CommandLedger:
         latest_end = max((window.ends_at for window in entry.windows), default=now)
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
         entry.displaced = True
+        return flushed
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the newest pending or windowed confirmed command match."""

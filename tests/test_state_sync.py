@@ -31,6 +31,7 @@ _LONG_QUIET_GAP_SECONDS: Final = 30 * 24 * 60 * 60
 _MILLISECONDS_PER_SECOND: Final = 1_000
 _OVERSIZED_RAW_FRAME_LENGTH: Final = 5 * 1_024 * 1_024
 _LEDGER_HANDOFF_TIME: Final = 10.0
+_LEDGER_AFTER_WINDOW_TIME: Final = 12.0
 _LEDGER_DISPLACED_TIME: Final = 30.0
 _LEDGER_FLUSH_STOP_TIME: Final = 30.1
 _LEDGER_STOP_OFFSET_MS: Final = 60_000
@@ -215,7 +216,7 @@ def test_ledger_displace_rewindows_only_confirmed_stop_frames() -> None:
     )
     ledger.confirm("command-1", _LEDGER_HANDOFF_TIME)
 
-    ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
+    assert ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
 
     assert ledger.match(action, _LEDGER_HANDOFF_TIME) == (
         "confirmed",
@@ -273,9 +274,10 @@ def test_ledger_displace_retires_a_pending_command() -> None:
         [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
     )
 
-    ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
+    assert not ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
 
     assert ledger.match(signature, _LEDGER_DISPLACED_TIME) is None
+    assert not ledger.displace("missing", _LEDGER_DISPLACED_TIME)
 
 
 def test_ledger_retire_and_gc_remove_entries() -> None:
@@ -337,9 +339,13 @@ def test_ledger_finds_only_live_overlapping_commands() -> None:
         [LedgerFrameSpec(first, offset_ms=0, airtime_ms=500)],
     )
     ledger.confirm("displaced", _LEDGER_HANDOFF_TIME)
-    ledger.displace("displaced", _LEDGER_DISPLACED_TIME)
+    assert not ledger.displace("displaced", _LEDGER_DISPLACED_TIME)
 
-    assert ledger.live_overlapping(_REMOTE_KEY, frozenset({1})) == (
+    assert ledger.live_overlapping(
+        _REMOTE_KEY,
+        frozenset({1}),
+        _LEDGER_HANDOFF_TIME,
+    ) == (
         state_sync_module.LiveCommand(
             bridge_id=_BRIDGE_A,
             command_id="matching",
@@ -354,6 +360,41 @@ def test_ledger_finds_only_live_overlapping_commands() -> None:
             button="DOWN",
             confirmed=True,
         ),
+    )
+
+
+def test_ledger_excludes_completed_confirmed_overlap_during_echo_tail() -> None:
+    """A confirmed command stops being takeover-live when every window ends."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.confirm("command-1", _LEDGER_HANDOFF_TIME)
+    live_command = state_sync_module.LiveCommand(
+        bridge_id=_BRIDGE_A,
+        command_id="command-1",
+        channels=frozenset({1}),
+        button="UP",
+        confirmed=True,
+    )
+
+    assert ledger.live_overlapping(
+        _REMOTE_KEY,
+        frozenset({1}),
+        _LEDGER_HANDOFF_TIME,
+    ) == (live_command,)
+    assert (
+        ledger.live_overlapping(
+            _REMOTE_KEY,
+            frozenset({1}),
+            _LEDGER_AFTER_WINDOW_TIME,
+        )
+        == ()
     )
 
 

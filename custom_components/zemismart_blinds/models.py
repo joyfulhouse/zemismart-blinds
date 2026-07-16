@@ -914,10 +914,12 @@ class ZemismartHub:
 
     def _request_takeover_disarms(self, event: HeardEvent) -> None:
         """Best-effort abort live overlapping RF work on physical takeover."""
-        deadline = self._now() + _PRESTART_DISARM_DEADLINE_SECONDS
+        now = self._now()
+        deadline = now + _PRESTART_DISARM_DEADLINE_SECONDS
         for command in self._ledger.live_overlapping(
             event.remote_key,
             event.chans,
+            now,
         ):
             if event.button == "STOP" and command.confirmed:
                 continue
@@ -949,27 +951,27 @@ class ZemismartHub:
         event: HeardEvent,
         command: LiveCommand,
     ) -> Callable[[], None]:
-        """Snapshot threatened cover hooks for one generic confirmed disarm.
+        """Build a lazy cover consequence for one generic confirmed disarm.
 
         A movement command threatens every cover on its channels, including
         covers outside the press: its motors latched travel and losing the
         disarm can preserve the old fail-safe STOP. A STOP command cannot move
         an unpressed motor, so only listeners also intersecting the physical
-        press are threatened by its remaining frames.
+        press are threatened by its remaining frames. Resolve the listener set
+        only when the consequence fires so late attachments are included and
+        removed listeners disappear naturally.
         """
-        movement_command = command.button in {"UP", "DOWN"}
-        timeout_hooks = tuple(
-            hook
-            for listener in self._rx_listeners
-            if listener.remote_key == event.remote_key
-            and not listener.channels.isdisjoint(command.channels)
-            and (movement_command or not listener.channels.isdisjoint(event.chans))
-            if (hook := listener.disarm_timeout) is not None
-        )
 
         def on_timeout() -> None:
-            for hook in timeout_hooks:
-                hook()
+            movement_command = command.button in {"UP", "DOWN"}
+            for listener in tuple(self._rx_listeners):
+                if (
+                    listener.remote_key == event.remote_key
+                    and not listener.channels.isdisjoint(command.channels)
+                    and (movement_command or not listener.channels.isdisjoint(event.chans))
+                    and (hook := listener.disarm_timeout) is not None
+                ):
+                    hook()
 
         return on_timeout
 
@@ -978,14 +980,15 @@ class ZemismartHub:
         event: HeardEvent,
         command: LiveCommand,
     ) -> None:
-        """Invalidate covers wholly outside a press that aborts their command."""
+        """Invalidate unpressed covers intersecting an aborted command."""
         unpressed = command.channels - event.chans
         if not unpressed:
             return
         for listener in tuple(self._rx_listeners):
             if (
                 listener.remote_key == event.remote_key
-                and listener.channels <= unpressed
+                and listener.channels.isdisjoint(event.chans)
+                and not listener.channels.isdisjoint(unpressed)
                 and listener.invalidate is not None
             ):
                 listener.invalidate(command.command_id)
@@ -1071,10 +1074,13 @@ class ZemismartHub:
                 # resolved future first so displace() re-windows the flushed
                 # STOPs instead of retiring the still-pending entry.
                 self._ledger.confirm(command_id, displaced_pending.started.result())
-        self._ledger.displace(command_id, self._now())
+        flushed = self._ledger.displace(command_id, self._now())
         self._state_sync.resume_holds(command_id)
         disarm_request = self._disarm_requests.get((bridge_id, command_id))
         if disarm_request is not None and not disarm_request.waiter.done():
+            if flushed:
+                for on_timeout in tuple(disarm_request.on_timeouts):
+                    on_timeout()
             disarm_request.waiter.set_result(None)
         self._remember_displaced(command_id)
         _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)

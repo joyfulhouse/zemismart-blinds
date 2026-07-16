@@ -33,6 +33,9 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import EntityPlatform
 
 _GENERIC_DISARM_DEADLINE_SECONDS: Final = 0.02
+_LATE_LISTENER_DISARM_DEADLINE_SECONDS: Final = 0.2
+_TIMED_COMMAND_STOP_AFTER_MS: Final = 5_000
+_COMPLETED_COMMAND_ADVANCE_SECONDS: Final = 8.0
 
 
 def cover_config(*, travel: float = 0.04) -> BlindConfig:
@@ -1930,6 +1933,230 @@ async def test_lost_disarm_invalidates_unmodeled_covers_outside_the_press(
 
 
 @pytest.mark.asyncio
+async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
+    hass: HomeAssistant,
+) -> None:
+    """A command retained only for echoes cannot threaten idle members."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    clock = {"now": cover_module.WALL_CLOCK()}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "completed-timed-group",
+        now=lambda: clock["now"],
+    )
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    unpressed = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-2",
+        entity_id="cover.completed_channel_2",
+    )
+    pressed._position = 50.0
+    unpressed._position = 60.0
+    try:
+        await hub.async_transmit(
+            channel_group_config((1, 2)),
+            "UP",
+            stop_after_ms=_TIMED_COMMAND_STOP_AFTER_MS,
+        )
+        clock["now"] += _COMPLETED_COMMAND_ADVANCE_SECONDS
+
+        dispatch_heard_press(
+            hub,
+            pressed._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert pressed.is_closing
+        assert unpressed.current_cover_position == 60
+        assert [item for item in published if item[0].endswith("/cmd")] == []
+    finally:
+        await unpressed.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_takeover_invalidates_partially_contained_unpressed_aggregate(
+    hass: HomeAssistant,
+) -> None:
+    """A successful takeover invalidates every unpressed command overlap."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "aggregate-group-up",
+    )
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    aggregate = await attach_cover(
+        hass,
+        hub,
+        config=channel_group_config((2, 3)),
+        entry_id="entry-2",
+        entity_id="cover.channels_2_3",
+    )
+    outside = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=4, travel=5.0),
+        entry_id="entry-3",
+        entity_id="cover.channel_4",
+    )
+    pressed._position = 50.0
+    aggregate._position = 60.0
+    outside._position = 70.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+
+        dispatch_heard_press(
+            hub,
+            pressed._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+
+        assert pressed.is_closing
+        assert aggregate.current_cover_position is None
+        assert outside.current_cover_position == 70
+    finally:
+        await outside.async_will_remove_from_hass()
+        await aggregate.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_takeover_timeout_invalidates_listener_attached_after_request(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disarm consequence discovers threatened listeners at fire time."""
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _LATE_LISTENER_DISARM_DEADLINE_SECONDS,
+    )
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "late-listener-group-up",
+    )
+    pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    late: ZemismartCover | None = None
+    pressed._position = 50.0
+    try:
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await hub.async_send_raw("bridge-a", raw_frame, 2)
+        dispatch_heard_press(
+            hub,
+            pressed._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        request = hub._disarm_requests[("bridge-a", "late-listener-group-up")]
+        task = request.task
+        assert task is not None
+
+        late = await attach_cover(
+            hass,
+            hub,
+            config=member_config(channel=2, travel=5.0),
+            entry_id="entry-2",
+            entity_id="cover.late_channel_2",
+        )
+        late._position = 60.0
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert late.current_cover_position is None
+    finally:
+        if late is not None:
+            await late.async_will_remove_from_hass()
+        await pressed.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_displaced_timed_command_fires_takeover_consequence_immediately(
+    hass: HomeAssistant,
+) -> None:
+    """Flushed fail-safe STOPs immediately invalidate the pressed mirror."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "timed-group-up",
+    )
+    entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
+    entity._position = 50.0
+    try:
+        await hub.async_transmit(
+            channel_group_config((1, 2)),
+            "UP",
+            stop_after_ms=_TIMED_COMMAND_STOP_AFTER_MS,
+        )
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "DOWN",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert entity.is_closing
+        request = hub._disarm_requests[("bridge-a", "timed-group-up")]
+        task = request.task
+        assert task is not None
+
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "displaced", "command_id": "timed-group-up"},
+        )
+
+        assert entity.current_cover_position is None
+        assert not entity.is_closing
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_displaced_raw_command_settles_takeover_disarm_timeout(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -2027,6 +2254,7 @@ async def test_takeover_timeout_preserves_newer_commanded_model(
         command = hub._ledger.live_overlapping(
             mirroring._config.remote_key,
             frozenset({1}),
+            hub._now(),
         )[0]
         on_timeout = hub._pressed_disarm_timeout(
             HeardEvent(
