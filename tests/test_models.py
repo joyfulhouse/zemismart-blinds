@@ -201,6 +201,67 @@ def test_blind_config_accepts_zero_coalescing_window_and_rejects_negative() -> N
         config_with_window(blind_config(), -1)
 
 
+def test_info_only_bridge_keeps_state_sync_metadata() -> None:
+    """Contract metadata alone is meaningful retained bridge state."""
+    registry = BridgeRegistry()
+
+    registry.update_info("bridge-a", {"boot": 3, "listen": False, "v": 2})
+
+    (bridge,) = registry.bridges
+    assert bridge.boot == 3
+    assert bridge.listen is False
+    assert bridge.contract_v == 2
+
+
+def test_availability_flip_preserves_state_sync_metadata() -> None:
+    """Availability updates do not discard retained contract metadata."""
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 3, "listen": False, "v": 2})
+
+    registry.update_availability("bridge-a", "online")
+    registry.update_availability("bridge-a", "offline")
+
+    (bridge,) = registry.bridges
+    assert not bridge.online
+    assert bridge.boot == 3
+    assert bridge.listen is False
+    assert bridge.contract_v == 2
+
+
+@pytest.mark.parametrize(("boot", "contract_v"), [("3", "2"), (True, False)])
+def test_bridge_info_rejects_non_integer_contract_metadata(
+    boot: object,
+    contract_v: object,
+) -> None:
+    """Strings and booleans are not strict integer contract metadata."""
+    registry = BridgeRegistry()
+
+    registry.update_info(
+        "bridge-a",
+        {"area": "living_room", "boot": boot, "listen": "false", "v": contract_v},
+    )
+
+    (bridge,) = registry.bridges
+    assert bridge.boot is None
+    assert bridge.listen is None
+    assert bridge.contract_v is None
+
+
+def test_info_tombstone_clears_state_sync_metadata() -> None:
+    """A complete retained-info withdrawal clears every metadata field."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    registry.update_info("bridge-a", {"boot": 3, "listen": True, "v": 2})
+
+    registry.update_info("bridge-a", {})
+
+    (bridge,) = registry.bridges
+    assert bridge.online
+    assert bridge.boot is None
+    assert bridge.listen is None
+    assert bridge.contract_v is None
+
+
 def test_bridge_selection_prefers_online_same_area() -> None:
     """An online in-area beacon wins even when another beacon is the default."""
     registry = BridgeRegistry()

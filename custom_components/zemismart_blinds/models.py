@@ -376,6 +376,9 @@ class BridgeInfo:
     # Whether an availability payload has ever been applied: online=False
     # without it only means "not discovered yet", not "reported offline".
     availability_seen: bool = False
+    boot: int | None = None
+    listen: bool | None = None
+    contract_v: int | None = None
 
 
 class BridgeRegistry:
@@ -409,6 +412,9 @@ class BridgeRegistry:
             and not bridge.online
             and not bridge.is_default
             and not bridge.availability_seen
+            and bridge.boot is None
+            and bridge.listen is None
+            and bridge.contract_v is None
         ):
             self._bridges.pop(bridge.bridge_id, None)
             return
@@ -428,11 +434,9 @@ class BridgeRegistry:
         if online != current.online:
             _LOGGER.debug("Bridge %s is now %s", bridge_id, "online" if online else "offline")
         self._store(
-            BridgeInfo(
-                bridge_id=bridge_id,
-                area_id=current.area_id,
+            replace(
+                current,
                 online=online,
-                is_default=current.is_default,
                 availability_seen=availability_seen,
             )
         )
@@ -456,13 +460,24 @@ class BridgeRegistry:
             if isinstance(raw_default, str)
             else bool(raw_default)
         )
+        raw_boot = payload.get("boot")
+        boot = raw_boot if isinstance(raw_boot, int) and not isinstance(raw_boot, bool) else None
+        raw_listen = payload.get("listen")
+        listen = raw_listen if isinstance(raw_listen, bool) else None
+        raw_contract_v = payload.get("v")
+        contract_v = (
+            raw_contract_v
+            if isinstance(raw_contract_v, int) and not isinstance(raw_contract_v, bool)
+            else None
+        )
         self._store(
-            BridgeInfo(
-                bridge_id=bridge_id,
+            replace(
+                current,
                 area_id=area_id,
-                online=current.online,
                 is_default=is_default,
-                availability_seen=current.availability_seen,
+                boot=boot,
+                listen=listen,
+                contract_v=contract_v,
             )
         )
 
