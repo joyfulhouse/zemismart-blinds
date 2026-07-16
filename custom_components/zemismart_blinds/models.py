@@ -40,6 +40,7 @@ from .const import (
     DEFAULT_COALESCE_WINDOW_MS,
     MQTT_ROOT,
 )
+from .state_sync import BridgeClock, CommandLedger, HeardEvent, StateSyncConsumer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +66,17 @@ _DISPLACED_MAX_ENTRIES: Final = 256
 _BRIDGE_AFFINITY_SECONDS: Final = 120.0
 _BRIDGE_MAX_ID_LENGTH: Final = 64
 _BRIDGE_MAX_ENTRIES: Final = 256
+_EMISSION_PROOF_MEMORY_SECONDS: Final = 60.0
+_EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
+_EMISSION_PROOF_MAX_ENTRIES: Final = 256
+_UINT32_MAX: Final = (1 << 32) - 1
+
+
+def _strict_uint32(value: object) -> int | None:
+    """Return a real uint32 integer, rejecting booleans and coercions."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _UINT32_MAX:
+        return None
+    return value
 
 
 class NoOnlineBridgeError(RuntimeError):
@@ -532,6 +544,15 @@ class _PendingStatuses:
     started: asyncio.Future[float]
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _RxListener:
+    """Bind one cover callback to its configured remote metadata."""
+
+    remote_key: str
+    channels: frozenset[int]
+    callback: Callable[[HeardEvent], None]
+
+
 @dataclass(slots=True)
 class _Contributor:
     """One caller's share of a coalesced movement batch."""
@@ -644,6 +665,18 @@ class ZemismartHub:
         self._started_timeout = started_timeout
         self._command_id_factory = command_id_factory or (lambda: uuid.uuid4().hex)
         self._now = now
+        self._clock = BridgeClock()
+        self._ledger = CommandLedger()
+        self._rx_listeners: list[_RxListener] = []
+        self._rx_bridge_ids: dict[str, bool] = {}
+        self._recent_emission_proofs: dict[str, float] = {}
+        self._state_sync = StateSyncConsumer(
+            ledger=self._ledger,
+            clock=self._clock,
+            dispatch=self._dispatch_heard,
+            on_emission_proof=self._record_emission_proof,
+            now=self._now,
+        )
         self._pending: dict[tuple[str, str], _PendingStatuses] = {}
         self._queue: deque[_QueuedCommand] = deque()
         self._queue_ready = asyncio.Condition()
@@ -701,6 +734,95 @@ class ZemismartHub:
         seen = self._recent_displaced.get(command_id)
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
+    def _record_emission_proof(self, command_id: str) -> None:
+        """Remember bounded command-scoped proof for the Phase-3 anchor hook."""
+        if len(command_id) > _EMISSION_PROOF_MAX_ID_LENGTH:
+            return
+        now = self._now()
+        self._recent_emission_proofs.pop(command_id, None)
+        self._recent_emission_proofs[command_id] = now
+        expired = [
+            key
+            for key, seen in self._recent_emission_proofs.items()
+            if now - seen > _EMISSION_PROOF_MEMORY_SECONDS
+        ]
+        for key in expired:
+            del self._recent_emission_proofs[key]
+        while len(self._recent_emission_proofs) > _EMISSION_PROOF_MAX_ENTRIES:
+            del self._recent_emission_proofs[next(iter(self._recent_emission_proofs))]
+
+    def register_rx_listener(
+        self,
+        remote_key: str,
+        channels: frozenset[int],
+        callback: Callable[[HeardEvent], None],
+    ) -> Callable[[], None]:
+        """Register one metadata-bearing RX callback and return its remover."""
+        listener = _RxListener(remote_key, channels, callback)
+
+        def unsubscribe() -> None:
+            with suppress(ValueError):
+                self._rx_listeners.remove(listener)
+
+        if not self._closed:
+            self._rx_listeners.append(listener)
+        return unsubscribe
+
+    def handle_rx(
+        self,
+        bridge_id: str,
+        payload: Mapping[str, object],
+        recv_time: float,
+    ) -> None:
+        """Validate and classify one bridge RX contract payload."""
+        frame_hex = payload.get("frame")
+        t = _strict_uint32(payload.get("t"))
+        boot = _strict_uint32(payload.get("boot"))
+        if not isinstance(frame_hex, str) or t is None or boot is None:
+            return
+        normalized_bridge_id = self._admit_rx_bridge(bridge_id)
+        if normalized_bridge_id is None:
+            return
+        self._state_sync.handle_rx(
+            normalized_bridge_id,
+            boot,
+            t,
+            frame_hex,
+            recv_time,
+        )
+
+    def _admit_rx_bridge(self, bridge_id: str) -> str | None:
+        """Bound bridge identities that may allocate state in the RX consumer."""
+        normalized = bridge_id.strip()
+        if not normalized or len(normalized) > _BRIDGE_MAX_ID_LENGTH:
+            return None
+        known = any(bridge.bridge_id == normalized for bridge in self.registry.bridges)
+        if normalized in self._rx_bridge_ids:
+            self._rx_bridge_ids[normalized] = known
+            return normalized
+        if len(self._rx_bridge_ids) >= _BRIDGE_MAX_ENTRIES:
+            if not known:
+                return None
+            forged = next(
+                (key for key, is_known in self._rx_bridge_ids.items() if not is_known),
+                None,
+            )
+            if forged is None:
+                return None
+            del self._rx_bridge_ids[forged]
+        self._rx_bridge_ids[normalized] = known
+        return normalized
+
+    def _dispatch_heard(self, event: HeardEvent) -> None:
+        """Invoke listeners fully contained by one decoded remote press."""
+        callbacks = tuple(
+            listener.callback
+            for listener in self._rx_listeners
+            if listener.remote_key == event.remote_key and listener.channels <= event.chans
+        )
+        for listener_callback in callbacks:
+            listener_callback(event)
+
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
         command_id = self._command_id_factory().strip()
@@ -729,50 +851,21 @@ class ZemismartHub:
         raw_status = decoded.get("status")
         command_id = decoded.get("command_id")
         if (
-            raw_status not in {"accepted", "rejected", "started", "displaced"}
+            raw_status not in {"accepted", "rejected", "started", "displaced", "disarmed"}
             or not isinstance(command_id, str)
             or not command_id
         ):
             return False
-        if raw_status == "displaced":
-            # Latest-command-wins on the bridge retired this command's RF
-            # state (any pending fail-safe STOP is flushed on air within the
-            # next pacing gaps). Resolve a still-waiting caller as superseded
-            # instead of letting it run out its started timeout, remember the
-            # id briefly for covers that have not yet recorded their motion,
-            # and let already-tracking covers react.
-            displaced_pending = self._pending.get((bridge_id, command_id))
-            if displaced_pending is not None:
-                # Resolve exactly the future the caller is awaiting (admission
-                # first, then started) so no exception goes unretrieved.
-                if not displaced_pending.admission.done():
-                    displaced_pending.admission.set_exception(CommandDisplacedError(command_id))
-                elif not displaced_pending.started.done():
-                    displaced_pending.started.set_exception(CommandDisplacedError(command_id))
-            self._remember_displaced(command_id)
-            _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
-            for listener in self.displaced_listeners:
-                listener(bridge_id, command_id)
+        if raw_status == "disarmed":
+            self.on_disarmed(bridge_id, command_id)
             return True
+        if raw_status == "displaced":
+            return self._handle_displaced_status(bridge_id, command_id)
         pending = self._pending.get((bridge_id, command_id))
         if pending is None:
             return False
         if raw_status == "started":
-            if pending.started.done():
-                return False
-            started_at = self._now()
-            raw_age = decoded.get("age_ms")
-            if (
-                isinstance(raw_age, int)
-                and not isinstance(raw_age, bool)
-                and 0 < raw_age <= 7_200_000
-            ):
-                # A QoS-1 duplicate replay reports how long ago the ORIGINAL
-                # RF handoff happened; anchor the model at the true start so
-                # travel timing is not shifted by the redelivery delay.
-                started_at -= raw_age / 1_000
-            pending.started.set_result(started_at)
-            return True
+            return self._handle_started_status(pending, decoded)
         if pending.admission.done():
             return False
         raw_reason = decoded.get("reason")
@@ -784,6 +877,48 @@ class ZemismartHub:
             )
         )
         return True
+
+    def _handle_displaced_status(self, bridge_id: str, command_id: str) -> bool:
+        """Resolve queue and cover state for one displaced command."""
+        # Latest-command-wins on the bridge retired this command's RF state.
+        displaced_pending = self._pending.get((bridge_id, command_id))
+        if displaced_pending is not None:
+            # Resolve exactly the future the caller is awaiting so no
+            # exception goes unretrieved.
+            if not displaced_pending.admission.done():
+                displaced_pending.admission.set_exception(CommandDisplacedError(command_id))
+            elif not displaced_pending.started.done():
+                displaced_pending.started.set_exception(CommandDisplacedError(command_id))
+        self._remember_displaced(command_id)
+        _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
+        for listener in self.displaced_listeners:
+            listener(bridge_id, command_id)
+        return True
+
+    def _handle_started_status(
+        self,
+        pending: _PendingStatuses,
+        decoded: Mapping[str, object],
+    ) -> bool:
+        """Resolve first dispatch and correlate an optional bridge clock sample."""
+        if pending.started.done():
+            return False
+        recv_time = self._now()
+        t = _strict_uint32(decoded.get("t"))
+        boot = _strict_uint32(decoded.get("boot"))
+        if t is not None and boot is not None:
+            self._clock.observe(boot, t, recv_time)
+        started_at = recv_time
+        raw_age = decoded.get("age_ms")
+        if isinstance(raw_age, int) and not isinstance(raw_age, bool) and 0 < raw_age <= 7_200_000:
+            # QoS-1 replay reports the age of the original RF handoff.
+            started_at -= raw_age / 1_000
+        pending.started.set_result(started_at)
+        return True
+
+    def on_disarmed(self, bridge_id: str, command_id: str) -> None:
+        """Accept the Task-12 disarm-waiter hook without pending-state reuse."""
+        del bridge_id, command_id
 
     def _ensure_worker(self) -> None:
         """Start the one queue worker lazily on the current event loop."""
@@ -1515,6 +1650,10 @@ class ZemismartHub:
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
         self._closed = True
+        self._state_sync.close()
+        self._rx_listeners.clear()
+        self._rx_bridge_ids.clear()
+        self._recent_emission_proofs.clear()
         if self._worker_task is not None:
             self._worker_task.cancel()
             self._worker_task = None

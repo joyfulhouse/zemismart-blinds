@@ -33,13 +33,14 @@ FULL_TRAVEL_MARGIN_SECONDS: Final = 1.0
 POSITION_UPDATE_INTERVAL_SECONDS: Final = 0.25
 
 # Fixed topic contract shared with the ESPHome RF433 MQTT bridge firmware.
-# Existing availability/info/status/tx topics remain unchanged. During the
-# guided Learn flow, the bridge publishes non-retained QoS-1 captures to
-# rf433/<bridge>/rx as JSON {"frame":"AAB1…55","t":<uint millis>}. The
-# controller starts a bounded capture by publishing exactly
+# Existing availability/info/status/tx topics remain unchanged. The domain
+# continuously consumes opt-in, non-retained QoS-1 captures from
+# rf433/<bridge>/rx as JSON {"frame":"AAB1…55","t":<uint millis>,"boot":<uint>}.
+# During guided Learn, the controller starts a bounded capture by publishing
+# exactly
 # {"action":"sniff","seconds":<0..60>} to rf433/<bridge>/cmd at QoS 1,
 # non-retained; seconds=0 cancels the active sniff. Both sides must keep this
-# onboarding-only contract identical.
+# onboarding command contract identical.
 MQTT_ROOT: Final = "rf433"
 MQTT_AVAILABILITY_TOPIC: Final = f"{MQTT_ROOT}/+/availability"
 MQTT_INFO_TOPIC: Final = f"{MQTT_ROOT}/+/info"

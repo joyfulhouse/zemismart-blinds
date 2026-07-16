@@ -3,7 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
@@ -25,6 +25,7 @@ from custom_components.zemismart_blinds.models import (
     ZemismartHub,
     parse_channels,
 )
+from custom_components.zemismart_blinds.state_sync import HeardEvent
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_BASES,
@@ -38,6 +39,12 @@ if TYPE_CHECKING:
 # A second synthetic remote used to prove that remote identity partitions
 # coalescing batches and command targets.
 _name, OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES, _payload = SYNTHETIC_REMOTES[1]
+
+_STATE_SYNC_BOOT: Final = 7
+_STATE_SYNC_T: Final = 2_000
+_STATE_SYNC_RECV_TIME: Final = 100.0
+_BRIDGE_STATE_CAP: Final = 256
+_FORGED_BRIDGE_COUNT: Final = 300
 
 
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
@@ -303,14 +310,16 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
     registry.update_info("bridge-a", {"area": "living_room"})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, Mapping[str, Any]]] = []
-    status_times = iter((1_000.0, 1_010.0))
+    clock = {"now": 0.0}
 
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         body: dict[str, Any] = json.loads(payload)
         published.append((topic, body))
+        clock["now"] = 1_000.0
         assert hub.handle_status("bridge-a", bytearray(json.dumps(accepted(body)).encode()))
+        clock["now"] = 1_010.0
         assert hub.handle_status("bridge-a", bytearray(json.dumps(started(body)).encode()))
 
     config = blind_config()
@@ -319,7 +328,7 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
         publish,
         ack_timeout=0.001,
         command_id_factory=lambda: "command-1",
-        now=lambda: next(status_times),
+        now=lambda: clock["now"],
     )
     ack = asyncio.run(
         hub.async_transmit(
@@ -447,6 +456,167 @@ def test_started_timeout_after_acceptance_is_reported_as_ambiguous() -> None:
 
     with pytest.raises(CommandStartedTimeoutError, match="not-started"):
         asyncio.run(hub.async_transmit(blind_config(), "UP"))
+
+
+def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A correlated started status seeds clock conversion from its t/boot pair."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    observed: list[tuple[int, int, float]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "t": _STATE_SYNC_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+        )
+
+    def observe(boot: int, t: int, recv_time: float) -> None:
+        observed.append((boot, t, recv_time))
+
+    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    monkeypatch.setattr(hub._clock, "observe", observe)
+
+    result = asyncio.run(hub.async_transmit(blind_config(), "UP"))
+
+    assert isinstance(result, CommandAck)
+    assert observed == [(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME)]
+
+
+def test_disarmed_status_routes_to_separate_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A disarmed status bypasses command-start pending state and routes directly."""
+    routed: list[tuple[str, str]] = []
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+
+    def on_disarmed(bridge_id: str, command_id: str) -> None:
+        routed.append((bridge_id, command_id))
+
+    monkeypatch.setattr(hub, "on_disarmed", on_disarmed)
+
+    assert hub.handle_status(
+        "bridge-a",
+        {"status": "disarmed", "command_id": "command-a"},
+    )
+    assert routed == [("bridge-a", "command-a")]
+    assert not hub.handle_status(
+        "bridge-a",
+        {"status": "unknown", "command_id": "command-a"},
+    )
+
+
+def test_handle_rx_dispatches_to_contained_channel_listeners() -> None:
+    """One decoded group press reaches every fully contained matching listener."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    member_events: list[HeardEvent] = []
+    group_events: list[HeardEvent] = []
+    partial_events: list[HeardEvent] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(remote_key, frozenset({1}), member_events.append)
+    hub.register_rx_listener(remote_key, frozenset({1, 2}), group_events.append)
+    hub.register_rx_listener(remote_key, frozenset({1, 3}), partial_events.append)
+    frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1, 2),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
+        _STATE_SYNC_RECV_TIME,
+    )
+
+    assert member_events == group_events
+    assert partial_events == []
+    assert member_events == [
+        HeardEvent(
+            button="UP",
+            chans=frozenset({1, 2}),
+            remote_key=remote_key,
+            heard_at=_STATE_SYNC_RECV_TIME,
+            bridge_id="bridge-a",
+        )
+    ]
+
+
+def test_handle_rx_bounds_forged_bridge_ids() -> None:
+    """Unknown RX topic ids cannot allocate more than the bridge registry cap."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+    payload = {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT}
+
+    for index in range(_FORGED_BRIDGE_COUNT):
+        hub.handle_rx(f"forged-{index}", payload, _STATE_SYNC_RECV_TIME)
+
+    assert len(hub._rx_bridge_ids) == _BRIDGE_STATE_CAP
+    assert f"forged-{_FORGED_BRIDGE_COUNT - 1}" not in hub._rx_bridge_ids
+
+
+def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
+    """Closing the hub clears bounded RX/proof state and disables later dispatch."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    events: list[HeardEvent] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(remote_key, frozenset({1}), events.append)
+    for index in range(_FORGED_BRIDGE_COUNT):
+        hub._record_emission_proof(f"command-{index}")
+
+    assert len(hub._recent_emission_proofs) == _BRIDGE_STATE_CAP
+    hub.close()
+
+    assert not hub._rx_listeners
+    assert not hub._rx_bridge_ids
+    assert not hub._recent_emission_proofs
+    frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "DOWN",
+            bases=TEST_BASES,
+        )
+    )
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
+        _STATE_SYNC_RECV_TIME,
+    )
+    assert events == []
 
 
 def test_publish_failure_is_propagated() -> None:
