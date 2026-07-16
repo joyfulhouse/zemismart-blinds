@@ -76,6 +76,7 @@ _BRIDGE_MAX_ENTRIES: Final = 256
 _EMISSION_PROOF_MEMORY_SECONDS: Final = 60.0
 _EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
 _EMISSION_PROOF_MAX_ENTRIES: Final = 256
+_DISARM_RETRY_SECONDS: Final = 0.25
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _UINT32_MAX: Final = (1 << 32) - 1
 
@@ -552,6 +553,17 @@ class _PendingStatuses:
     started: asyncio.Future[float]
 
 
+@dataclass(slots=True)
+class _DisarmRequest:
+    """One deadline-bounded disarm waiter shared by duplicate requests."""
+
+    waiter: asyncio.Future[None]
+    deadline: float
+    loop_deadline: float
+    on_timeouts: list[Callable[[], None]]
+    task: asyncio.Task[None] | None = None
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class _RxListener:
     """Bind one cover callback to its configured remote metadata."""
@@ -686,6 +698,7 @@ class ZemismartHub:
             now=self._now,
         )
         self._pending: dict[tuple[str, str], _PendingStatuses] = {}
+        self._disarm_requests: dict[tuple[str, str], _DisarmRequest] = {}
         self._queue: deque[_QueuedCommand] = deque()
         self._queue_ready = asyncio.Condition()
         self._worker_task: asyncio.Task[None] | None = None
@@ -702,6 +715,7 @@ class ZemismartHub:
         self._publish_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self.displaced_listeners: list[Callable[[str, str], None]] = []
+        self.emission_proof_listeners: list[Callable[[str], None]] = []
         self.bridge_listeners: list[Callable[[], None]] = []
 
     def notify_bridge_change(self) -> None:
@@ -743,8 +757,8 @@ class ZemismartHub:
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
     def _record_emission_proof(self, command_id: str) -> None:
-        """Remember bounded command-scoped proof for the Phase-3 anchor hook."""
-        if len(command_id) > _EMISSION_PROOF_MAX_ID_LENGTH:
+        """Remember proof and notify only command-id-aware cover listeners."""
+        if self._closed or len(command_id) > _EMISSION_PROOF_MAX_ID_LENGTH:
             return
         now = self._now()
         self._recent_emission_proofs.pop(command_id, None)
@@ -758,6 +772,13 @@ class ZemismartHub:
             del self._recent_emission_proofs[key]
         while len(self._recent_emission_proofs) > _EMISSION_PROOF_MAX_ENTRIES:
             del self._recent_emission_proofs[next(iter(self._recent_emission_proofs))]
+        for listener in tuple(self.emission_proof_listeners):
+            listener(command_id)
+
+    def was_emission_proven(self, command_id: str) -> bool:
+        """Return whether a peer recently proved this exact command emitted."""
+        seen = self._recent_emission_proofs.get(command_id)
+        return seen is not None and self._now() - seen <= _EMISSION_PROOF_MEMORY_SECONDS
 
     def register_rx_listener(
         self,
@@ -927,8 +948,97 @@ class ZemismartHub:
         return True
 
     def on_disarmed(self, bridge_id: str, command_id: str) -> None:
-        """Accept the Task-12 disarm-waiter hook without pending-state reuse."""
-        del bridge_id, command_id
+        """Resolve the separate waiter for an ack received before its deadline."""
+        request = self._disarm_requests.get((bridge_id, command_id))
+        if (
+            request is None
+            or request.waiter.done()
+            or request.waiter.get_loop().time() >= request.loop_deadline
+        ):
+            return
+        self._ledger.retire(command_id)
+        self._state_sync.resume_holds(command_id)
+        request.waiter.set_result(None)
+
+    def request_disarm(
+        self,
+        bridge_id: str,
+        command_id: str,
+        deadline: float,
+        on_timeout: Callable[[], None],
+    ) -> None:
+        """Schedule or join one deadline-bounded bridge disarm request."""
+        if self._closed:
+            return
+        key = (bridge_id, command_id)
+        existing = self._disarm_requests.get(key)
+        if existing is not None:
+            if on_timeout not in existing.on_timeouts:
+                existing.on_timeouts.append(on_timeout)
+            return
+        loop = asyncio.get_running_loop()
+        remaining = max(0.0, deadline - self._now())
+        request = _DisarmRequest(
+            waiter=loop.create_future(),
+            deadline=deadline,
+            loop_deadline=loop.time() + remaining,
+            on_timeouts=[on_timeout],
+        )
+        self._disarm_requests[key] = request
+        request.task = asyncio.create_task(
+            self._disarm(bridge_id, command_id, deadline),
+            name=f"Zemismart disarm {bridge_id}/{command_id}",
+        )
+
+    async def _disarm(self, bridge_id: str, command_id: str, deadline: float) -> None:
+        """Retry one deduped control publish until ack or the old STOP deadline."""
+        key = (bridge_id, command_id)
+        request = self._disarm_requests.get(key)
+        if request is None or request.deadline != deadline:
+            return
+        try:
+            while (
+                not self._closed
+                and not request.waiter.done()
+                and request.waiter.get_loop().time() < request.loop_deadline
+            ):
+                if not await self._publish_disarm(bridge_id, command_id):
+                    return
+                await self._wait_for_disarm_retry(request)
+            if not self._closed and not request.waiter.done():
+                for on_timeout in tuple(request.on_timeouts):
+                    on_timeout()
+        finally:
+            if self._disarm_requests.get(key) is request:
+                del self._disarm_requests[key]
+            if not request.waiter.done():
+                request.waiter.cancel()
+
+    async def _wait_for_disarm_retry(self, request: _DisarmRequest) -> None:
+        """Wait for the ack, one retry interval, or the absolute deadline."""
+        remaining = request.loop_deadline - request.waiter.get_loop().time()
+        if remaining <= 0 or request.waiter.done():
+            return
+        with suppress(TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(request.waiter),
+                timeout=min(_DISARM_RETRY_SECONDS, remaining),
+            )
+
+    async def _publish_disarm(self, bridge_id: str, command_id: str) -> bool:
+        """Enqueue one QoS-1 control message through the shared publish path."""
+        topic = f"{MQTT_ROOT}/{bridge_id}/cmd"
+        payload = json.dumps(
+            {"action": "disarm", "command_id": command_id},
+            separators=(",", ":"),
+        )
+        async with self._publish_lock:
+            if self._closed:
+                return False
+            transport_error = await self._enqueue_publish(topic, payload)
+        if transport_error is not None:
+            _LOGGER.warning("MQTT disarm publish failed: %s", transport_error)
+        return True
 
     def _ensure_worker(self) -> None:
         """Start the one queue worker lazily on the current event loop."""
@@ -1460,26 +1570,7 @@ class ZemismartHub:
             body = dict(command.body)
             body["command_id"] = command_id
             payload = json.dumps(body, separators=(",", ":"))
-            task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
-            # Track the task BEFORE the yield so a cancellation during it
-            # (e.g. final unload) cannot orphan an untracked publish that then
-            # enqueues after teardown; close() cancels the tracked set.
-            self._publish_tasks.add(task)
-            try:
-                # Yield once so the task runs up to its PUBACK await — past the
-                # synchronous paho enqueue — before the lock and barrier release.
-                await asyncio.sleep(0)
-            except asyncio.CancelledError:
-                task.cancel()
-                self._publish_tasks.discard(task)
-                raise
-            transport_error = task.exception() if task.done() and not task.cancelled() else None
-            if transport_error is None:
-                # Still enqueuing/awaiting its PUBACK: reap it in the
-                # background so ordering never waits on the acknowledgment.
-                task.add_done_callback(self._on_publish_done)
-            else:
-                self._publish_tasks.discard(task)
+            transport_error = await self._enqueue_publish(topic, payload)
         if transport_error is not None:
             # An immediate transport failure (e.g. broker down) surfaces
             # fast instead of waiting out the admission timeout. The order
@@ -1488,6 +1579,30 @@ class ZemismartHub:
         self._record_publish(command)
         if command.published is not None:
             command.published.set()
+
+    async def _enqueue_publish(self, topic: str, payload: str) -> BaseException | None:
+        """Start and track one broker enqueue without awaiting its QoS-1 ack."""
+        task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
+        # Track the task BEFORE the yield so a cancellation during it
+        # (e.g. final unload) cannot orphan an untracked publish that then
+        # enqueues after teardown; close() cancels the tracked set.
+        self._publish_tasks.add(task)
+        try:
+            # Yield once so the task runs up to its PUBACK await — past the
+            # synchronous paho enqueue — before the lock and barrier release.
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            task.cancel()
+            self._publish_tasks.discard(task)
+            raise
+        transport_error = task.exception() if task.done() and not task.cancelled() else None
+        if transport_error is None:
+            # Still enqueuing/awaiting its PUBACK: reap it in the background
+            # so ordering never waits on the acknowledgment.
+            task.add_done_callback(self._on_publish_done)
+        else:
+            self._publish_tasks.discard(task)
+        return transport_error
 
     def _on_publish_done(self, task: asyncio.Task[None]) -> None:
         """Retire a background publish, surfacing a transport error to the log."""
@@ -1726,6 +1841,11 @@ class ZemismartHub:
         self._rx_listeners.clear()
         self._rx_bridge_ids.clear()
         self._recent_emission_proofs.clear()
+        for request in self._disarm_requests.values():
+            request.waiter.cancel()
+            if request.task is not None:
+                request.task.cancel()
+        self._disarm_requests.clear()
         if self._worker_task is not None:
             self._worker_task.cancel()
             self._worker_task = None
@@ -1753,6 +1873,7 @@ class ZemismartHub:
             pending.started.cancel()
         self._pending.clear()
         self.displaced_listeners.clear()
+        self.emission_proof_listeners.clear()
         self.bridge_listeners.clear()
 
 

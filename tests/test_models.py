@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
+from custom_components.zemismart_blinds import models as models_module
 from custom_components.zemismart_blinds.codec import (
     CommandBases,
     decode_b0,
@@ -47,6 +48,8 @@ _LEDGER_STOP_AFTER_MS: Final = 3_250
 _MILLISECONDS_PER_SECOND: Final = 1_000
 _BRIDGE_STATE_CAP: Final = 256
 _FORGED_BRIDGE_COUNT: Final = 300
+_DISARM_RETRY_TEST_SECONDS: Final = 0.005
+_DISARM_TEST_DEADLINE_SECONDS: Final = 1.0
 
 
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
@@ -760,6 +763,83 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
         _STATE_SYNC_RECV_TIME,
     )
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate takeover requests share one retry task and one waiter."""
+    monkeypatch.setattr(
+        models_module,
+        "_DISARM_RETRY_SECONDS",
+        _DISARM_RETRY_TEST_SECONDS,
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    acknowledged = asyncio.Event()
+    timeout_calls: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if len(published) == 3:
+            hub.on_disarmed("bridge-a", "timed-command")
+            acknowledged.set()
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    deadline = hub._now() + _DISARM_TEST_DEADLINE_SECONDS
+
+    def on_timeout() -> None:
+        timeout_calls.append("timeout")
+
+    hub.request_disarm("bridge-a", "timed-command", deadline, on_timeout)
+    hub.request_disarm("bridge-a", "timed-command", deadline, on_timeout)
+    try:
+        await asyncio.wait_for(acknowledged.wait(), timeout=_DISARM_TEST_DEADLINE_SECONDS)
+        await asyncio.sleep(_DISARM_RETRY_TEST_SECONDS)
+
+        assert (
+            published
+            == [
+                (
+                    "rf433/bridge-a/cmd",
+                    {"action": "disarm", "command_id": "timed-command"},
+                ),
+            ]
+            * 3
+        )
+        assert timeout_calls == []
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_disarm_task_and_waiter_before_publish() -> None:
+    """Final unload cancels a scheduled disarm before it can publish later."""
+    published: list[tuple[str, str]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, payload))
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
+        lambda: None,
+    )
+    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    task = request.task
+    assert task is not None
+
+    hub.close()
+    await asyncio.sleep(0)
+
+    assert task.cancelled()
+    assert request.waiter.cancelled()
+    assert not hub._disarm_requests
+    assert published == []
 
 
 def test_publish_failure_is_propagated() -> None:

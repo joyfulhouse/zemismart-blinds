@@ -977,6 +977,237 @@ async def test_heard_stop_reconciles_offline_unverified_anchor(
 
 
 @pytest.mark.asyncio
+async def test_emission_proof_upgrades_only_the_exact_command_anchor(
+    hass: HomeAssistant,
+) -> None:
+    """Proof for C cannot clear another cover's restored command-D marker."""
+    first_config = member_config(channel=1)
+    second_config = member_config(channel=2)
+
+    def restored_state(
+        config: BlindConfig,
+        *,
+        bridge_id: str,
+        command_id: str,
+    ) -> State:
+        return State(
+            "cover.synthetic",
+            "open",
+            {
+                ATTR_CURRENT_POSITION: 80,
+                "remote": config.remote_key,
+                "channels": list(config.channels),
+                "motion_direction": 0,
+                "unverified_anchor_bridge": bridge_id,
+                "unverified_anchor_command_id": command_id,
+            },
+        )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    registry = BridgeRegistry()
+    hub = ZemismartHub(registry, quiet_publish)
+    first = await attach_cover(
+        hass,
+        hub,
+        config=first_config,
+        cover_type=restored_cover_type(
+            restored_state(
+                first_config,
+                bridge_id="bridge-c",
+                command_id="command-c",
+            )
+        ),
+    )
+    second = await attach_cover(
+        hass,
+        hub,
+        config=second_config,
+        cover_type=restored_cover_type(
+            restored_state(
+                second_config,
+                bridge_id="bridge-d",
+                command_id="command-d",
+            )
+        ),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_2",
+    )
+    try:
+        hub._record_emission_proof("command-c")
+
+        assert first.extra_state_attributes["unverified_anchor_bridge"] is None
+        assert first.extra_state_attributes["unverified_anchor_command_id"] is None
+        assert second.extra_state_attributes["unverified_anchor_bridge"] == "bridge-d"
+        assert second.extra_state_attributes["unverified_anchor_command_id"] == "command-d"
+
+        registry.update_availability("bridge-d", "offline")
+        hub.notify_bridge_change()
+
+        assert first.current_cover_position == 80
+        assert second.current_cover_position is None
+    finally:
+        await first.async_will_remove_from_hass()
+        await second.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_emission_proof_before_restore_marker_commit_is_replayed(
+    hass: HomeAssistant,
+) -> None:
+    """Bounded proof memory upgrades a marker committed after the peer echo."""
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 50,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 1,
+            "motion_target": 80,
+            "motion_started": now - 2.0,
+            "motion_deadline": now - 1.0,
+            "motion_start_position": 50,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "command-c",
+            "motion_timed": True,
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), quiet_publish)
+    hub._record_emission_proof("command-c")
+    entity = await attach_cover(
+        hass,
+        hub,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert hub.was_emission_proven("command-c")
+        assert entity.current_cover_position == 80
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+        assert entity.extra_state_attributes["unverified_anchor_command_id"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_up_disarm_ack_keeps_mirrored_motion(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An acknowledged takeover disarms the old STOP and keeps modeling UP."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.005)
+    published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.4))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 75})
+        command_id = entity._motion_command_id
+        old_deadline = entity._motion_deadline
+        assert command_id is not None
+        assert entity._motion_timed
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        disarms = [item for item in published if item[0].endswith("/cmd")]
+        assert disarms == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": command_id},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": command_id},
+        )
+
+        await asyncio.sleep(max(0.0, old_deadline - cover_module.WALL_CLOCK()) + 0.02)
+
+        assert entity.is_opening
+        assert entity._motion_target == 100.0
+        assert entity.current_cover_position is not None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_up_disarm_timeout_marks_mirrored_motion_unknown(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a disarm ack, the old STOP deadline invalidates the mirror."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.005)
+    published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.4))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 75})
+        command_id = entity._motion_command_id
+        old_deadline = entity._motion_deadline
+        assert command_id is not None
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+        await asyncio.sleep(max(0.0, old_deadline - cover_module.WALL_CLOCK()) + 0.02)
+
+        assert [item for item in published if item[0].endswith("/cmd")]
+        assert entity.current_cover_position is None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_transmitted_stop_still_publishes_records_ack_and_freezes(
     hass: HomeAssistant,
 ) -> None:
