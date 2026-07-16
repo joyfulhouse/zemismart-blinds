@@ -242,6 +242,7 @@ class _LedgerEntry:
     windows: tuple[_LedgerWindow, ...] = ()
     pending_since: float | None = None
     expires_at: float | None = None
+    displaced: bool = False
 
 
 class CommandLedger:
@@ -273,7 +274,10 @@ class CommandLedger:
     def confirm(self, command_id: str, handoff: float) -> None:
         """Confirm a pending command and calculate every frame window."""
         entry = self._entries.get(command_id)
-        if entry is None:
+        if entry is None or entry.displaced:
+            # A displaced entry's STOP windows describe the bridge's flush
+            # drain; rebuilding them from the original handoff would resurrect
+            # the retired deadline and lose the drain window.
             return
         windows = tuple(self._window(frame, handoff) for frame in entry.frames)
         latest_end = max((window.ends_at for window in windows), default=handoff)
@@ -305,6 +309,7 @@ class CommandLedger:
         )
         latest_end = max((window.ends_at for window in entry.windows), default=now)
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
+        entry.displaced = True
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the newest pending or windowed confirmed command match."""

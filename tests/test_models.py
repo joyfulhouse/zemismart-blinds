@@ -65,6 +65,9 @@ _SEEDED_BRIDGE_T: Final = 10_000
 _STARTED_STATUS_T: Final = 10_250
 _STARTED_STATUS_AGE_MS: Final = 250
 _STARTED_DELIVERY_TIME: Final = 102.0
+_CLAMPED_DELIVERY_TIME: Final = 200.0
+_CLAMPED_AGE_MS: Final = 20_000
+_CLAMPED_STATUS_T: Final = 70_000
 _REPLAY_AGE_MS: Final = 600_000
 _REPLAY_STATUS_T: Final = 610_000
 _REPLAY_DELIVERY_TIME: Final = 700.0
@@ -1852,6 +1855,165 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     )
     assert [event.button for event in events] == ["STOP"]
     hub.close()
+
+
+@pytest.mark.asyncio
+async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> None:
+    """A displaced arriving before the started awaiter resumes keeps the drain.
+
+    One broker callback batch can resolve the started future AND deliver the
+    displaced status before _async_execute resumes to confirm the ledger.
+    displace() must not retire the still-pending entry (the flushed STOPs
+    would dispatch as physical presses), and the awaiter's later confirm must
+    not resurrect the original-deadline windows over the drain re-window.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    clock = {"now": _STATE_SYNC_RECV_TIME}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+        # Same callback batch: the started future is resolved but its awaiter
+        # has not resumed yet when the displacement lands.
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "displaced", "command_id": body["command_id"]},
+        )
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "displaced-race",
+        now=lambda: clock["now"],
+    )
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
+    result = await hub.async_transmit(
+        config,
+        "DOWN",
+        stop_after_ms=_DISPLACED_STOP_AFTER_MS,
+    )
+    assert isinstance(result, CommandAck)
+    body = published[0]
+
+    clock["now"] = _STATE_SYNC_RECV_TIME + 0.1
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": body["stop_raw"],
+            "t": _STATE_SYNC_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+    assert events == []
+
+    clock["now"] = _DISPLACED_ORIGINAL_STOP_AT
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": body["stop_raw"],
+            "t": _DISPLACED_ORIGINAL_STOP_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+    assert [event.button for event in events] == ["STOP"]
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
+    """A clamped projection never anchors a delayed delivery at NOW.
+
+    With a small age_ms the corroboration tolerance alone would accept a
+    projection that to_ha_time clamped to recv_time; the exact-recv guard
+    must reject it and keep the recv - age baseline anchor.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    clock = {"now": _STATE_SYNC_RECV_TIME}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "age_ms": _CLAMPED_AGE_MS,
+                "t": _CLAMPED_STATUS_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+        )
+
+    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    seed_frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
+    )
+    clock["now"] = _CLAMPED_DELIVERY_TIME
+
+    ack = await hub.async_transmit(blind_config(), "DOWN")
+
+    assert isinstance(ack, CommandAck)
+    assert ack.started_at == pytest.approx(
+        _CLAMPED_DELIVERY_TIME - _CLAMPED_AGE_MS / _MILLISECONDS_PER_SECOND
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_disarm_after_resolved_waiter_starts_fresh_request() -> None:
+    """A takeover after a completed disarm gets its own live request.
+
+    Joining a request whose waiter already resolved would strand the new
+    requester: the finished task never retries and never fires timeouts.
+    """
+    timeout_calls: list[str] = []
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    now = hub._now()
+
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        now + _DISARM_LONG_DEADLINE_SECONDS,
+        lambda: timeout_calls.append("first"),
+    )
+    old_request = hub._disarm_requests[("bridge-a", "timed-command")]
+    # Resolve the first request and re-request in the SAME loop step, before
+    # the old task's finally block can clear its slot.
+    hub.on_disarmed("bridge-a", "timed-command")
+    hub.request_disarm(
+        "bridge-a",
+        "timed-command",
+        hub._now() + _DISARM_SHORT_DEADLINE_SECONDS,
+        lambda: timeout_calls.append("second"),
+    )
+    try:
+        new_request = hub._disarm_requests[("bridge-a", "timed-command")]
+        assert new_request is not old_request
+        await asyncio.sleep(_DISARM_TIMEOUT_LOWER_BOUND_SECONDS)
+        assert timeout_calls == ["second"]
+    finally:
+        hub.close()
 
 
 @pytest.mark.asyncio

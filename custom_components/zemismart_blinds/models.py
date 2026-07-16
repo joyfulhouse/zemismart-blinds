@@ -953,6 +953,16 @@ class ZemismartHub:
                 displaced_pending.admission.set_exception(CommandDisplacedError(command_id))
             elif not displaced_pending.started.done():
                 displaced_pending.started.set_exception(CommandDisplacedError(command_id))
+            elif (
+                not displaced_pending.started.cancelled()
+                and displaced_pending.started.exception() is None
+            ):
+                # started resolved but _async_execute has not resumed to
+                # confirm the ledger yet (a started+displaced broker batch
+                # runs both callbacks before the awaiter). Confirm from the
+                # resolved future first so displace() re-windows the flushed
+                # STOPs instead of retiring the still-pending entry.
+                self._ledger.confirm(command_id, displaced_pending.started.result())
         self._ledger.displace(command_id, self._now())
         self._state_sync.resume_holds(command_id)
         self._remember_displaced(command_id)
@@ -993,8 +1003,15 @@ class ZemismartHub:
                 # collapses any projection older than 30 s to recv_time.
                 # Accept the projection only when it corroborates the
                 # age-based estimate; otherwise keep recv - age (the shipped
-                # baseline anchor), never a clamped delivery-time anchor.
-                if abs(projected - started_at) <= _STARTED_PROJECTION_TOLERANCE_SECONDS:
+                # baseline anchor), never a clamped delivery-time anchor. An
+                # exact recv_time result means to_ha_time clamped an
+                # implausible projection — with a small age_ms the tolerance
+                # alone would accept that clamp and anchor a delayed delivery
+                # at NOW, so a clamped value is always rejected.
+                if (
+                    projected != recv_time
+                    and abs(projected - started_at) <= _STARTED_PROJECTION_TOLERANCE_SECONDS
+                ):
                     started_at = projected
             clock.observe(boot, t, recv_time)
         pending.started.set_result(started_at)
@@ -1026,7 +1043,7 @@ class ZemismartHub:
         loop = asyncio.get_running_loop()
         key = (bridge_id, command_id)
         existing = self._disarm_requests.get(key)
-        if existing is not None:
+        if existing is not None and not existing.waiter.done():
             existing.deadline = max(existing.deadline, deadline)
             existing.loop_deadline = max(
                 existing.loop_deadline,
