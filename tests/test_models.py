@@ -515,8 +515,13 @@ def test_disarmed_status_routes_to_separate_hook(monkeypatch: pytest.MonkeyPatch
     )
 
 
-def test_handle_rx_dispatches_to_contained_channel_listeners() -> None:
-    """One decoded group press reaches every fully contained matching listener."""
+def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
+    """A decoded press reaches every listener whose channels intersect it.
+
+    The hub dispatches to any matching listener that shares a channel with the
+    press (contained OR partially overlapping); the cover-side callback then
+    decides whether to mirror the move or mark itself unknown (design §6.A).
+    """
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -525,10 +530,12 @@ def test_handle_rx_dispatches_to_contained_channel_listeners() -> None:
     member_events: list[HeardEvent] = []
     group_events: list[HeardEvent] = []
     partial_events: list[HeardEvent] = []
+    disjoint_events: list[HeardEvent] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     hub.register_rx_listener(remote_key, frozenset({1}), member_events.append)
     hub.register_rx_listener(remote_key, frozenset({1, 2}), group_events.append)
     hub.register_rx_listener(remote_key, frozenset({1, 3}), partial_events.append)
+    hub.register_rx_listener(remote_key, frozenset({4}), disjoint_events.append)
     frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -545,17 +552,19 @@ def test_handle_rx_dispatches_to_contained_channel_listeners() -> None:
         _STATE_SYNC_RECV_TIME,
     )
 
-    assert member_events == group_events
-    assert partial_events == []
-    assert member_events == [
-        HeardEvent(
-            button="UP",
-            chans=frozenset({1, 2}),
-            remote_key=remote_key,
-            heard_at=_STATE_SYNC_RECV_TIME,
-            bridge_id="bridge-a",
-        )
-    ]
+    expected = HeardEvent(
+        button="UP",
+        chans=frozenset({1, 2}),
+        remote_key=remote_key,
+        heard_at=_STATE_SYNC_RECV_TIME,
+        bridge_id="bridge-a",
+    )
+    # Contained (member, group) AND partial-overlap ({1, 3} shares channel 1)
+    # all receive the event; a disjoint listener ({4}) does not.
+    assert member_events == [expected]
+    assert group_events == [expected]
+    assert partial_events == [expected]
+    assert disjoint_events == []
 
 
 def test_handle_rx_bounds_forged_bridge_ids() -> None:

@@ -22,6 +22,7 @@ from custom_components.zemismart_blinds.models import (
     RemoteIdentity,
     ZemismartHub,
 )
+from custom_components.zemismart_blinds.state_sync import HeardEvent
 from tests.synthetic import TEST_ACTION_BASES, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
@@ -119,6 +120,26 @@ def acknowledge(hub: ZemismartHub, bridge_id: str, body: Mapping[str, Any]) -> N
             "status": "started",
             "command_id": body["command_id"],
         },
+    )
+
+
+def dispatch_heard_press(
+    hub: ZemismartHub,
+    config: BlindConfig,
+    button: str,
+    channels: tuple[int, ...],
+    *,
+    at: float,
+) -> None:
+    """Dispatch one synthetic decoded physical press to registered covers."""
+    hub._dispatch_heard(
+        HeardEvent(
+            button=button,
+            chans=frozenset(channels),
+            remote_key=config.remote_key,
+            heard_at=at,
+            bridge_id="synthetic-rx-bridge",
+        ),
     )
 
 
@@ -710,6 +731,228 @@ def member_config(*, channel: int = 1, travel: float = 1.0) -> BlindConfig:
         area_id="living_room",
         repeats=2,
     )
+
+
+@pytest.mark.asyncio
+async def test_heard_up_starts_exact_cover_without_routing_or_publish(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A physical UP mirrors travel without pretending the hearing bridge transmitted."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.005)
+    published: list[tuple[str, str]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.04))
+    entity._position = 20.0
+    entity._last_bridge = "prior-synthetic-bridge"
+    entity._degraded = False
+    try:
+        before = entity.current_cover_position
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+
+        assert entity.is_opening
+        assert published == []
+        assert entity.extra_state_attributes["last_bridge"] == "prior-synthetic-bridge"
+        assert entity.extra_state_attributes["degraded_bridge"] is False
+
+        await asyncio.sleep(0.02)
+        assert before is not None
+        assert entity.current_cover_position is not None
+        assert entity.current_cover_position > before
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_heard_group_move_models_members_once_without_double_invalidation(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact group owns its member propagation for one heard-event batch."""
+    published: list[tuple[str, str]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    first = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=1, travel=5.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    second = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-3",
+        entity_id="cover.living_room_channel_2",
+    )
+    group._position = 20.0
+    first._position = 30.0
+    second._position = 40.0
+    writes: list[str] = []
+    monkeypatch.setattr(
+        ZemismartCover,
+        "async_write_ha_state",
+        lambda entity: writes.append(entity.entity_id),
+    )
+    try:
+        dispatch_heard_press(
+            hub,
+            group._config,
+            "UP",
+            group._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+
+        assert group.is_opening
+        assert first.is_opening
+        assert second.is_opening
+        assert sorted(writes) == sorted(
+            [
+                "cover.living_room_left",
+                "cover.living_room_channel_1",
+                "cover.living_room_channel_2",
+            ],
+        )
+        assert published == []
+    finally:
+        await group.async_will_remove_from_hass()
+        await first.async_will_remove_from_hass()
+        await second.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_partially_addressed_heard_press_marks_group_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """A one-channel press cannot preserve a two-channel aggregate estimate."""
+    published: list[tuple[str, str]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    group = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    group._position = 50.0
+    try:
+        dispatch_heard_press(
+            hub,
+            group._config,
+            "UP",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+
+        assert group.current_cover_position is None
+        assert not group.is_opening
+        assert group.extra_state_attributes["degraded_bridge"] is True
+        assert published == []
+    finally:
+        await group.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_reconciles_offline_unverified_anchor(
+    hass: HomeAssistant,
+) -> None:
+    """A heard STOP revokes the origin exposed by stopping exempt full travel."""
+    registry = online_registry("bridge-b")
+    published: list[tuple[str, str]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, payload))
+
+    hub = ZemismartHub(registry, publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=cover_config(travel=5.0),
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    heard_at = cover_module.WALL_CLOCK()
+    try:
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=heard_at,
+        )
+        assert entity.is_opening
+
+        registry.update_availability("bridge-a", "offline")
+        hub.notify_bridge_change()
+        assert entity.is_opening
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "STOP",
+            entity._config.channels,
+            at=heard_at + 0.25,
+        )
+
+        assert entity.current_cover_position is None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+        assert published == []
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_transmitted_stop_still_publishes_records_ack_and_freezes(
+    hass: HomeAssistant,
+) -> None:
+    """Extracting the freeze helper preserves the ordinary transmitted STOP path."""
+    bodies: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        bodies.append(body)
+        acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 20.0
+    try:
+        await entity.async_open_cover()
+        stopped = await entity._async_stop()
+
+        assert stopped is True
+        assert len(bodies) == 2
+        assert bodies[-1]["raw"] == encode_b0(
+            make_payload(
+                TEST_PREFIX,
+                TEST_REMOTE_ID,
+                entity._config.channels,
+                "STOP",
+                bases=TEST_ACTION_BASES,
+            ),
+        )
+        assert entity.current_cover_position is not None
+        assert not entity.is_opening
+        assert entity.extra_state_attributes["last_bridge"] == "bridge-a"
+        assert entity.extra_state_attributes["degraded_bridge"] is False
+    finally:
+        await entity.async_will_remove_from_hass()
 
 
 @pytest.mark.asyncio

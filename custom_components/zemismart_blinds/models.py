@@ -814,11 +814,12 @@ class ZemismartHub:
         return normalized
 
     def _dispatch_heard(self, event: HeardEvent) -> None:
-        """Invoke listeners fully contained by one decoded remote press."""
+        """Invoke a snapshot of matching listeners intersecting the press."""
         callbacks = tuple(
             listener.callback
             for listener in self._rx_listeners
-            if listener.remote_key == event.remote_key and listener.channels <= event.chans
+            if listener.remote_key == event.remote_key
+            and not listener.channels.isdisjoint(event.chans)
         )
         for listener_callback in callbacks:
             listener_callback(event)
