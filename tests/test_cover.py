@@ -733,6 +733,41 @@ def member_config(*, channel: int = 1, travel: float = 1.0) -> BlindConfig:
     )
 
 
+def channel_group_config(
+    channels: tuple[int, ...],
+    *,
+    travel: float = 5.0,
+) -> BlindConfig:
+    """Return a synthetic group configuration for an arbitrary channel set."""
+    return BlindConfig(
+        name=f"Living Room channels {channels}",
+        remote=cover_config().remote,
+        channels=channels,
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+
+
+async def attach_channel_groups(
+    hass: HomeAssistant,
+    hub: ZemismartHub,
+    channels_in_order: tuple[tuple[int, ...], tuple[int, ...]],
+) -> dict[tuple[int, ...], ZemismartCover]:
+    """Attach two groups in an explicit RX-listener registration order."""
+    covers: dict[tuple[int, ...], ZemismartCover] = {}
+    for index, channels in enumerate(channels_in_order, start=1):
+        covers[channels] = await attach_cover(
+            hass,
+            hub,
+            config=channel_group_config(channels),
+            entry_id=f"group-entry-{index}",
+            entity_id=f"cover.synthetic_group_{index}",
+        )
+    return covers
+
+
 @pytest.mark.asyncio
 async def test_heard_up_starts_exact_cover_without_routing_or_publish(
     hass: HomeAssistant,
@@ -924,6 +959,256 @@ async def test_partially_addressed_heard_press_marks_group_unknown(
         assert published == []
     finally:
         await group.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_heard_group_prepare_disarms_member_timed_command_first(
+    hass: HomeAssistant,
+) -> None:
+    """A group-first callback cannot erase its member's timed disarm snapshot."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "command-c",
+    )
+    group = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    member = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=1, travel=5.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    member._position = 20.0
+    try:
+        await member.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert member._motion_timed
+
+        dispatch_heard_press(
+            hub,
+            group._config,
+            "UP",
+            group._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "command-c"},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "command-c"},
+        )
+    finally:
+        await group.async_will_remove_from_hass()
+        await member.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_heard_press_disarms_timed_command_before_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """A partially driven timed cover disarms its stale fail-safe STOP."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "command-d",
+    )
+    cover = await attach_cover(
+        hass,
+        hub,
+        config=channel_group_config((1, 3)),
+    )
+    cover._position = 20.0
+    try:
+        await cover.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert cover._motion_timed
+
+        dispatch_heard_press(
+            hub,
+            cover._config,
+            "UP",
+            (1, 2),
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        assert cover.current_cover_position is None
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "command-d"},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "command-d"},
+        )
+    finally:
+        await cover.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_does_not_disarm_timed_command(hass: HomeAssistant) -> None:
+    """A physical STOP freezes a timed model without disarming its scheduler."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "command-stop",
+    )
+    cover = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    cover._position = 20.0
+    try:
+        await cover.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert cover._motion_timed
+
+        dispatch_heard_press(
+            hub,
+            cover._config,
+            "STOP",
+            cover._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.sleep(0)
+
+        assert cover.current_cover_position is not None
+        assert not cover.is_opening
+        assert not [item for item in published if item[0].endswith("/cmd")]
+    finally:
+        await cover.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.parametrize(
+    "channels_in_order",
+    [
+        ((1, 2, 3), (1, 2)),
+        ((1, 2), (1, 2, 3)),
+    ],
+    ids=["larger-first", "smaller-first"],
+)
+@pytest.mark.asyncio
+async def test_heard_up_preserves_every_fully_contained_group(
+    hass: HomeAssistant,
+    channels_in_order: tuple[tuple[int, ...], tuple[int, ...]],
+) -> None:
+    """Contained covers in one heard batch cannot invalidate one another."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    covers = await attach_channel_groups(hass, hub, channels_in_order)
+    for index, cover in enumerate(covers.values(), start=2):
+        cover._position = float(index * 10)
+    try:
+        dispatch_heard_press(
+            hub,
+            covers[(1, 2, 3)]._config,
+            "UP",
+            (1, 2, 3),
+            at=cover_module.WALL_CLOCK(),
+        )
+
+        assert all(cover.is_opening for cover in covers.values())
+        assert all(cover.current_cover_position is not None for cover in covers.values())
+    finally:
+        for cover in covers.values():
+            await cover.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.parametrize(
+    "channels_in_order",
+    [
+        ((1, 2, 3), (1, 2)),
+        ((1, 2), (1, 2, 3)),
+    ],
+    ids=["larger-first", "smaller-first"],
+)
+@pytest.mark.asyncio
+async def test_heard_stop_freezes_every_fully_contained_group(
+    hass: HomeAssistant,
+    channels_in_order: tuple[tuple[int, ...], tuple[int, ...]],
+) -> None:
+    """Each contained cover freezes its own estimate without batch invalidation."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    covers = await attach_channel_groups(hass, hub, channels_in_order)
+    started_at = cover_module.WALL_CLOCK()
+    motion = cover_module._MotionStart(
+        source="heard",
+        started_at=started_at,
+        deadline=None,
+        bridge_id=None,
+        command_id=None,
+    )
+    for index, cover in enumerate(covers.values(), start=2):
+        cover._position = float(index * 10)
+        cover._commit_motion(
+            motion,
+            direction=1,
+            target=100.0,
+            duration=5.0,
+            absolute_anchor=True,
+        )
+    try:
+        dispatch_heard_press(
+            hub,
+            covers[(1, 2, 3)]._config,
+            "STOP",
+            (1, 2, 3),
+            at=started_at + 0.01,
+        )
+
+        assert all(not cover.is_opening for cover in covers.values())
+        assert all(cover.current_cover_position is not None for cover in covers.values())
+    finally:
+        for cover in covers.values():
+            await cover.async_will_remove_from_hass()
+        hub.close()
 
 
 @pytest.mark.asyncio

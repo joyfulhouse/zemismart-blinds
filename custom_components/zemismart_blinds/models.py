@@ -576,6 +576,7 @@ class _RxListener:
     remote_key: str
     channels: frozenset[int]
     callback: Callable[[HeardEvent], None]
+    prepare: Callable[[HeardEvent], None] | None = None
 
 
 @dataclass(slots=True)
@@ -793,9 +794,11 @@ class ZemismartHub:
         remote_key: str,
         channels: frozenset[int],
         callback: Callable[[HeardEvent], None],
+        *,
+        prepare: Callable[[HeardEvent], None] | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
-        listener = _RxListener(remote_key, channels, callback)
+        listener = _RxListener(remote_key, channels, callback, prepare)
 
         def unsubscribe() -> None:
             with suppress(ValueError):
@@ -877,6 +880,9 @@ class ZemismartHub:
             event.remote_key,
             event.chans & configured_channels,
         )
+        for listener in listeners:
+            if listener.prepare is not None:
+                listener.prepare(event)
         for listener in listeners:
             listener.callback(event)
 

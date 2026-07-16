@@ -642,6 +642,46 @@ def test_dispatch_heard_supersedes_only_matched_configured_channels() -> None:
     }
 
 
+def test_dispatch_heard_prepares_all_listeners_before_callbacks() -> None:
+    """Every matched listener snapshots state before any callback mutates it."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    calls: list[str] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(
+        remote_key,
+        frozenset({1, 2}),
+        lambda _event: calls.append("group callback"),
+        prepare=lambda _event: calls.append("group prepare"),
+    )
+    hub.register_rx_listener(
+        remote_key,
+        frozenset({1}),
+        lambda _event: calls.append("member callback"),
+        prepare=lambda _event: calls.append("member prepare"),
+    )
+
+    hub._dispatch_heard(
+        HeardEvent(
+            button="UP",
+            chans=frozenset({1, 2}),
+            remote_key=remote_key,
+            heard_at=_STATE_SYNC_RECV_TIME,
+            bridge_id="bridge-a",
+        )
+    )
+
+    assert calls == [
+        "group prepare",
+        "member prepare",
+        "group callback",
+        "member callback",
+    ]
+
+
 def test_handle_rx_maintains_independent_bridge_clocks() -> None:
     """Alternating bridge boots cannot replace one another's correlation."""
 

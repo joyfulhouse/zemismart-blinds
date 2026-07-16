@@ -204,6 +204,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._config.remote.key,
             frozenset(self._config.channels),
             self._on_heard_press,
+            prepare=self._prepare_heard_press,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
@@ -359,6 +360,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._hub.bridge_listeners.remove(self._on_bridge_change)
         self._cancel_motion_task()
         await super().async_will_remove_from_hass()
+
+    @callback
+    def _prepare_heard_press(self, event: HeardEvent) -> None:
+        """Disarm a timed command before the heard-event batch mutates it."""
+        if event.button in {"UP", "DOWN"}:
+            self._request_takeover_disarm()
 
     @callback
     def _on_heard_press(self, event: HeardEvent) -> None:
@@ -676,7 +683,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             configured = self._config.travel_down
         else:
             return
-        self._request_takeover_disarm()
         motion = _MotionStart(
             source="heard",
             started_at=event.heard_at,
@@ -700,7 +706,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 duration=duration,
                 group_target=target,
             )
-        self._reconcile_overlaps(moving=True)
+        # Heard dispatch is one batch: every intersecting cover receives its
+        # own callback, so owner-side reconciliation would invalidate another
+        # fully contained cover before or after it commits the same press.
         self.async_write_ha_state()
 
     def _request_takeover_disarm(self) -> None:
@@ -958,7 +966,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             member._interrupt_motion(at)
             member._reconcile_unverified_anchor()
             member.async_write_ha_state()
-        self._reconcile_overlaps(moving=False)
+        if provenance == "commanded":
+            # A heard STOP is already reconciled by every intersecting cover's
+            # callback in the same batch; owner-side invalidation is harmful.
+            self._reconcile_overlaps(moving=False)
         self.async_write_ha_state()
 
     async def _async_stop(self) -> bool:
