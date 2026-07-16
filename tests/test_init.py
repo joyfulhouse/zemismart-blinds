@@ -37,6 +37,11 @@ from custom_components.zemismart_blinds.models import (
     EntryRuntime,
     ZemismartHub,
 )
+from custom_components.zemismart_blinds.state_sync import (
+    HeardEvent,
+    LedgerFrameSpec,
+    frame_signature,
+)
 from tests.synthetic import TEST_CH12_UP_B0
 
 if TYPE_CHECKING:
@@ -74,7 +79,13 @@ def config_entry(entry_id: str) -> ConfigEntry[EntryRuntime]:
     )
 
 
-def message(topic: str, payload: str, *, retain: bool) -> ReceiveMessage:
+def message(
+    topic: str,
+    payload: str,
+    *,
+    retain: bool,
+    timestamp: float = 1.0,
+) -> ReceiveMessage:
     """Build one actual MQTT ReceiveMessage for a wildcard subscription."""
     return ReceiveMessage(
         topic=topic,
@@ -82,7 +93,7 @@ def message(topic: str, payload: str, *, retain: bool) -> ReceiveMessage:
         qos=1,
         retain=retain,
         subscribed_topic=topic,
-        timestamp=1.0,
+        timestamp=timestamp,
     )
 
 
@@ -96,14 +107,13 @@ def test_rx_handler_drops_retained_and_malformed_messages(
 
     hub = ZemismartHub(BridgeRegistry(), publish)
     runtime = DomainRuntime(hub=hub, unsubscribers=[])
-    handled: list[tuple[str, Mapping[str, object], float]] = []
+    handled: list[tuple[str, Mapping[str, object]]] = []
 
     def handle_rx(
         bridge_id: str,
         payload: Mapping[str, object],
-        recv_time: float,
     ) -> None:
-        handled.append((bridge_id, payload, recv_time))
+        handled.append((bridge_id, payload))
 
     monkeypatch.setattr(hub, "handle_rx", handle_rx)
     payload = json.dumps({"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1})
@@ -125,9 +135,47 @@ def test_rx_handler_drops_retained_and_malformed_messages(
         (
             "bridge-a",
             {"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1},
-            1.0,
         )
     ]
+
+
+def test_rx_handler_uses_hub_clock_for_confirmed_echo() -> None:
+    """HA's monotonic-domain MQTT timestamp cannot classify RF ledger time."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    wall_time = 1_700_000_000.0
+    mqtt_timestamp = 12_345.67
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: wall_time)
+    runtime = DomainRuntime(hub=hub, unsubscribers=[])
+    signature = frame_signature(TEST_CH12_UP_B0)
+    assert signature is not None
+    remote_key, channels, button = signature
+    hub._ledger.register_pending(
+        "command-1",
+        "bridge-a",
+        tuple(channels),
+        button,
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    hub._ledger.confirm("command-1", wall_time)
+    events: list[HeardEvent] = []
+    hub.register_rx_listener(remote_key, channels, events.append)
+    payload = json.dumps({"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1})
+
+    integration_module._handle_rx(
+        runtime,
+        message(
+            "rf433/bridge-b/rx",
+            payload,
+            retain=False,
+            timestamp=mqtt_timestamp,
+        ),
+    )
+
+    assert events == []
+    assert hub.was_emission_proven("command-1")
 
 
 @pytest.mark.asyncio

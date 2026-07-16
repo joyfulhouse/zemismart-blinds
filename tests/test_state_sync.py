@@ -6,6 +6,7 @@ from typing import Final
 
 import pytest
 
+from custom_components.zemismart_blinds import state_sync as state_sync_module
 from custom_components.zemismart_blinds.codec import encode_b0, make_payload
 from custom_components.zemismart_blinds.state_sync import (
     BridgeClock,
@@ -23,6 +24,12 @@ _BOOT: Final = 7
 _REMOTE_KEY: Final = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
 _UINT32_MAX: Final = (1 << 32) - 1
 _CLAMPED_RECV_TIME: Final = 10.5
+_OUTLIER_FUTURE_T: Final = 1_000_000
+_CLOCK_STEP_RECV_TIME: Final = 112.0
+_INTERMEDIATE_PROJECTION_RECV_TIME: Final = 40.0
+_LONG_QUIET_GAP_SECONDS: Final = 30 * 24 * 60 * 60
+_MILLISECONDS_PER_SECOND: Final = 1_000
+_OVERSIZED_RAW_FRAME_LENGTH: Final = 5 * 1_024 * 1_024
 
 
 def _frame(channels: tuple[int, ...], button: str) -> str:
@@ -98,9 +105,9 @@ def test_bridge_clock_rejects_stale_sample() -> None:
     clock = BridgeClock()
     clock.observe(_BOOT, 100_000, 100.0)
     clock.observe(_BOOT, 101_000, 101.0)
-    clock.observe(_BOOT, 100_500, 200.0)
+    clock.observe(_BOOT, 100_500, 120.0)
 
-    assert clock.to_ha_time(_BOOT, 101_500, 200.0) == pytest.approx(101.5)
+    assert clock.to_ha_time(_BOOT, 101_500, 120.0) == pytest.approx(101.5)
 
 
 def test_bridge_clock_handles_uint32_wrap() -> None:
@@ -118,6 +125,39 @@ def test_bridge_clock_clamps_future_projection() -> None:
     clock.observe(_BOOT, 1_000, 10.0)
 
     assert clock.to_ha_time(_BOOT, 2_000, _CLAMPED_RECV_TIME) == _CLAMPED_RECV_TIME
+
+
+def test_bridge_clock_rejects_single_outlier_without_shifting_projection() -> None:
+    """One forged future timestamp cannot replace an established offset."""
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, 10.0)
+    clock.observe(_BOOT, 2_000, 11.0)
+
+    clock.observe(_BOOT, _OUTLIER_FUTURE_T, 12.0)
+
+    assert clock.to_ha_time(_BOOT, 3_000, 12.0) == pytest.approx(12.0)
+
+
+def test_bridge_clock_reseeds_after_two_consistent_outliers() -> None:
+    """A confirmed wall-clock step replaces the stale correlation offset."""
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, 10.0)
+    clock.observe(_BOOT, 2_000, 11.0)
+
+    clock.observe(_BOOT, 3_000, _CLOCK_STEP_RECV_TIME)
+    assert clock.to_ha_time(
+        _BOOT,
+        3_000,
+        _INTERMEDIATE_PROJECTION_RECV_TIME,
+    ) == pytest.approx(12.0)
+
+    clock.observe(_BOOT, 4_000, _CLOCK_STEP_RECV_TIME + 1.0)
+
+    assert clock.to_ha_time(
+        _BOOT,
+        4_500,
+        _CLOCK_STEP_RECV_TIME + 1.5,
+    ) == pytest.approx(_CLOCK_STEP_RECV_TIME + 1.5)
 
 
 def test_ledger_pending_then_confirmed_matches_full_envelope() -> None:
@@ -198,11 +238,13 @@ def _consumer(
     dispatched: list[HeardEvent],
     proofs: list[str],
     now_value: list[float],
+    bridge_clocks: dict[str, BridgeClock] | None = None,
 ) -> StateSyncConsumer:
     """Build a deterministic consumer around mutable observation lists."""
+    clocks = {} if bridge_clocks is None else bridge_clocks
     return StateSyncConsumer(
         ledger=ledger,
-        clock=BridgeClock(),
+        clock_resolver=lambda bridge_id: clocks.setdefault(bridge_id, BridgeClock()),
         dispatch=dispatched.append,
         on_emission_proof=proofs.append,
         now=lambda: now_value[0],
@@ -225,6 +267,28 @@ def test_consumer_dispatches_fresh_press() -> None:
             bridge_id=_BRIDGE_A,
         ),
     ]
+
+
+def test_consumer_resolves_independent_clock_per_bridge() -> None:
+    """Alternating bridge boots retain separate time correlations."""
+    now_value = [100.0]
+    bridge_clocks: dict[str, BridgeClock] = {}
+    consumer = _consumer(CommandLedger(), [], [], now_value, bridge_clocks)
+
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), 100.0)
+    now_value[0] = 100.1
+    consumer.handle_rx(_BRIDGE_B, _BOOT + 1, 9_000, _frame((1,), "DOWN"), 100.1)
+    now_value[0] = 101.0
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 2_000, _frame((1,), "STOP"), 101.0)
+    now_value[0] = 101.1
+    consumer.handle_rx(_BRIDGE_B, _BOOT + 1, 10_000, _frame((2,), "UP"), 101.1)
+
+    assert bridge_clocks[_BRIDGE_A].to_ha_time(_BOOT, 2_500, 101.5) == pytest.approx(101.5)
+    assert bridge_clocks[_BRIDGE_B].to_ha_time(
+        _BOOT + 1,
+        10_500,
+        101.6,
+    ) == pytest.approx(101.6)
 
 
 def test_consumer_exact_event_deduplicates_normalized_frame() -> None:
@@ -270,6 +334,36 @@ def test_consumer_suppresses_confirmed_peer_echo_and_records_proof() -> None:
     consumer = _consumer(ledger, dispatched, proofs, [10.0])
 
     consumer.handle_rx(_BRIDGE_B, _BOOT, 1_000, _frame((1,), "UP"), 10.0)
+
+    assert dispatched == []
+    assert proofs == ["command-1"]
+
+
+def test_consumer_projects_delayed_echo_before_observing_sample() -> None:
+    """Delivery delay cannot move an echo outside its confirmed window."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.confirm("command-1", 101.0)
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, 100.0)
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    consumer = StateSyncConsumer(
+        ledger=ledger,
+        clock_resolver=lambda _bridge_id: clock,
+        dispatch=dispatched.append,
+        on_emission_proof=proofs.append,
+        now=lambda: 116.0,
+    )
+
+    consumer.handle_rx(_BRIDGE_B, _BOOT, 2_000, _frame((1,), "UP"), 116.0)
 
     assert dispatched == []
     assert proofs == ["command-1"]
@@ -365,6 +459,58 @@ def test_consumer_resumes_retired_hold_as_press() -> None:
     consumer.resume_holds("command-1")
 
     assert [event.button for event in dispatched] == ["STOP"]
+
+
+def test_consumer_drops_resumed_hold_older_than_overlapping_press() -> None:
+    """Releasing a hold cannot overwrite a newer overlapping press."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    dispatched: list[HeardEvent] = []
+    now_value = [10.0]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), 10.0)
+
+    now_value[0] = 11.0
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 2_000, _frame((1, 2), "DOWN"), 11.0)
+    ledger.retire("command-1")
+    consumer.resume_holds("command-1")
+
+    assert [event.button for event in dispatched] == ["DOWN"]
+
+
+def test_consumer_projects_fresh_press_at_receipt_after_long_quiet_gap() -> None:
+    """A serially ambiguous quiet gap cannot create an ancient press time."""
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, 100.0)
+    recv_time = 100.0 + _LONG_QUIET_GAP_SECONDS
+    raw_t = (1_000 + _LONG_QUIET_GAP_SECONDS * _MILLISECONDS_PER_SECOND) & _UINT32_MAX
+    dispatched: list[HeardEvent] = []
+    consumer = StateSyncConsumer(
+        ledger=CommandLedger(),
+        clock_resolver=lambda _bridge_id: clock,
+        dispatch=dispatched.append,
+        on_emission_proof=lambda _command_id: None,
+        now=lambda: recv_time,
+    )
+
+    consumer.handle_rx(_BRIDGE_A, _BOOT, raw_t, _frame((1,), "UP"), recv_time)
+
+    assert dispatched[0].heard_at == pytest.approx(recv_time)
+
+
+def test_normalize_frame_rejects_oversized_raw_input() -> None:
+    """The raw-size guard rejects huge input before whitespace normalization."""
+    frame = " " * _OVERSIZED_RAW_FRAME_LENGTH
+
+    assert len(frame) > state_sync_module._MAX_RAW_FRAME_LENGTH
+    assert StateSyncConsumer._normalize_frame(frame) is None
 
 
 def test_consumer_close_clears_state_and_stops_dispatch() -> None:

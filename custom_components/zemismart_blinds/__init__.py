@@ -138,7 +138,7 @@ def _handle_rx(runtime: DomainRuntime, message: ReceiveMessage) -> None:
     if not isinstance(decoded, Mapping):
         return
     payload = {str(key): value for key, value in decoded.items()}
-    runtime.hub.handle_rx(bridge_id, payload, message.timestamp)
+    runtime.hub.handle_rx(bridge_id, payload)
 
 
 def _create_domain_runtime(hass: HomeAssistant) -> DomainRuntime:

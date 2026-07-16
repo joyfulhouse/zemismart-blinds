@@ -50,6 +50,13 @@ _BRIDGE_STATE_CAP: Final = 256
 _FORGED_BRIDGE_COUNT: Final = 300
 _DISARM_RETRY_TEST_SECONDS: Final = 0.005
 _DISARM_TEST_DEADLINE_SECONDS: Final = 1.0
+_SEEDED_BRIDGE_T: Final = 10_000
+_STARTED_STATUS_T: Final = 10_250
+_STARTED_STATUS_AGE_MS: Final = 250
+_STARTED_DELIVERY_TIME: Final = 102.0
+_REPLAY_AGE_MS: Final = 600_000
+_REPLAY_STATUS_T: Final = 610_000
+_REPLAY_DELIVERY_TIME: Final = 700.0
 
 
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
@@ -442,6 +449,20 @@ def test_unmatched_and_malformed_statuses_cannot_acknowledge_a_command() -> None
         asyncio.run(hub.async_transmit(blind_config(), "UP"))
 
 
+def test_handle_status_drops_unhashable_status_value() -> None:
+    """A JSON list status is malformed input, not a callback exception."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+
+    assert not hub.handle_status(
+        "bridge-a",
+        {"status": [], "command_id": "command-1"},
+    )
+
+
 def test_started_timeout_after_acceptance_is_reported_as_ambiguous() -> None:
     """Admission without first RF dispatch cannot start or preserve a position estimate."""
     registry = BridgeRegistry()
@@ -487,7 +508,8 @@ def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> N
         observed.append((boot, t, recv_time))
 
     hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
-    monkeypatch.setattr(hub._clock, "observe", observe)
+    bridge_clock = hub._resolve_bridge_clock("bridge-a")
+    monkeypatch.setattr(bridge_clock, "observe", observe)
 
     result = asyncio.run(hub.async_transmit(blind_config(), "UP"))
 
@@ -554,7 +576,6 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     hub.handle_rx(
         "bridge-a",
         {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
-        _STATE_SYNC_RECV_TIME,
     )
 
     expected = HeardEvent(
@@ -570,6 +591,74 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     assert group_events == [expected]
     assert partial_events == [expected]
     assert disjoint_events == []
+
+
+def test_handle_rx_maintains_independent_bridge_clocks() -> None:
+    """Alternating bridge boots cannot replace one another's correlation."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    clock = {"now": 100.0}
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: clock["now"])
+    frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": frame, "t": 1_000, "boot": _STATE_SYNC_BOOT},
+    )
+    clock["now"] = 100.1
+    hub.handle_rx(
+        "bridge-b",
+        {"frame": frame, "t": 9_000, "boot": _STATE_SYNC_BOOT + 1},
+    )
+    clock["now"] = 101.0
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": frame, "t": 2_000, "boot": _STATE_SYNC_BOOT},
+    )
+    clock["now"] = 101.1
+    hub.handle_rx(
+        "bridge-b",
+        {"frame": frame, "t": 10_000, "boot": _STATE_SYNC_BOOT + 1},
+    )
+
+    assert hub._bridge_clocks["bridge-a"].to_ha_time(
+        _STATE_SYNC_BOOT,
+        2_500,
+        101.5,
+    ) == pytest.approx(101.5)
+    assert hub._bridge_clocks["bridge-b"].to_ha_time(
+        _STATE_SYNC_BOOT + 1,
+        10_500,
+        101.6,
+    ) == pytest.approx(101.6)
+
+
+def test_bridge_clock_resolver_evicts_least_recently_observed() -> None:
+    """Clock correlation stays bounded while retaining a recently used bridge."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    for index in range(models_module._BRIDGE_CLOCK_CAP):
+        hub._resolve_bridge_clock(f"bridge-{index}")
+    hub._resolve_bridge_clock("bridge-0")
+
+    hub._resolve_bridge_clock("bridge-new")
+
+    assert len(hub._bridge_clocks) == models_module._BRIDGE_CLOCK_CAP
+    assert "bridge-0" in hub._bridge_clocks
+    assert "bridge-1" not in hub._bridge_clocks
 
 
 def test_heard_press_from_a_different_remote_reaches_no_listener() -> None:
@@ -589,7 +678,6 @@ def test_heard_press_from_a_different_remote_reaches_no_listener() -> None:
     hub.handle_rx(
         "bridge-a",
         {"frame": foreign_frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
-        _STATE_SYNC_RECV_TIME,
     )
 
     assert events == []
@@ -620,7 +708,6 @@ def test_identical_identity_press_is_mirrored_accepted_residual_risk() -> None:
     hub.handle_rx(
         "bridge-c",
         {"frame": identical_frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
-        _STATE_SYNC_RECV_TIME,
     )
 
     assert events == [
@@ -673,7 +760,6 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
                 "t": _STATE_SYNC_T,
                 "boot": _STATE_SYNC_BOOT,
             },
-            clock["now"],
         )
 
         assert events == []
@@ -694,7 +780,6 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
                 "t": _STATE_SYNC_T + _LEDGER_STOP_AFTER_MS,
                 "boot": _STATE_SYNC_BOOT,
             },
-            clock["now"],
         )
         assert events == []
     finally:
@@ -738,7 +823,6 @@ async def test_unconfirmed_command_retires_ledger_and_releases_peer_hold(
                 "t": _STATE_SYNC_T,
                 "boot": _STATE_SYNC_BOOT,
             },
-            _STATE_SYNC_RECV_TIME,
         )
         assert events == []
         assert len(hub._state_sync._holds) == 1
@@ -785,9 +869,10 @@ def test_handle_rx_bounds_forged_bridge_ids() -> None:
     payload = {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT}
 
     for index in range(_FORGED_BRIDGE_COUNT):
-        hub.handle_rx(f"forged-{index}", payload, _STATE_SYNC_RECV_TIME)
+        hub.handle_rx(f"forged-{index}", payload)
 
     assert len(hub._rx_bridge_ids) == _BRIDGE_STATE_CAP
+    assert len(hub._bridge_clocks) == models_module._BRIDGE_CLOCK_CAP
     assert f"forged-{_FORGED_BRIDGE_COUNT - 1}" not in hub._rx_bridge_ids
 
 
@@ -801,6 +886,8 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
     events: list[HeardEvent] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     hub.register_rx_listener(remote_key, frozenset({1}), events.append)
+    bridge_clock = hub._resolve_bridge_clock("bridge-a")
+    bridge_clock.observe(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME)
     for index in range(_FORGED_BRIDGE_COUNT):
         hub._record_emission_proof(f"command-{index}")
 
@@ -809,6 +896,8 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
 
     assert not hub._rx_listeners
     assert not hub._rx_bridge_ids
+    assert not hub._bridge_clocks
+    assert not bridge_clock.can_project(_STATE_SYNC_BOOT)
     assert not hub._recent_emission_proofs
     frame = encode_b0(
         make_payload(
@@ -822,7 +911,6 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
     hub.handle_rx(
         "bridge-a",
         {"frame": frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
-        _STATE_SYNC_RECV_TIME,
     )
     assert events == []
 
@@ -1704,6 +1792,137 @@ async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
 
 
 @pytest.mark.asyncio
+async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
+    """A seeded bridge clock removes network delay from STARTED handoff time."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    clock = {"now": 100.0}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "age_ms": _STARTED_STATUS_AGE_MS,
+                "t": _STARTED_STATUS_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+        )
+
+    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    seed_frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
+    )
+    clock["now"] = _STARTED_DELIVERY_TIME
+
+    ack = await hub.async_transmit(blind_config(), "DOWN")
+
+    assert isinstance(ack, CommandAck)
+    assert ack.started_at == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
+async def test_started_status_without_seed_falls_back_to_delivery_age() -> None:
+    """An unseeded bridge uses receive time minus the reported bridge age."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "age_ms": _STARTED_STATUS_AGE_MS,
+                "t": _STARTED_STATUS_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+        )
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: _STARTED_DELIVERY_TIME,
+    )
+
+    ack = await hub.async_transmit(blind_config(), "DOWN")
+
+    assert isinstance(ack, CommandAck)
+    assert ack.started_at == pytest.approx(
+        _STARTED_DELIVERY_TIME - _STARTED_STATUS_AGE_MS / _MILLISECONDS_PER_SECOND
+    )
+
+
+@pytest.mark.asyncio
+async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
+    """A replay older than the projection clamp still back-dates by age_ms.
+
+    to_ha_time collapses any projection older than 30 s to receive time; a
+    QoS-1 replayed STARTED can be legitimately minutes old, so the clamped
+    projection must be rejected in favor of the recv - age baseline anchor
+    instead of anchoring the model at delivery time.
+    """
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    clock = {"now": 100.0}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "age_ms": _REPLAY_AGE_MS,
+                "t": _REPLAY_STATUS_T,
+                "boot": _STATE_SYNC_BOOT,
+            },
+        )
+
+    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    seed_frame = encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            (1,),
+            "UP",
+            bases=TEST_BASES,
+        )
+    )
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
+    )
+    clock["now"] = _REPLAY_DELIVERY_TIME
+
+    ack = await hub.async_transmit(blind_config(), "DOWN")
+
+    assert isinstance(ack, CommandAck)
+    assert ack.started_at == pytest.approx(
+        _REPLAY_DELIVERY_TIME - _REPLAY_AGE_MS / _MILLISECONDS_PER_SECOND
+    )
+
+
+@pytest.mark.asyncio
 async def test_stop_queues_behind_an_overlapping_queued_raw_frame() -> None:
     """A fast-lane STOP never jumps an earlier overlapping raw debug frame.
 
@@ -2002,7 +2221,6 @@ async def test_heard_press_invalidates_overlap_token_before_publish() -> None:
             "t": _STATE_SYNC_T,
             "boot": _STATE_SYNC_BOOT,
         },
-        _STATE_SYNC_RECV_TIME,
     )
     result = await hub.async_transmit(
         config,

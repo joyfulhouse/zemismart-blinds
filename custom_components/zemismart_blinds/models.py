@@ -73,12 +73,16 @@ _DISPLACED_MAX_ENTRIES: Final = 256
 _BRIDGE_AFFINITY_SECONDS: Final = 120.0
 _BRIDGE_MAX_ID_LENGTH: Final = 64
 _BRIDGE_MAX_ENTRIES: Final = 256
+_BRIDGE_CLOCK_CAP: Final = 64
 _EMISSION_PROOF_MEMORY_SECONDS: Final = 60.0
 _EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
 _EMISSION_PROOF_MAX_ENTRIES: Final = 256
 _DISARM_RETRY_SECONDS: Final = 0.25
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _UINT32_MAX: Final = (1 << 32) - 1
+_MAX_STARTED_AGE_MS: Final = 7_200_000
+_MILLISECONDS_PER_SECOND: Final = 1_000.0
+_STARTED_PROJECTION_TOLERANCE_SECONDS: Final = 30.0
 
 
 def _strict_uint32(value: object) -> int | None:
@@ -685,14 +689,14 @@ class ZemismartHub:
         self._started_timeout = started_timeout
         self._command_id_factory = command_id_factory or (lambda: uuid.uuid4().hex)
         self._now = now
-        self._clock = BridgeClock()
+        self._bridge_clocks: dict[str, BridgeClock] = {}
         self._ledger = CommandLedger()
         self._rx_listeners: list[_RxListener] = []
         self._rx_bridge_ids: dict[str, bool] = {}
         self._recent_emission_proofs: dict[str, float] = {}
         self._state_sync = StateSyncConsumer(
             ledger=self._ledger,
-            clock=self._clock,
+            clock_resolver=self._resolve_bridge_clock,
             dispatch=self._dispatch_heard,
             on_emission_proof=self._record_emission_proof,
             now=self._now,
@@ -801,9 +805,9 @@ class ZemismartHub:
         self,
         bridge_id: str,
         payload: Mapping[str, object],
-        recv_time: float,
     ) -> None:
         """Validate and classify one bridge RX contract payload."""
+        recv_time = self._now()
         frame_hex = payload.get("frame")
         t = _strict_uint32(payload.get("t"))
         boot = _strict_uint32(payload.get("boot"))
@@ -819,6 +823,16 @@ class ZemismartHub:
             frame_hex,
             recv_time,
         )
+
+    def _resolve_bridge_clock(self, bridge_id: str) -> BridgeClock:
+        """Return one recently observed bridge clock under a strict LRU cap."""
+        clock = self._bridge_clocks.pop(bridge_id, None)
+        if clock is None:
+            clock = BridgeClock()
+        self._bridge_clocks[bridge_id] = clock
+        while len(self._bridge_clocks) > _BRIDGE_CLOCK_CAP:
+            del self._bridge_clocks[next(iter(self._bridge_clocks))]
+        return clock
 
     def _admit_rx_bridge(self, bridge_id: str) -> str | None:
         """Bound bridge identities that may allocate state in the RX consumer."""
@@ -882,7 +896,8 @@ class ZemismartHub:
         raw_status = decoded.get("status")
         command_id = decoded.get("command_id")
         if (
-            raw_status not in {"accepted", "rejected", "started", "displaced", "disarmed"}
+            not isinstance(raw_status, str)
+            or raw_status not in {"accepted", "rejected", "started", "displaced", "disarmed"}
             or not isinstance(command_id, str)
             or not command_id
         ):
@@ -896,7 +911,7 @@ class ZemismartHub:
         if pending is None:
             return False
         if raw_status == "started":
-            return self._handle_started_status(pending, decoded)
+            return self._handle_started_status(bridge_id, pending, decoded)
         if pending.admission.done():
             return False
         raw_reason = decoded.get("reason")
@@ -928,6 +943,7 @@ class ZemismartHub:
 
     def _handle_started_status(
         self,
+        bridge_id: str,
         pending: _PendingStatuses,
         decoded: Mapping[str, object],
     ) -> bool:
@@ -937,13 +953,30 @@ class ZemismartHub:
         recv_time = self._now()
         t = _strict_uint32(decoded.get("t"))
         boot = _strict_uint32(decoded.get("boot"))
-        if t is not None and boot is not None:
-            self._clock.observe(boot, t, recv_time)
-        started_at = recv_time
         raw_age = decoded.get("age_ms")
-        if isinstance(raw_age, int) and not isinstance(raw_age, bool) and 0 < raw_age <= 7_200_000:
-            # QoS-1 replay reports the age of the original RF handoff.
-            started_at -= raw_age / 1_000
+        age_ms = (
+            raw_age
+            if isinstance(raw_age, int)
+            and not isinstance(raw_age, bool)
+            and 0 < raw_age <= _MAX_STARTED_AGE_MS
+            else 0
+        )
+        started_at = recv_time - age_ms / _MILLISECONDS_PER_SECOND
+        if t is not None and boot is not None:
+            clock = self._resolve_bridge_clock(bridge_id)
+            if clock.can_project(boot):
+                handoff_t = (t - age_ms) & _UINT32_MAX
+                projected = clock.to_ha_time(boot, handoff_t, recv_time)
+                # The projection refines the age-based estimate by removing
+                # network delivery delay — but a QoS-1 REPLAYED handoff can be
+                # legitimately hours old, and to_ha_time's plausibility clamp
+                # collapses any projection older than 30 s to recv_time.
+                # Accept the projection only when it corroborates the
+                # age-based estimate; otherwise keep recv - age (the shipped
+                # baseline anchor), never a clamped delivery-time anchor.
+                if abs(projected - started_at) <= _STARTED_PROJECTION_TOLERANCE_SECONDS:
+                    started_at = projected
+            clock.observe(boot, t, recv_time)
         pending.started.set_result(started_at)
         return True
 
@@ -1838,6 +1871,9 @@ class ZemismartHub:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
         self._closed = True
         self._state_sync.close()
+        for clock in self._bridge_clocks.values():
+            clock.clear()
+        self._bridge_clocks.clear()
         self._rx_listeners.clear()
         self._rx_bridge_ids.clear()
         self._recent_emission_proofs.clear()

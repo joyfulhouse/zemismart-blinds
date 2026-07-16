@@ -22,6 +22,8 @@ _UINT32_MASK: Final = _UINT32_MODULUS - 1
 _UINT32_HALF_RANGE: Final = _UINT32_MODULUS // 2
 _CLOCK_EMA_ALPHA: Final = 0.2
 _CLOCK_RESEED_RESIDUAL_SECONDS: Final = 30.0
+_CLOCK_LONG_GAP_SECONDS: Final = 1_036_800.0
+_CLOCK_MAX_PROJECTION_LAG_SECONDS: Final = 30.0
 
 _LEDGER_WINDOW_SLACK_SECONDS: Final = 0.75
 _LEDGER_ENTRY_TTL_SECONDS: Final = 60.0
@@ -38,6 +40,7 @@ _HOLD_TTL_SECONDS: Final = 30.0
 _HOLD_CAP: Final = 256
 _MAX_BRIDGE_ID_LENGTH: Final = 64
 _MAX_NORMALIZED_FRAME_LENGTH: Final = 520
+_MAX_RAW_FRAME_LENGTH: Final = 4 * _MAX_NORMALIZED_FRAME_LENGTH
 
 
 def frame_signature(frame_hex: str) -> FrameSignature | None:
@@ -53,6 +56,16 @@ def frame_signature(frame_hex: str) -> FrameSignature | None:
     return remote_key, frozenset(decoded["chans"]), button
 
 
+@dataclass(frozen=True, slots=True)
+class _ClockOutlier:
+    """Retain one unapplied offset outlier for next-sample confirmation."""
+
+    boot: int
+    raw_t: int
+    recv_time: float
+    implied_offset: float
+
+
 class BridgeClock:
     """Correlate one bridge's uint32 millisecond clock with HA time."""
 
@@ -62,11 +75,16 @@ class BridgeClock:
         self._raw_t: int | None = None
         self._unwrapped_seconds: float | None = None
         self._offset_seconds: float | None = None
+        self._last_recv_time: float | None = None
+        self._outlier: _ClockOutlier | None = None
 
     def observe(self, boot: int, t: int, recv_time: float) -> None:
         """Incorporate one ordered bridge timestamp sample into the EMA."""
         raw_t = t & _UINT32_MASK
         if self._boot is None or boot != self._boot:
+            self._seed(boot, raw_t, recv_time)
+            return
+        if self._is_long_gap(recv_time):
             self._seed(boot, raw_t, recv_time)
             return
 
@@ -75,6 +93,7 @@ class BridgeClock:
             self._seed(boot, raw_t, recv_time)
             return
         if raw_delta == 0 or raw_delta > _UINT32_HALF_RANGE:
+            self._outlier = None
             return
 
         previous_unwrapped = self._unwrapped_seconds
@@ -85,13 +104,27 @@ class BridgeClock:
         unwrapped = previous_unwrapped + raw_delta / _MILLISECONDS_PER_SECOND
         observed_offset = recv_time - unwrapped
         residual = observed_offset - previous_offset
-        if not math.isfinite(residual) or abs(residual) > _CLOCK_RESEED_RESIDUAL_SECONDS:
-            self._seed(boot, raw_t, recv_time)
+        if not math.isfinite(residual):
+            self._outlier = None
+            return
+        if abs(residual) > _CLOCK_RESEED_RESIDUAL_SECONDS:
+            self._record_or_confirm_outlier(boot, raw_t, recv_time, observed_offset)
             return
 
+        self._outlier = None
         self._raw_t = raw_t
         self._unwrapped_seconds = unwrapped
         self._offset_seconds = previous_offset + _CLOCK_EMA_ALPHA * residual
+        self._last_recv_time = recv_time
+
+    def can_project(self, boot: int) -> bool:
+        """Return whether this boot has a seeded HA-time correlation."""
+        return (
+            boot == self._boot
+            and self._raw_t is not None
+            and self._unwrapped_seconds is not None
+            and self._offset_seconds is not None
+        )
 
     def to_ha_time(self, boot: int, t: int, recv_time: float) -> float:
         """Project a bridge timestamp into HA time, never after receipt."""
@@ -106,7 +139,40 @@ class BridgeClock:
         projected = unwrapped + signed_delta / _MILLISECONDS_PER_SECOND + offset
         if not math.isfinite(projected):
             return recv_time
-        return min(projected, recv_time)
+        if projected > recv_time or projected < recv_time - _CLOCK_MAX_PROJECTION_LAG_SECONDS:
+            return recv_time
+        return projected
+
+    def _record_or_confirm_outlier(
+        self,
+        boot: int,
+        raw_t: int,
+        recv_time: float,
+        implied_offset: float,
+    ) -> None:
+        """Remember one offset outlier or reseed after a consistent successor."""
+        previous = self._outlier
+        if (
+            previous is not None
+            and previous.boot == boot
+            and math.isfinite(implied_offset)
+            and abs(implied_offset - previous.implied_offset) <= _CLOCK_RESEED_RESIDUAL_SECONDS
+        ):
+            self._seed(boot, raw_t, recv_time)
+            return
+        self._outlier = _ClockOutlier(
+            boot=boot,
+            raw_t=raw_t,
+            recv_time=recv_time,
+            implied_offset=implied_offset,
+        )
+
+    def _is_long_gap(self, recv_time: float) -> bool:
+        """Return whether serial ordering is unsafe after a quiet interval."""
+        return (
+            self._last_recv_time is not None
+            and recv_time - self._last_recv_time > _CLOCK_LONG_GAP_SECONDS
+        )
 
     def _seed(self, boot: int, raw_t: int, recv_time: float) -> None:
         """Reset the correlation from one receive-time sample."""
@@ -115,6 +181,8 @@ class BridgeClock:
         self._raw_t = raw_t
         self._unwrapped_seconds = unwrapped
         self._offset_seconds = recv_time - unwrapped
+        self._last_recv_time = recv_time
+        self._outlier = None
 
     def _forward_delta(self, raw_t: int) -> int:
         """Return the unsigned serial delta from the most recent sample."""
@@ -138,6 +206,8 @@ class BridgeClock:
         self._raw_t = None
         self._unwrapped_seconds = None
         self._offset_seconds = None
+        self._last_recv_time = None
+        self._outlier = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,14 +394,14 @@ class StateSyncConsumer:
         self,
         *,
         ledger: CommandLedger,
-        clock: BridgeClock,
+        clock_resolver: Callable[[str], BridgeClock],
         dispatch: Callable[[HeardEvent], None],
         on_emission_proof: Callable[[str], None],
         now: Callable[[], float],
     ) -> None:
         """Initialize the classifier with injected state and side effects."""
         self._ledger = ledger
-        self._clock = clock
+        self._clock_resolver = clock_resolver
         self._dispatch = dispatch
         self._on_emission_proof = on_emission_proof
         self._now = now
@@ -363,8 +433,9 @@ class StateSyncConsumer:
         signature = frame_signature(normalized_frame)
         if signature is None:
             return
-        self._clock.observe(boot, t, recv_time)
-        heard_at = self._clock.to_ha_time(boot, t, recv_time)
+        clock = self._clock_resolver(bridge_id)
+        heard_at = clock.to_ha_time(boot, t, recv_time)
+        clock.observe(boot, t, recv_time)
         self._classify(signature, heard_at, bridge_id, seen_at, hold_pending=True)
 
     def resume_holds(self, command_id: str) -> None:
@@ -397,11 +468,12 @@ class StateSyncConsumer:
         self._debounce.clear()
         self._holds.clear()
         self._ledger.clear()
-        self._clock.clear()
 
     @staticmethod
     def _normalize_frame(frame_hex: str) -> str | None:
         """Canonicalize a bounded capture for exact-event identity."""
+        if len(frame_hex) > _MAX_RAW_FRAME_LENGTH:
+            return None
         normalized = "".join(frame_hex.split()).upper()
         if not normalized or len(normalized) > _MAX_NORMALIZED_FRAME_LENGTH:
             return None
@@ -511,6 +583,14 @@ class StateSyncConsumer:
         seen_at: float,
     ) -> None:
         """Debounce and dispatch the first copy of a physical press."""
+        remote_key, channels, button = signature
+        if any(
+            recent_remote == remote_key
+            and not recent_channels.isdisjoint(channels)
+            and stamp.heard_at > heard_at
+            for (recent_remote, recent_channels, _recent_button), stamp in self._debounce.items()
+        ):
+            return
         previous = self._debounce.get(signature)
         if previous is not None and abs(heard_at - previous.heard_at) <= _DEBOUNCE_WINDOW_SECONDS:
             return
@@ -518,7 +598,6 @@ class StateSyncConsumer:
         self._debounce[signature] = _DebounceStamp(heard_at=heard_at, seen_at=seen_at)
         while len(self._debounce) > _DEBOUNCE_CAP:
             del self._debounce[next(iter(self._debounce))]
-        remote_key, channels, button = signature
         self._dispatch(
             HeardEvent(
                 button=button,
