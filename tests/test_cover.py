@@ -1145,9 +1145,12 @@ async def test_partial_heard_press_disarms_timed_command_before_unknown(
 
 
 @pytest.mark.asyncio
-async def test_heard_stop_does_not_disarm_timed_command(hass: HomeAssistant) -> None:
-    """A physical STOP freezes a timed model without disarming its scheduler."""
+async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
+    hass: HomeAssistant,
+) -> None:
+    """A whole-command abort makes an unpressed bound member honestly unknown."""
     published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -1155,6 +1158,97 @@ async def test_heard_stop_does_not_disarm_timed_command(hass: HomeAssistant) -> 
         published.append((topic, body))
         if topic.endswith("/tx"):
             acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "group-timed",
+    )
+    group = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    first = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=1, travel=5.0),
+        entry_id="entry-2",
+        entity_id="cover.living_room_channel_1",
+    )
+    second = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-3",
+        entity_id="cover.living_room_channel_2",
+    )
+    unbound = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=2, travel=5.0),
+        entry_id="entry-4",
+        entity_id="cover.unbound_channel_2",
+    )
+    for cover in (group, first, second, unbound):
+        cover._position = 20.0
+    try:
+        await group.async_set_cover_position(**{ATTR_POSITION: 40})
+        assert second._motion_command_id == "group-timed"
+        unbound._position = 65.0
+        unbound._clear_motion()
+        unbound._degraded = False
+
+        dispatch_heard_press(
+            hub,
+            group._config,
+            "UP",
+            (1,),
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        assert first.is_opening
+        assert group.current_cover_position is None
+        assert second.current_cover_position is None
+        assert unbound.current_cover_position == 65
+        assert unbound.extra_state_attributes["degraded_bridge"] is False
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "group-timed"},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "group-timed"},
+        )
+    finally:
+        await group.async_will_remove_from_hass()
+        await first.async_will_remove_from_hass()
+        await second.async_will_remove_from_hass()
+        await unbound.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_heard_stop_preserves_confirmed_timed_group_stop(
+    hass: HomeAssistant,
+) -> None:
+    """A partial physical STOP keeps the confirmed group's scheduled STOP."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    barrier_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        elif body["command_id"] == "publish-barrier":
+            assert hub.handle_status(
+                "bridge-a",
+                {"status": "disarmed", "command_id": "publish-barrier"},
+            )
+            barrier_published.set()
 
     hub = ZemismartHub(
         online_registry(),
@@ -1171,14 +1265,24 @@ async def test_heard_stop_does_not_disarm_timed_command(hass: HomeAssistant) -> 
             hub,
             cover._config,
             "STOP",
-            cover._config.channels,
+            (1,),
             at=cover_module.WALL_CLOCK(),
         )
-        await asyncio.sleep(0)
+        hub.request_disarm(
+            "bridge-a",
+            "publish-barrier",
+            hub._now() + 1.0,
+            lambda: None,
+        )
+        await asyncio.wait_for(barrier_published.wait(), timeout=1.0)
 
-        assert cover.current_cover_position is not None
-        assert not cover.is_opening
-        assert not [item for item in published if item[0].endswith("/cmd")]
+        assert cover.current_cover_position is None
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "publish-barrier"},
+            )
+        ]
     finally:
         await cover.async_will_remove_from_hass()
         hub.close()

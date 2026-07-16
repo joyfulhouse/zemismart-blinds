@@ -206,6 +206,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             frozenset(self._config.channels),
             self._on_heard_press,
             prepare=self._prepare_heard_press,
+            invalidate=self._on_command_invalidated,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
@@ -412,6 +413,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return
         if self._motion_timed:
             self._interrupt_motion(WALL_CLOCK())
+            self.async_write_ha_state()
+
+    @callback
+    def _on_command_invalidated(self, command_id: str) -> None:
+        """Discard a model whose whole command was aborted by another channel."""
+        if command_id and command_id == self._motion_command_id:
+            self._mark_unknown()
             self.async_write_ha_state()
 
     @callback

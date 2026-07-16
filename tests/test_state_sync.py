@@ -340,8 +340,18 @@ def test_ledger_finds_only_live_overlapping_commands() -> None:
     ledger.displace("displaced", _LEDGER_DISPLACED_TIME)
 
     assert ledger.live_overlapping(_REMOTE_KEY, frozenset({1})) == (
-        (_BRIDGE_A, "matching"),
-        (_BRIDGE_B, "started"),
+        state_sync_module.LiveCommand(
+            bridge_id=_BRIDGE_A,
+            command_id="matching",
+            channels=frozenset({1}),
+            confirmed=False,
+        ),
+        state_sync_module.LiveCommand(
+            bridge_id=_BRIDGE_B,
+            command_id="started",
+            channels=frozenset({1}),
+            confirmed=True,
+        ),
     )
 
 

@@ -45,6 +45,7 @@ from .state_sync import (
     CommandLedger,
     HeardEvent,
     LedgerFrameSpec,
+    LiveCommand,
     StateSyncConsumer,
     frame_signature,
 )
@@ -581,6 +582,7 @@ class _RxListener:
     channels: frozenset[int]
     callback: Callable[[HeardEvent], None]
     prepare: Callable[[HeardEvent], None] | None = None
+    invalidate: Callable[[str], None] | None = None
 
 
 @dataclass(slots=True)
@@ -805,9 +807,10 @@ class ZemismartHub:
         callback: Callable[[HeardEvent], None],
         *,
         prepare: Callable[[HeardEvent], None] | None = None,
+        invalidate: Callable[[str], None] | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
-        listener = _RxListener(remote_key, channels, callback, prepare)
+        listener = _RxListener(remote_key, channels, callback, prepare, invalidate)
 
         def unsubscribe() -> None:
             with suppress(ValueError):
@@ -903,19 +906,40 @@ class ZemismartHub:
     def _request_takeover_disarms(self, event: HeardEvent) -> None:
         """Best-effort abort live overlapping RF work on physical takeover."""
         deadline = self._now() + _PRESTART_DISARM_DEADLINE_SECONDS
-        for bridge_id, command_id in self._ledger.live_overlapping(
+        for command in self._ledger.live_overlapping(
             event.remote_key,
             event.chans,
         ):
-            existing = self._disarm_requests.get((bridge_id, command_id))
+            if event.button == "STOP" and command.confirmed:
+                continue
+            if event.button in {"UP", "DOWN"} and command.confirmed:
+                self._invalidate_unpressed_listeners(event, command)
+            existing = self._disarm_requests.get((command.bridge_id, command.command_id))
             if existing is not None and not existing.waiter.done():
                 continue
             self.request_disarm(
-                bridge_id,
-                command_id,
+                command.bridge_id,
+                command.command_id,
                 deadline,
                 self._ignore_takeover_disarm_timeout,
             )
+
+    def _invalidate_unpressed_listeners(
+        self,
+        event: HeardEvent,
+        command: LiveCommand,
+    ) -> None:
+        """Invalidate covers wholly outside a press that aborts their command."""
+        unpressed = command.channels - event.chans
+        if not unpressed:
+            return
+        for listener in tuple(self._rx_listeners):
+            if (
+                listener.remote_key == event.remote_key
+                and listener.channels <= unpressed
+                and listener.invalidate is not None
+            ):
+                listener.invalidate(command.command_id)
 
     @staticmethod
     def _ignore_takeover_disarm_timeout() -> None:
@@ -1808,6 +1832,9 @@ class ZemismartHub:
         self._rebuild_from_live_contributors(command)
         self._raise_if_overlap_displaced(command)
         self._raise_if_press_displaced(command)
+        pending = self._pending.get((bridge_id, command_id))
+        if pending is not None:
+            pending.channels = command.channels
         body = dict(command.body)
         body["command_id"] = command_id
         payload = json.dumps(body, separators=(",", ":"))

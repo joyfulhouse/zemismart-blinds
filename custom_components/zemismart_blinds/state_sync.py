@@ -223,6 +223,16 @@ class LedgerFrameSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class LiveCommand:
+    """Identify one pending or confirmed live command overlapping a takeover."""
+
+    bridge_id: str
+    command_id: str
+    channels: frozenset[int]
+    confirmed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _LedgerWindow:
     """Hold one confirmed signature's inclusive HA-time window."""
 
@@ -291,10 +301,15 @@ class CommandLedger:
         self,
         remote_key: str,
         channels: frozenset[int],
-    ) -> tuple[tuple[str, str], ...]:
-        """Return bridge/command keys for live overlapping transmissions."""
+    ) -> tuple[LiveCommand, ...]:
+        """Return identities and phases for live overlapping transmissions."""
         return tuple(
-            (entry.bridge_id, entry.command_id)
+            LiveCommand(
+                bridge_id=entry.bridge_id,
+                command_id=entry.command_id,
+                channels=frozenset(entry.channels),
+                confirmed=entry.phase == "confirmed",
+            )
             for entry in self._entries.values()
             if (entry.phase == "pending" or (entry.phase == "confirmed" and not entry.displaced))
             and not channels.isdisjoint(entry.channels)

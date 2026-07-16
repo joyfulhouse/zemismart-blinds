@@ -974,8 +974,8 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
 
 
 @pytest.mark.asyncio
-async def test_heard_press_disarms_published_unstarted_command() -> None:
-    """A physical press atomically aborts an admitted command before RF start."""
+async def test_heard_stop_disarms_published_unstarted_command() -> None:
+    """A physical STOP outranks an admitted command before its RF start."""
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, dict[str, Any]]] = []
@@ -1004,7 +1004,7 @@ async def test_heard_press_disarms_published_unstarted_command() -> None:
 
         hub._dispatch_heard(
             HeardEvent(
-                button="UP",
+                button="STOP",
                 chans=frozenset(config.channels),
                 remote_key=config.remote.key,
                 heard_at=_STATE_SYNC_RECV_TIME,
@@ -3369,6 +3369,64 @@ async def test_ledger_registers_the_final_under_lock_coalesced_frame(
 
     assert isinstance(await first, CommandAck)
     assert [event.chans for event in events] == [frozenset({1, 2})]
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_started_stamp_uses_final_under_lock_coalesced_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled contributor cannot leave a stale commanded-start channel."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    enqueued = asyncio.Event()
+    rebuilt = asyncio.Event()
+
+    async def publish(_topic: str, payload: str) -> None:
+        published.append(json.loads(payload))
+        enqueued.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "final-started-channels",
+        now=lambda: _STATE_SYNC_RECV_TIME,
+    )
+    original_rebuild = hub._rebuild_from_live_contributors
+
+    def record_rebuild(command: Any) -> None:
+        original_rebuild(command)
+        rebuilt.set()
+
+    monkeypatch.setattr(hub, "_rebuild_from_live_contributors", record_rebuild)
+    first_config = config_with_window(replace(blind_config(), channels=(1,)), 10)
+    second_config = config_with_window(replace(blind_config(), channels=(2,)), 10)
+    hub.register_rx_listener(first_config.remote.key, frozenset({1, 2}), events.append)
+
+    async with hub._publish_lock:
+        first = asyncio.create_task(hub.async_transmit(first_config, "UP"))
+        second = asyncio.create_task(hub.async_transmit(second_config, "UP"))
+        await rebuilt.wait()
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+    await enqueued.wait()
+    accept_and_start(hub, "bridge-a", published[0])
+    assert isinstance(await first, CommandAck)
+    older_at = _STATE_SYNC_RECV_TIME - 1.0
+    seen_at = _STATE_SYNC_RECV_TIME + 1.0
+    for channels in (frozenset({2}), frozenset({1})):
+        hub._state_sync._dispatch_press(
+            (first_config.remote.key, channels, "DOWN"),
+            older_at,
+            "bridge-b",
+            seen_at,
+        )
+
+    assert [event.chans for event in events] == [frozenset({2})]
     hub.close()
 
 
