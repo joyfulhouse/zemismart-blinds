@@ -287,16 +287,16 @@ class CommandLedger:
         entry.windows = windows
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
 
-    def pending_overlapping(
+    def live_overlapping(
         self,
         remote_key: str,
         channels: frozenset[int],
     ) -> tuple[tuple[str, str], ...]:
-        """Return bridge/command keys for pending overlapping transmissions."""
+        """Return bridge/command keys for live overlapping transmissions."""
         return tuple(
             (entry.bridge_id, entry.command_id)
             for entry in self._entries.values()
-            if entry.phase == "pending"
+            if (entry.phase == "pending" or (entry.phase == "confirmed" and not entry.displaced))
             and not channels.isdisjoint(entry.channels)
             and any(frame.signature[0] == remote_key for frame in entry.frames)
         )

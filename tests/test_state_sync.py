@@ -294,8 +294,8 @@ def test_ledger_retire_and_gc_remove_entries() -> None:
     assert ledger.match(signature, 10.25) is None
 
 
-def test_ledger_finds_only_pending_overlapping_commands() -> None:
-    """Pre-start takeover targets only pending commands on the pressed channels."""
+def test_ledger_finds_only_live_overlapping_commands() -> None:
+    """Takeover targets pending and non-displaced confirmed overlaps."""
     ledger = CommandLedger()
     first = _required_signature((1,), "DOWN")
     second = _required_signature((2,), "DOWN")
@@ -329,8 +329,20 @@ def test_ledger_finds_only_pending_overlapping_commands() -> None:
         [LedgerFrameSpec(first, offset_ms=0, airtime_ms=500)],
     )
     ledger.confirm("started", _LEDGER_HANDOFF_TIME)
+    ledger.register_pending(
+        "displaced",
+        _BRIDGE_B,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(first, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.confirm("displaced", _LEDGER_HANDOFF_TIME)
+    ledger.displace("displaced", _LEDGER_DISPLACED_TIME)
 
-    assert ledger.pending_overlapping(_REMOTE_KEY, frozenset({1})) == ((_BRIDGE_A, "matching"),)
+    assert ledger.live_overlapping(_REMOTE_KEY, frozenset({1})) == (
+        (_BRIDGE_A, "matching"),
+        (_BRIDGE_B, "started"),
+    )
 
 
 def test_ledger_enforces_per_bridge_and_global_caps() -> None:

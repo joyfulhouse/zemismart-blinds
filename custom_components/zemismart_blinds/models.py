@@ -554,10 +554,12 @@ class _BridgeStatus:
 
 @dataclass(slots=True)
 class _PendingStatuses:
-    """The two lightweight lifecycle waiters for one correlated command."""
+    """Lifecycle waiters and RF identity for one correlated command."""
 
     admission: asyncio.Future[_BridgeStatus]
     started: asyncio.Future[float]
+    remote_key: str | None
+    channels: frozenset[int]
 
 
 @dataclass(slots=True)
@@ -887,30 +889,37 @@ class ZemismartHub:
             event.remote_key,
             event.chans & configured_channels,
         )
-        self._request_prestart_disarms(event)
         for listener in listeners:
             if listener.prepare is not None:
                 listener.prepare(event)
+        # Listener-owned requests carry command-specific safety deadlines.
+        # Register them first, then fill any ledger-only gaps (a confirmed
+        # STOP after its cover fields were frozen, or a raw command) without
+        # widening an existing request to the generic takeover deadline.
+        self._request_takeover_disarms(event)
         for listener in listeners:
             listener.callback(event)
 
-    def _request_prestart_disarms(self, event: HeardEvent) -> None:
-        """Atomically abort published overlapping commands before their RF start."""
+    def _request_takeover_disarms(self, event: HeardEvent) -> None:
+        """Best-effort abort live overlapping RF work on physical takeover."""
         deadline = self._now() + _PRESTART_DISARM_DEADLINE_SECONDS
-        for bridge_id, command_id in self._ledger.pending_overlapping(
+        for bridge_id, command_id in self._ledger.live_overlapping(
             event.remote_key,
             event.chans,
         ):
+            existing = self._disarm_requests.get((bridge_id, command_id))
+            if existing is not None and not existing.waiter.done():
+                continue
             self.request_disarm(
                 bridge_id,
                 command_id,
                 deadline,
-                self._ignore_disarm_timeout,
+                self._ignore_takeover_disarm_timeout,
             )
 
     @staticmethod
-    def _ignore_disarm_timeout() -> None:
-        """Ignore expiry of a best-effort pre-start physical takeover."""
+    def _ignore_takeover_disarm_timeout() -> None:
+        """Ignore expiry of a best-effort physical takeover."""
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -1040,6 +1049,12 @@ class ZemismartHub:
                 ):
                     started_at = projected
             clock.observe(boot, t, recv_time)
+        if pending.remote_key is not None:
+            self._state_sync.record_commanded_start(
+                pending.remote_key,
+                pending.channels,
+                started_at,
+            )
         pending.started.set_result(started_at)
         return True
 
@@ -1593,6 +1608,8 @@ class ZemismartHub:
         self,
         bridge: BridgeInfo,
         command_id: str,
+        remote_key: str | None,
+        channels: frozenset[int],
     ) -> _PendingStatuses:
         """Register admission and start correlation before MQTT publication."""
         key = (bridge.bridge_id, command_id)
@@ -1600,7 +1617,12 @@ class ZemismartHub:
             msg = f"duplicate pending command_id {command_id!r} for {bridge.bridge_id!r}"
             raise ValueError(msg)
         loop = asyncio.get_running_loop()
-        pending = _PendingStatuses(loop.create_future(), loop.create_future())
+        pending = _PendingStatuses(
+            admission=loop.create_future(),
+            started=loop.create_future(),
+            remote_key=remote_key,
+            channels=channels,
+        )
         self._pending[key] = pending
         return pending
 
@@ -1781,6 +1803,8 @@ class ZemismartHub:
         command_id: str,
     ) -> None:
         """Finalize synchronously in the publisher task, then enqueue to paho."""
+        if all(future.done() for future in command.futures):
+            raise CommandDisplacedError(command.target)
         self._rebuild_from_live_contributors(command)
         self._raise_if_overlap_displaced(command)
         self._raise_if_press_displaced(command)
@@ -1846,7 +1870,12 @@ class ZemismartHub:
         else:
             bridge = self._resolve_with_affinity(command)
         command_id = self._new_command_id()
-        pending = self._register_pending(bridge, command_id)
+        pending = self._register_pending(
+            bridge,
+            command_id,
+            command.remote.key if command.remote is not None else None,
+            command.channels,
+        )
         key = (bridge.bridge_id, command_id)
         ledger_confirmed = False
         _LOGGER.debug(
@@ -1865,12 +1894,6 @@ class ZemismartHub:
             )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
-            if command.remote is not None:
-                self._state_sync.record_commanded_start(
-                    command.remote.key,
-                    command.channels,
-                    started_at,
-                )
             if command.ledger_registered:
                 self._ledger.confirm(command_id, started_at)
                 ledger_confirmed = True
@@ -1879,6 +1902,8 @@ class ZemismartHub:
             # Pop on EVERY exit, including an immediate publish transport
             # error, so a failed command never leaks its pending entry.
             self._pending.pop(key, None)
+            if pending.started.done() and not pending.started.cancelled():
+                pending.started.exception()
             if command.ledger_registered and not ledger_confirmed:
                 self._ledger.retire(command_id)
                 self._state_sync.resume_holds(command_id)
