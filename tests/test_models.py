@@ -24,6 +24,7 @@ from custom_components.zemismart_blinds.models import (
     CommandStartedTimeoutError,
     NoOnlineBridgeError,
     RemoteIdentity,
+    TakeoverCoverState,
     ZemismartHub,
     parse_channels,
 )
@@ -791,8 +792,8 @@ def test_dispatch_heard_supersedes_only_matched_configured_channels() -> None:
     }
 
 
-def test_dispatch_heard_prepares_all_listeners_before_callbacks() -> None:
-    """Every matched listener snapshots state before any callback mutates it."""
+def test_dispatch_heard_gathers_all_listener_state_before_callbacks() -> None:
+    """Every matched listener exposes live state before callbacks mutate it."""
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -800,17 +801,22 @@ def test_dispatch_heard_prepares_all_listeners_before_callbacks() -> None:
     hub = ZemismartHub(BridgeRegistry(), publish)
     calls: list[str] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+
+    def takeover_state(name: str) -> TakeoverCoverState:
+        calls.append(f"{name} state")
+        return TakeoverCoverState(None, None, None, None, False)
+
     hub.register_rx_listener(
         remote_key,
         frozenset({1, 2}),
         lambda _event: calls.append("group callback"),
-        prepare=lambda _event: calls.append("group prepare"),
+        takeover_state=lambda: takeover_state("group"),
     )
     hub.register_rx_listener(
         remote_key,
         frozenset({1}),
         lambda _event: calls.append("member callback"),
-        prepare=lambda _event: calls.append("member prepare"),
+        takeover_state=lambda: takeover_state("member"),
     )
 
     hub._dispatch_heard(
@@ -824,8 +830,8 @@ def test_dispatch_heard_prepares_all_listeners_before_callbacks() -> None:
     )
 
     assert calls == [
-        "group prepare",
-        "member prepare",
+        "group state",
+        "member state",
         "group callback",
         "member callback",
     ]
@@ -1306,7 +1312,7 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
+async def test_disarm_retries_are_deduped_by_bridge_and_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Duplicate takeover requests share one retry task and one waiter."""
@@ -1317,7 +1323,6 @@ async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
     )
     published: list[tuple[str, dict[str, Any]]] = []
     acknowledged = asyncio.Event()
-    timeout_calls: list[str] = []
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -1329,12 +1334,9 @@ async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
 
     hub = ZemismartHub(BridgeRegistry(), publish)
     deadline = hub._now() + _DISARM_TEST_DEADLINE_SECONDS
-
-    def on_timeout() -> None:
-        timeout_calls.append("timeout")
-
-    hub.request_disarm("bridge-a", "timed-command", deadline, on_timeout)
-    hub.request_disarm("bridge-a", "timed-command", deadline, on_timeout)
+    request = hub._start_disarm_request("bridge-a", "timed-command", deadline)
+    joined = hub._start_disarm_request("bridge-a", "timed-command", deadline)
+    assert joined is request
     try:
         await asyncio.wait_for(acknowledged.wait(), timeout=_DISARM_TEST_DEADLINE_SECONDS)
         await asyncio.sleep(_DISARM_RETRY_TEST_SECONDS)
@@ -1349,7 +1351,7 @@ async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
             ]
             * 3
         )
-        assert timeout_calls == []
+        assert request.waiter.done() and not request.waiter.cancelled()
     finally:
         hub.close()
 
@@ -1357,33 +1359,23 @@ async def test_request_disarm_retries_are_deduped_by_bridge_and_command(
 @pytest.mark.asyncio
 async def test_joined_disarm_extends_deadline_for_a_late_ack() -> None:
     """A shared waiter accepts an ack after the first requester's deadline."""
-    timeout_calls: list[str] = []
 
     async def publish(_topic: str, _payload: str) -> None:
         return
 
     hub = ZemismartHub(BridgeRegistry(), publish)
     now = hub._now()
-
-    def short_timeout() -> None:
-        timeout_calls.append("short")
-
-    def long_timeout() -> None:
-        timeout_calls.append("long")
-
-    hub.request_disarm(
+    request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         now + _DISARM_SHORT_DEADLINE_SECONDS,
-        short_timeout,
     )
-    hub.request_disarm(
+    joined = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         now + _DISARM_LONG_DEADLINE_SECONDS,
-        long_timeout,
     )
-    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    assert joined is request
     task = request.task
     assert task is not None
     try:
@@ -1392,49 +1384,39 @@ async def test_joined_disarm_extends_deadline_for_a_late_ack() -> None:
         await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
 
         assert request.waiter.done() and not request.waiter.cancelled()
-        assert timeout_calls == []
     finally:
         hub.close()
 
 
 @pytest.mark.asyncio
-async def test_joined_disarm_fires_all_timeouts_at_widest_deadline() -> None:
-    """Every deduped requester times out at the maximum shared deadline."""
+async def test_joined_disarm_times_out_at_widest_deadline() -> None:
+    """One deduped request times out at the maximum shared deadline."""
     loop = asyncio.get_running_loop()
     started_at = loop.time()
-    timeout_calls: list[tuple[str, float]] = []
 
     async def publish(_topic: str, _payload: str) -> None:
         return
 
     hub = ZemismartHub(BridgeRegistry(), publish)
     now = hub._now()
-
-    def record_timeout(name: str) -> None:
-        timeout_calls.append((name, loop.time() - started_at))
-
-    hub.request_disarm(
+    request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         now + _DISARM_SHORT_DEADLINE_SECONDS,
-        lambda: record_timeout("short"),
     )
-    hub.request_disarm(
+    joined = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         now + _DISARM_LONG_DEADLINE_SECONDS,
-        lambda: record_timeout("long"),
     )
-    request = hub._disarm_requests[("bridge-a", "timed-command")]
+    assert joined is request
     task = request.task
     assert task is not None
     try:
         await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
 
-        assert [name for name, _elapsed in timeout_calls] == ["short", "long"]
-        assert all(
-            elapsed >= _DISARM_TIMEOUT_LOWER_BOUND_SECONDS for _name, elapsed in timeout_calls
-        )
+        assert loop.time() - started_at >= _DISARM_TIMEOUT_LOWER_BOUND_SECONDS
+        assert request.waiter.cancelled()
     finally:
         hub.close()
 
@@ -1451,27 +1433,24 @@ async def test_disarm_does_not_republish_while_puback_is_pending(
     )
     published: list[str] = []
     puback = asyncio.Event()
-    timed_out = asyncio.Event()
 
     async def publish(_topic: str, payload: str) -> None:
         published.append(payload)
         await puback.wait()
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    hub.request_disarm(
+    request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         hub._now() + _DISARM_PENDING_DEADLINE_SECONDS,
-        timed_out.set,
     )
-    request = hub._disarm_requests[("bridge-a", "timed-command")]
     task = request.task
     assert task is not None
     try:
-        await asyncio.wait_for(timed_out.wait(), timeout=_DISARM_TEST_DEADLINE_SECONDS)
         await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
 
         assert len(published) == 1
+        assert request.waiter.cancelled()
     finally:
         hub.close()
 
@@ -1496,13 +1475,11 @@ async def test_disarm_retry_backoff_doubles_and_caps(
 
     hub = ZemismartHub(BridgeRegistry(), publish)
     monkeypatch.setattr(hub, "_wait_for_disarm_retry", record_retry)
-    hub.request_disarm(
+    request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
-        lambda: None,
     )
-    request = hub._disarm_requests[("bridge-a", "timed-command")]
     task = request.task
     assert task is not None
     try:
@@ -1523,13 +1500,11 @@ async def test_close_cancels_disarm_task_and_waiter_before_publish() -> None:
         published.append((topic, payload))
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    hub.request_disarm(
+    request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
-        lambda: None,
     )
-    request = hub._disarm_requests[("bridge-a", "timed-command")]
     task = request.task
     assert task is not None
 
@@ -2108,11 +2083,10 @@ async def test_execute_drains_started_exception_after_prestart_disarm() -> None:
             return
         body: dict[str, Any] = json.loads(payload)
         command_id = str(body["command_id"])
-        hub.request_disarm(
+        hub._start_disarm_request(
             "bridge-a",
             command_id,
             hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
-            lambda: None,
         )
         assert hub.handle_status(
             "bridge-a",
@@ -2249,11 +2223,10 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         "bridge-a",
         {"status": "displaced", "command_id": "displaced-disarmed"},
     )
-    hub.request_disarm(
+    hub._start_disarm_request(
         "bridge-a",
         "displaced-disarmed",
         _DISPLACED_AT + _DISARM_TEST_DEADLINE_SECONDS,
-        lambda: None,
     )
     assert hub.handle_status(
         "bridge-a",
@@ -2394,13 +2367,12 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_disarm_after_resolved_waiter_starts_fresh_request() -> None:
+async def test_disarm_after_resolved_waiter_starts_fresh_request() -> None:
     """A takeover after a completed disarm gets its own live request.
 
     Joining a request whose waiter already resolved would strand the new
-    requester: the finished task never retries and never fires timeouts.
+    requester: the finished task never retries or reaches the new deadline.
     """
-    timeout_calls: list[str] = []
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -2408,27 +2380,25 @@ async def test_request_disarm_after_resolved_waiter_starts_fresh_request() -> No
     hub = ZemismartHub(BridgeRegistry(), publish)
     now = hub._now()
 
-    hub.request_disarm(
+    old_request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         now + _DISARM_LONG_DEADLINE_SECONDS,
-        lambda: timeout_calls.append("first"),
     )
-    old_request = hub._disarm_requests[("bridge-a", "timed-command")]
     # Resolve the first request and re-request in the SAME loop step, before
     # the old task's finally block can clear its slot.
     hub.on_disarmed("bridge-a", "timed-command")
-    hub.request_disarm(
+    new_request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
         hub._now() + _DISARM_SHORT_DEADLINE_SECONDS,
-        lambda: timeout_calls.append("second"),
     )
     try:
-        new_request = hub._disarm_requests[("bridge-a", "timed-command")]
         assert new_request is not old_request
-        await asyncio.sleep(_DISARM_TIMEOUT_LOWER_BOUND_SECONDS)
-        assert timeout_calls == ["second"]
+        task = new_request.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+        assert new_request.waiter.cancelled()
     finally:
         hub.close()
 

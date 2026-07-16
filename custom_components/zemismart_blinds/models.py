@@ -12,7 +12,6 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from functools import partial
 from typing import Final, Literal, cast
 
 from .calibrations import KNOWN_CALIBRATIONS
@@ -46,7 +45,6 @@ from .state_sync import (
     CommandLedger,
     HeardEvent,
     LedgerFrameSpec,
-    LiveCommand,
     StateSyncConsumer,
     frame_signature,
 )
@@ -568,12 +566,39 @@ class _PendingStatuses:
 class _DisarmRequest:
     """One deadline-bounded disarm waiter shared by duplicate requests."""
 
+    bridge_id: str
+    command_id: str
     waiter: asyncio.Future[None]
     deadline: float
     loop_deadline: float
-    on_timeouts: list[Callable[[], None]]
-    on_resolves: list[Callable[[], None]]
+    command_channels: frozenset[int] = frozenset()
+    pressed_channels: set[int] = field(default_factory=set)
+    remote_key: str | None = None
+    command_button: str | None = None
     task: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TakeoverCoverState:
+    """Expose one cover's live state to takeover targeting and resolution."""
+
+    bridge_id: str | None
+    command_id: str | None
+    button: Button | None
+    disarm_deadline: float | None
+    stopped_by_heard: bool
+
+
+@dataclass(slots=True)
+class _TakeoverTarget:
+    """Merge ledger and cover-owned evidence for one live command."""
+
+    bridge_id: str
+    command_id: str
+    channels: frozenset[int]
+    button: str
+    confirmed: bool | None
+    owned_deadline: float | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -583,9 +608,8 @@ class _RxListener:
     remote_key: str
     channels: frozenset[int]
     callback: Callable[[HeardEvent], None]
-    prepare: Callable[[HeardEvent], None] | None = None
-    invalidate: Callable[[str], None] | None = None
-    disarm_timeout: Callable[[], None] | None = None
+    takeover_state: Callable[[], TakeoverCoverState] | None = None
+    invalidate_takeover: Callable[[], None] | None = None
 
 
 @dataclass(slots=True)
@@ -813,18 +837,16 @@ class ZemismartHub:
         channels: frozenset[int],
         callback: Callable[[HeardEvent], None],
         *,
-        prepare: Callable[[HeardEvent], None] | None = None,
-        invalidate: Callable[[str], None] | None = None,
-        disarm_timeout: Callable[[], None] | None = None,
+        takeover_state: Callable[[], TakeoverCoverState] | None = None,
+        invalidate_takeover: Callable[[], None] | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
         listener = _RxListener(
             remote_key,
             channels,
             callback,
-            prepare,
-            invalidate,
-            disarm_timeout,
+            takeover_state,
+            invalidate_takeover,
         )
 
         def unsubscribe() -> None:
@@ -907,109 +929,155 @@ class ZemismartHub:
             event.remote_key,
             event.chans & configured_channels,
         )
-        for listener in listeners:
-            if listener.prepare is not None:
-                listener.prepare(event)
-        # Listener-owned requests carry command-specific safety deadlines.
-        # Register them first, then fill any ledger-only gaps (a confirmed
-        # STOP after its cover fields were frozen, or a raw command) without
-        # widening an existing request to the generic takeover deadline.
-        self._request_takeover_disarms(event)
+        self._request_takeover_disarms(event, listeners)
         for listener in listeners:
             listener.callback(event)
 
-    def _request_takeover_disarms(self, event: HeardEvent) -> None:
-        """Best-effort abort live overlapping RF work on physical takeover."""
-        now = self._now()
-        deadline = now + _PRESTART_DISARM_DEADLINE_SECONDS
-        for command in self._ledger.live_overlapping(
-            event.remote_key,
-            event.chans,
-            now,
-        ):
-            if event.button == "STOP" and command.confirmed:
-                continue
-            pressed = event.button in {"UP", "DOWN"} and command.confirmed
-            on_timeout = self._ignore_takeover_disarm_timeout
-            on_resolve: Callable[[], None] | None = None
-            if pressed:
-                if command.button in {"UP", "DOWN"}:
-                    self._invalidate_unpressed_listeners(event, command)
-                    on_resolve = partial(self._invalidate_unpressed_listeners, event, command)
-                on_timeout = self._pressed_disarm_timeout(event, command)
-            key = (command.bridge_id, command.command_id)
-            existing = self._disarm_requests.get(key)
-            if existing is not None and not existing.waiter.done():
-                # Merge the pressed-cover consequence into the live request
-                # instead of discarding it: a cover-owned request only carries
-                # the covers still modeling the command at prepare time, and a
-                # later press must not lose its failure hook. The deadline is
-                # deliberately untouched (never widened to the generic bound).
-                if pressed:
-                    existing.on_timeouts.append(on_timeout)
-                if on_resolve is not None:
-                    existing.on_resolves.append(on_resolve)
-                continue
-            self.request_disarm(
-                command.bridge_id,
-                command.command_id,
-                deadline,
-                on_timeout,
-            )
-            request = self._disarm_requests.get(key)
-            if request is not None and on_resolve is not None:
-                request.on_resolves.append(on_resolve)
-
-    def _pressed_disarm_timeout(
+    def _request_takeover_disarms(
         self,
         event: HeardEvent,
-        command: LiveCommand,
-    ) -> Callable[[], None]:
-        """Build a lazy cover consequence for one generic confirmed disarm.
-
-        A movement command threatens every cover on its channels, including
-        covers outside the press: its motors latched travel and losing the
-        disarm can preserve the old fail-safe STOP. A STOP command cannot move
-        an unpressed motor, so only listeners also intersecting the physical
-        press are threatened by its remaining frames. Resolve the listener set
-        only when the consequence fires so late attachments are included and
-        removed listeners disappear naturally.
-        """
-
-        def on_timeout() -> None:
-            movement_command = command.button in {"UP", "DOWN"}
-            for listener in tuple(self._rx_listeners):
-                if (
-                    listener.remote_key == event.remote_key
-                    and not listener.channels.isdisjoint(command.channels)
-                    and (movement_command or not listener.channels.isdisjoint(event.chans))
-                    and (hook := listener.disarm_timeout) is not None
-                ):
-                    hook()
-
-        return on_timeout
-
-    def _invalidate_unpressed_listeners(
-        self,
-        event: HeardEvent,
-        command: LiveCommand,
+        listeners: tuple[_RxListener, ...],
     ) -> None:
-        """Invalidate unpressed covers intersecting an aborted command."""
-        unpressed = command.channels - event.chans
-        if not unpressed:
+        """Gather, deduplicate, and disarm every live takeover target."""
+        if self._closed:
             return
+        now = self._now()
+        for target in self._takeover_targets(event, listeners, now):
+            key = (target.bridge_id, target.command_id)
+            request = self._disarm_requests.get(key)
+            if request is None or request.waiter.done():
+                deadline = target.owned_deadline
+                if deadline is None:
+                    deadline = now + _PRESTART_DISARM_DEADLINE_SECONDS
+                request = self._start_disarm_request(
+                    target.bridge_id,
+                    target.command_id,
+                    deadline,
+                )
+            self._merge_takeover_context(request, event, target)
+            self._evaluate_takeover_resolution(request, None)
+
+    def _takeover_targets(
+        self,
+        event: HeardEvent,
+        listeners: tuple[_RxListener, ...],
+        now: float,
+    ) -> tuple[_TakeoverTarget, ...]:
+        """Combine ledger overlaps with intersecting covers' modeled commands."""
+        targets: dict[tuple[str, str], _TakeoverTarget] = {}
+        for command in self._ledger.live_overlapping(event.remote_key, event.chans, now):
+            targets[(command.bridge_id, command.command_id)] = _TakeoverTarget(
+                bridge_id=command.bridge_id,
+                command_id=command.command_id,
+                channels=command.channels,
+                button=command.button,
+                confirmed=command.confirmed,
+            )
+        if event.button in {"UP", "DOWN"}:
+            self._merge_cover_owned_targets(targets, listeners)
+        return tuple(
+            target
+            for target in targets.values()
+            if self.command_takeover_live(target.command_id)
+            and not (event.button == "STOP" and target.confirmed is not False)
+        )
+
+    def _merge_cover_owned_targets(
+        self,
+        targets: dict[tuple[str, str], _TakeoverTarget],
+        listeners: tuple[_RxListener, ...],
+    ) -> None:
+        """Add cover-owned commands, widening shared commands to all members."""
+        for listener in listeners:
+            self._merge_cover_owned_target(targets, listener, create=True)
         for listener in tuple(self._rx_listeners):
-            if (
-                listener.remote_key == event.remote_key
-                and listener.channels.isdisjoint(event.chans)
-                and not listener.channels.isdisjoint(unpressed)
-                and listener.invalidate is not None
-            ):
-                listener.invalidate(command.command_id)
+            if listener not in listeners:
+                self._merge_cover_owned_target(targets, listener, create=False)
 
     @staticmethod
-    def _ignore_takeover_disarm_timeout() -> None:
-        """Ignore expiry of a best-effort physical takeover."""
+    def _merge_cover_owned_target(
+        targets: dict[tuple[str, str], _TakeoverTarget],
+        listener: _RxListener,
+        *,
+        create: bool,
+    ) -> None:
+        """Merge one current cover state into a candidate command target."""
+        if listener.takeover_state is None:
+            return
+        state = listener.takeover_state()
+        if (
+            state.bridge_id is None
+            or state.command_id is None
+            or state.button is None
+            or state.disarm_deadline is None
+        ):
+            return
+        key = (state.bridge_id, state.command_id)
+        target = targets.get(key)
+        if target is None:
+            if create:
+                targets[key] = _TakeoverTarget(
+                    bridge_id=state.bridge_id,
+                    command_id=state.command_id,
+                    channels=listener.channels,
+                    button=state.button,
+                    confirmed=None,
+                    owned_deadline=state.disarm_deadline,
+                )
+            return
+        target.channels |= listener.channels
+        if target.owned_deadline is None:
+            target.owned_deadline = state.disarm_deadline
+        else:
+            target.owned_deadline = max(target.owned_deadline, state.disarm_deadline)
+
+    @staticmethod
+    def _merge_takeover_context(
+        request: _DisarmRequest,
+        event: HeardEvent,
+        target: _TakeoverTarget,
+    ) -> None:
+        """Accumulate current command channels and every pressed intersection."""
+        request.remote_key = event.remote_key
+        request.command_channels |= target.channels
+        request.command_button = target.button
+        request.pressed_channels.update(event.chans & target.channels)
+
+    def _evaluate_takeover_resolution(
+        self,
+        request: _DisarmRequest,
+        outcome: Literal["disarmed", "timed_out", "displaced"] | None,
+        *,
+        displaced_flushed: bool = False,
+    ) -> None:
+        """Apply the takeover truth table to current listeners and live state."""
+        if request.remote_key is None or request.command_button is None:
+            return
+        movement_command = request.command_button in {"UP", "DOWN"}
+        for listener in tuple(self._rx_listeners):
+            if (
+                listener.remote_key != request.remote_key
+                or listener.channels.isdisjoint(request.command_channels)
+                or listener.takeover_state is None
+                or listener.invalidate_takeover is None
+            ):
+                continue
+            state = listener.takeover_state()
+            if state.stopped_by_heard or (
+                state.command_id is not None and state.command_id != request.command_id
+            ):
+                continue
+            pressed = not listener.channels.isdisjoint(request.pressed_channels)
+            if outcome is None:
+                invalidate = movement_command and not pressed
+            elif pressed:
+                invalidate = outcome == "timed_out" or (
+                    outcome == "displaced" and displaced_flushed
+                )
+            else:
+                invalidate = movement_command
+            if invalidate:
+                listener.invalidate_takeover()
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -1092,9 +1160,11 @@ class ZemismartHub:
         self._state_sync.resume_holds(command_id)
         disarm_request = self._disarm_requests.get((bridge_id, command_id))
         if disarm_request is not None and not disarm_request.waiter.done():
-            if flushed:
-                for on_timeout in tuple(disarm_request.on_timeouts):
-                    on_timeout()
+            self._evaluate_takeover_resolution(
+                disarm_request,
+                "displaced",
+                displaced_flushed=flushed,
+            )
             disarm_request.waiter.set_result(None)
         self._remember_displaced(command_id)
         _LOGGER.debug("Bridge %s displaced command %s", bridge_id, command_id)
@@ -1166,8 +1236,7 @@ class ZemismartHub:
         self._resolve_disarmed_pending(bridge_id, command_id)
         self._ledger.release(command_id)
         self._state_sync.resume_holds(command_id)
-        for on_resolve in tuple(request.on_resolves):
-            on_resolve()
+        self._evaluate_takeover_resolution(request, "disarmed")
         request.waiter.set_result(None)
 
     def _resolve_disarmed_pending(self, bridge_id: str, command_id: str) -> None:
@@ -1181,16 +1250,13 @@ class ZemismartHub:
         elif not pending.started.done():
             pending.started.set_exception(error)
 
-    def request_disarm(
+    def _start_disarm_request(
         self,
         bridge_id: str,
         command_id: str,
         deadline: float,
-        on_timeout: Callable[[], None],
-    ) -> None:
-        """Schedule or join one deadline-bounded bridge disarm request."""
-        if self._closed:
-            return
+    ) -> _DisarmRequest:
+        """Start or join one request, replacing only a resolved predecessor."""
         loop = asyncio.get_running_loop()
         key = (bridge_id, command_id)
         existing = self._disarm_requests.get(key)
@@ -1200,22 +1266,21 @@ class ZemismartHub:
                 existing.loop_deadline,
                 loop.time() + max(0.0, deadline - self._now()),
             )
-            if on_timeout not in existing.on_timeouts:
-                existing.on_timeouts.append(on_timeout)
-            return
+            return existing
         remaining = max(0.0, deadline - self._now())
         request = _DisarmRequest(
+            bridge_id=bridge_id,
+            command_id=command_id,
             waiter=loop.create_future(),
             deadline=deadline,
             loop_deadline=loop.time() + remaining,
-            on_timeouts=[on_timeout],
-            on_resolves=[],
         )
         self._disarm_requests[key] = request
         request.task = asyncio.create_task(
             self._disarm(bridge_id, command_id, request),
             name=f"Zemismart disarm {bridge_id}/{command_id}",
         )
+        return request
 
     async def _disarm(
         self,
@@ -1245,10 +1310,7 @@ class ZemismartHub:
                     _DISARM_RETRY_MAX_SECONDS,
                 )
             if not self._closed and not request.waiter.done():
-                for on_resolve in tuple(request.on_resolves):
-                    on_resolve()
-                for on_timeout in tuple(request.on_timeouts):
-                    on_timeout()
+                self._evaluate_takeover_resolution(request, "timed_out")
         finally:
             if self._disarm_requests.get(key) is request:
                 del self._disarm_requests[key]

@@ -32,6 +32,7 @@ from .models import (
     CommandAckTimeoutError,
     CommandStartedTimeoutError,
     EntryRuntime,
+    TakeoverCoverState,
     ZemismartHub,
 )
 
@@ -135,8 +136,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._intent_generation = 0
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
         self._stopped_by_heard = False
-        self._restoring = False
-        self._restore_invalidated = False
         # Serializes this entity's own commands: without it, a set_position
         # racing an unstarted open/close computes travel from a stale
         # estimate and physically overshoots.
@@ -208,27 +207,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._config.remote.key,
             frozenset(self._config.channels),
             self._on_heard_press,
-            prepare=self._prepare_heard_press,
-            invalidate=self._on_command_invalidated,
-            disarm_timeout=self._on_takeover_disarm_timeout,
+            takeover_state=self._takeover_state,
+            invalidate_takeover=self._invalidate_for_takeover,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
-        self._restoring = True
-        try:
-            await self._async_restore_state()
-        finally:
-            self._restoring = False
-            if self._restore_invalidated:
-                self._mark_unknown()
-                self.async_write_ha_state()
-                self._restore_invalidated = False
+        restore_generation = self._intent_generation
+        await self._async_restore_state(restore_generation)
 
-    async def _async_restore_state(self) -> None:
+    async def _async_restore_state(self, restore_generation: int) -> None:
         """Restore one stopped estimate or complete started motion."""
         state = await self.async_get_last_state()
-        if state is None:
+        if state is None or restore_generation != self._intent_generation:
             return
         if state.attributes.get("remote") != self._config.remote_key or state.attributes.get(
             "channels"
@@ -380,12 +371,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         await super().async_will_remove_from_hass()
 
     @callback
-    def _prepare_heard_press(self, event: HeardEvent) -> None:
-        """Disarm a timed command before the heard-event batch mutates it."""
-        if event.button in {"UP", "DOWN"}:
-            self._request_takeover_disarm()
-
-    @callback
     def _on_heard_press(self, event: HeardEvent) -> None:
         """Mirror one intersecting physical press without transmitting."""
         channels = frozenset(self._config.channels)
@@ -429,18 +414,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return
         if self._motion_timed:
             self._interrupt_motion(WALL_CLOCK())
-            self.async_write_ha_state()
-
-    @callback
-    def _on_command_invalidated(self, command_id: str) -> None:
-        """Discard a model whose whole command was aborted by another channel."""
-        if command_id and (
-            command_id == self._motion_command_id or self._motion_command_id is None
-        ):
-            if self._restoring:
-                self._restore_invalidated = True
-                return
-            self._mark_unknown()
             self.async_write_ha_state()
 
     @callback
@@ -742,55 +715,34 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         # fully contained cover before or after it commits the same press.
         self.async_write_ha_state()
 
-    def _request_takeover_disarm(self) -> None:
-        """Snapshot and asynchronously disarm the motion being replaced."""
-        bridge_id = self._motion_bridge
-        command_id = self._motion_command_id
-        if bridge_id is None or command_id is None:
-            return
-        if not self._hub.command_takeover_live(command_id):
-            return
-        deadline = (
-            self._motion_deadline
-            if self._motion_timed
-            else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
-        )
-        self._hub.request_disarm(
-            bridge_id,
-            command_id,
-            deadline,
-            self._on_disarm_timeout,
+    def _takeover_state(self) -> TakeoverCoverState:
+        """Return current modeled-command and heard-STOP takeover state."""
+        button: Button | None = None
+        if self._direction > 0:
+            button = "UP"
+        elif self._direction < 0:
+            button = "DOWN"
+        disarm_deadline: float | None = None
+        if self._motion_bridge is not None and self._motion_command_id is not None:
+            disarm_deadline = (
+                self._motion_deadline
+                if self._motion_timed
+                else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+            )
+        return TakeoverCoverState(
+            bridge_id=self._motion_bridge,
+            command_id=self._motion_command_id,
+            button=button,
+            disarm_deadline=disarm_deadline,
+            stopped_by_heard=self._stopped_by_heard,
         )
 
     @callback
-    def _on_disarm_timeout(self) -> None:
-        """Invalidate a takeover if the old fail-safe STOP may have fired."""
+    def _invalidate_for_takeover(self) -> None:
+        """Apply one hub-classified takeover invalidation to this cover."""
         if self._unsubscribe_rx_listener is None:
             return
-        if self._restoring:
-            self._restore_invalidated = True
-            return
-        self._mark_unknown_and_notify_members()
-
-    @callback
-    def _on_takeover_disarm_timeout(self) -> None:
-        """Invalidate ONLY this entity when a generic takeover disarm is lost.
-
-        The hub's pressed-listener snapshot already selects exactly the covers
-        the un-disarmed command threatens; fanning out to members here would
-        re-invalidate covers the intersect-both filter deliberately excluded.
-        The whole-command fan-out stays with cover-owned requests
-        (_on_disarm_timeout above).
-        """
-        if (
-            self._unsubscribe_rx_listener is None
-            or self._motion_command_id is not None
-            or self._stopped_by_heard
-        ):
-            return
-        if self._restoring:
-            self._restore_invalidated = True
-            return
+        self._intent_generation += 1
         self._mark_unknown()
         self.async_write_ha_state()
 
@@ -1027,6 +979,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # aggregate says nothing about where an individual blind stopped.
             member._interrupt_motion(at)
             member._reconcile_unverified_anchor()
+            if provenance == "heard":
+                member._stopped_by_heard = True
             member.async_write_ha_state()
         if provenance == "commanded":
             # A heard STOP is already reconciled by every intersecting cover's
