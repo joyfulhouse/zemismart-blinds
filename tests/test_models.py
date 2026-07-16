@@ -572,6 +572,68 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     assert disjoint_events == []
 
 
+def test_heard_press_from_a_different_remote_reaches_no_listener() -> None:
+    """A press from a remote we do not manage never moves our covers."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    events: list[HeardEvent] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(remote_key, frozenset({1}), events.append)
+    foreign_frame = encode_b0(
+        make_payload(OTHER_PREFIX, OTHER_REMOTE_ID, (1,), "UP", bases=OTHER_BASES)
+    )
+
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": foreign_frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
+        _STATE_SYNC_RECV_TIME,
+    )
+
+    assert events == []
+
+
+def test_identical_identity_press_is_mirrored_accepted_residual_risk() -> None:
+    """A remote with our exact identity is indistinguishable and IS mirrored.
+
+    Documents the accepted trust-and-mirror residual (design §14 / finding 13):
+    RF carries no provenance, so a neighbour's remote sharing our 24-bit prefix
+    and 8-bit id decodes identically and cannot be told apart from ours. This is
+    a known, accepted limitation, not a bug — the assertion guards the behaviour.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    events: list[HeardEvent] = []
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    hub.register_rx_listener(remote_key, frozenset({1}), events.append)
+    # A press with our exact prefix/id from ANOTHER physical remote ("bridge-c"
+    # heard it) is byte-identical to our own remote's frame.
+    identical_frame = encode_b0(
+        make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES)
+    )
+
+    hub.handle_rx(
+        "bridge-c",
+        {"frame": identical_frame, "t": _STATE_SYNC_T, "boot": _STATE_SYNC_BOOT},
+        _STATE_SYNC_RECV_TIME,
+    )
+
+    assert events == [
+        HeardEvent(
+            button="UP",
+            chans=frozenset({1}),
+            remote_key=remote_key,
+            heard_at=_STATE_SYNC_RECV_TIME,
+            bridge_id="bridge-c",
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_pending_command_holds_peer_echo_until_started_confirmation() -> None:
     """A peer capture before STARTED is held, then classified as our echo."""
