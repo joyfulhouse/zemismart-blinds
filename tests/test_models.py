@@ -531,6 +531,42 @@ def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> N
     assert observed == [(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME)]
 
 
+@pytest.mark.asyncio
+async def test_rf_start_records_commanded_start_for_press_staleness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every correlated start records its remote channels and projected time."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    recorded: list[tuple[str, frozenset[int], float]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        accept_and_start(hub, "bridge-a", json.loads(payload))
+
+    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    monkeypatch.setattr(
+        hub._state_sync,
+        "record_commanded_start",
+        lambda remote_key, channels, started_at: recorded.append(
+            (remote_key, channels, started_at)
+        ),
+    )
+    config = blind_config()
+
+    result = await hub.async_transmit(config, "UP")
+
+    assert isinstance(result, CommandAck)
+    assert recorded == [
+        (
+            config.remote.key,
+            frozenset(config.channels),
+            _STATE_SYNC_RECV_TIME,
+        )
+    ]
+    hub.close()
+
+
 def test_disarmed_status_routes_to_separate_hook(monkeypatch: pytest.MonkeyPatch) -> None:
     """A disarmed status bypasses command-start pending state and routes directly."""
     routed: list[tuple[str, str]] = []
@@ -874,6 +910,63 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
             },
         )
         assert events == []
+    finally:
+        if not transmit.done():
+            transmit.cancel()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_press_disarms_published_unstarted_command() -> None:
+    """A physical press atomically aborts an admitted command before RF start."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[tuple[str, dict[str, Any]]] = []
+    tx_enqueued = asyncio.Event()
+    disarm_enqueued = asyncio.Event()
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, json.loads(payload)))
+        if topic.endswith("/tx"):
+            tx_enqueued.set()
+        else:
+            disarm_enqueued.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "published-unstarted",
+    )
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
+    transmit = asyncio.create_task(hub.async_transmit(config, "DOWN"))
+    try:
+        await tx_enqueued.wait()
+        tx_body = published[0][1]
+        assert hub.handle_status("bridge-a", accepted(tx_body))
+
+        hub._dispatch_heard(
+            HeardEvent(
+                button="UP",
+                chans=frozenset(config.channels),
+                remote_key=config.remote.key,
+                heard_at=_STATE_SYNC_RECV_TIME,
+                bridge_id="bridge-b",
+            )
+        )
+        await asyncio.wait_for(disarm_enqueued.wait(), timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "published-unstarted"},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "published-unstarted"},
+        )
+        assert await transmit == "superseded"
     finally:
         if not transmit.done():
             transmit.cancel()
@@ -1858,6 +1951,68 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
+    """A disarm ack preserves echo suppression for a displaced flushed STOP."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    clock = {"now": _STATE_SYNC_RECV_TIME}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            published.append(body)
+            accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "displaced-disarmed",
+        now=lambda: clock["now"],
+    )
+    config = blind_config()
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
+    result = await hub.async_transmit(
+        config,
+        "DOWN",
+        stop_after_ms=_DISPLACED_STOP_AFTER_MS,
+    )
+    assert isinstance(result, CommandAck)
+    body = published[0]
+
+    clock["now"] = _DISPLACED_AT
+    assert hub.handle_status(
+        "bridge-a",
+        {"status": "displaced", "command_id": "displaced-disarmed"},
+    )
+    hub.request_disarm(
+        "bridge-a",
+        "displaced-disarmed",
+        _DISPLACED_AT + _DISARM_TEST_DEADLINE_SECONDS,
+        lambda: None,
+    )
+    assert hub.handle_status(
+        "bridge-a",
+        {"status": "disarmed", "command_id": "displaced-disarmed"},
+    )
+
+    clock["now"] = _DISPLACED_FLUSH_AT
+    hub.handle_rx(
+        "bridge-b",
+        {
+            "frame": body["stop_raw"],
+            "t": _STATE_SYNC_T,
+            "boot": _STATE_SYNC_BOOT,
+        },
+    )
+
+    assert events == []
+    hub.close()
+
+
+@pytest.mark.asyncio
 async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> None:
     """A displaced arriving before the started awaiter resumes keeps the drain.
 
@@ -2755,6 +2910,47 @@ async def test_overlap_token_is_rechecked_after_waiting_for_publish_lock(
         )
 
     assert await transmit == "superseded"
+    assert published == []
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_heard_press_supersedes_full_move_before_publisher_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready press callback wins the final no-await check before paho enqueue."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    config = blind_config()
+    event = HeardEvent(
+        button="UP",
+        chans=frozenset(config.channels),
+        remote_key=config.remote.key,
+        heard_at=_STATE_SYNC_RECV_TIME,
+        bridge_id="bridge-b",
+    )
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
+    original_register_pending = hub._register_pending
+
+    def register_and_schedule_press(bridge: Any, command_id: str) -> Any:
+        pending = original_register_pending(bridge, command_id)
+        asyncio.get_running_loop().call_soon(hub._dispatch_heard, event)
+        return pending
+
+    monkeypatch.setattr(hub, "_register_pending", register_and_schedule_press)
+
+    result = await hub.async_transmit(config, "DOWN")
+
+    assert result == "superseded"
     assert published == []
     hub.close()
 

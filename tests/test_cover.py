@@ -816,6 +816,7 @@ async def test_heard_up_supersedes_timed_down_awaiting_started(
     """A delayed commanded ack cannot overwrite a newer physical press."""
     published: list[dict[str, Any]] = []
     admitted = asyncio.Event()
+    disarm_published = asyncio.Event()
     allow_started = asyncio.Event()
     hub: ZemismartHub
 
@@ -823,13 +824,20 @@ async def test_heard_up_supersedes_timed_down_awaiting_started(
         body: dict[str, Any] = json.loads(payload)
         published.append(body)
         bridge_id = topic.split("/")[1]
+        if topic.endswith("/cmd"):
+            assert hub.handle_status(
+                bridge_id,
+                {"status": "disarmed", "command_id": body["command_id"]},
+            )
+            disarm_published.set()
+            return
         assert hub.handle_status(
             bridge_id,
             {"status": "accepted", "command_id": body["command_id"]},
         )
         admitted.set()
         await allow_started.wait()
-        assert hub.handle_status(
+        assert not hub.handle_status(
             bridge_id,
             {"status": "started", "command_id": body["command_id"]},
         )
@@ -855,16 +863,74 @@ async def test_heard_up_supersedes_timed_down_awaiting_started(
         assert entity.is_opening
         assert entity._motion_command_id is None
 
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
         allow_started.set()
         await command
 
-        assert len(published) == 1
+        assert len(published) == 2
+        assert published[1] == {
+            "action": "disarm",
+            "command_id": published[0]["command_id"],
+        }
         assert entity.is_opening
         assert entity._motion_target == 100.0
         assert entity._motion_command_id is None
     finally:
         if not command.done():
             command.cancel()
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_opposite_press_disarms_started_full_move(
+    hass: HomeAssistant,
+) -> None:
+    """A physical reversal aborts an untimed move's remaining action repeats."""
+    published: list[tuple[str, dict[str, Any]]] = []
+    disarm_published = asyncio.Event()
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, body))
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+        else:
+            disarm_published.set()
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        command_id_factory=lambda: "full-down",
+    )
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 80.0
+    try:
+        await entity.async_close_cover()
+        assert not entity._motion_timed
+        assert entity._motion_command_id == "full-down"
+
+        dispatch_heard_press(
+            hub,
+            entity._config,
+            "UP",
+            entity._config.channels,
+            at=cover_module.WALL_CLOCK(),
+        )
+        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
+
+        assert [item for item in published if item[0].endswith("/cmd")] == [
+            (
+                "rf433/bridge-a/cmd",
+                {"action": "disarm", "command_id": "full-down"},
+            )
+        ]
+        assert hub.handle_status(
+            "bridge-a",
+            {"status": "disarmed", "command_id": "full-down"},
+        )
+    finally:
         await entity.async_will_remove_from_hass()
         hub.close()
 

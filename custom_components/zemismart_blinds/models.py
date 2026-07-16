@@ -79,7 +79,9 @@ _EMISSION_PROOF_MAX_ID_LENGTH: Final = 64
 _EMISSION_PROOF_MAX_ENTRIES: Final = 256
 _DISARM_RETRY_SECONDS: Final = 0.25
 _DISARM_RETRY_MAX_SECONDS: Final = 5.0
+_PRESTART_DISARM_DEADLINE_SECONDS: Final = 10.0
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
+_PRESS_SEQ_CAP: Final = 512
 _UINT32_MAX: Final = (1 << 32) - 1
 _MAX_STARTED_AGE_MS: Final = 7_200_000
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
@@ -585,6 +587,7 @@ class _Contributor:
 
     channels: frozenset[int]
     repeats: int
+    press_token: int
     futures: list[asyncio.Future[CommandResult]]
 
     @property
@@ -641,6 +644,9 @@ class _QueuedCommand:
     # publish sequence taken by the caller; the hub refuses to publish (as
     # "superseded") if any overlapping publication happened since.
     overlap_token: int | None = None
+    # Snapshot of the physical-press-only generation for every addressed
+    # channel. Unlike overlap_token, ordinary sibling publishes never change it.
+    press_token: int = 0
     # Set only after the final under-lock frame is registered immediately
     # before enqueue; execute cleanup uses it to confirm or retire the entry.
     ledger_registered: bool = False
@@ -717,6 +723,7 @@ class ZemismartHub:
         self._recent_displaced: dict[str, float] = {}
         self._bridge_affinity: dict[tuple[str, str], tuple[str, float]] = {}
         self._publish_seq: dict[tuple[str, int], int] = {}
+        self._press_seq: dict[tuple[str, int], int] = {}
         # Serializes just the synchronous broker enqueue so bridge-receipt
         # order matches request order without any command holding the order
         # barrier across a QoS-1 broker acknowledgment.
@@ -880,11 +887,30 @@ class ZemismartHub:
             event.remote_key,
             event.chans & configured_channels,
         )
+        self._request_prestart_disarms(event)
         for listener in listeners:
             if listener.prepare is not None:
                 listener.prepare(event)
         for listener in listeners:
             listener.callback(event)
+
+    def _request_prestart_disarms(self, event: HeardEvent) -> None:
+        """Atomically abort published overlapping commands before their RF start."""
+        deadline = self._now() + _PRESTART_DISARM_DEADLINE_SECONDS
+        for bridge_id, command_id in self._ledger.pending_overlapping(
+            event.remote_key,
+            event.chans,
+        ):
+            self.request_disarm(
+                bridge_id,
+                command_id,
+                deadline,
+                self._ignore_disarm_timeout,
+            )
+
+    @staticmethod
+    def _ignore_disarm_timeout() -> None:
+        """Ignore expiry of a best-effort pre-start physical takeover."""
 
     def _new_command_id(self) -> str:
         """Allocate a non-empty command ID suitable for status correlation."""
@@ -1026,9 +1052,21 @@ class ZemismartHub:
             or request.waiter.get_loop().time() >= request.loop_deadline
         ):
             return
-        self._ledger.retire(command_id)
+        self._resolve_disarmed_pending(bridge_id, command_id)
+        self._ledger.release(command_id)
         self._state_sync.resume_holds(command_id)
         request.waiter.set_result(None)
+
+    def _resolve_disarmed_pending(self, bridge_id: str, command_id: str) -> None:
+        """Displace the pending lifecycle future aborted by a disarm ack."""
+        pending = self._pending.get((bridge_id, command_id))
+        if pending is None:
+            return
+        error = CommandDisplacedError(command_id)
+        if not pending.admission.done():
+            pending.admission.set_exception(error)
+        elif not pending.started.done():
+            pending.started.set_exception(error)
 
     def request_disarm(
         self,
@@ -1130,7 +1168,9 @@ class ZemismartHub:
         async with self._publish_lock:
             if self._closed:
                 return None
-            publish_task, transport_error = await self._enqueue_publish(topic, payload)
+            publish_task, transport_error = await self._enqueue_publish(
+                self._publisher(topic, payload)
+            )
         if transport_error is not None:
             _LOGGER.warning("MQTT disarm publish failed: %s", transport_error)
         return publish_task
@@ -1149,12 +1189,27 @@ class ZemismartHub:
             return 0
         return sum(self._publish_seq.get((remote.key, channel), 0) for channel in channels)
 
+    def _press_generation(
+        self,
+        remote: RemoteIdentity | None,
+        channels: frozenset[int],
+    ) -> int:
+        """Sum the physical-press-only generations covering these channels."""
+        if remote is None:
+            return 0
+        return sum(self._press_seq.get((remote.key, channel), 0) for channel in channels)
+
     def _raise_if_overlap_displaced(self, command: _QueuedCommand) -> None:
         """Reject a multi-frame movement whose channel generation is stale."""
         if command.overlap_token is not None and command.overlap_token != self._overlap_seq(
             command.remote,
             command.channels,
         ):
+            raise CommandDisplacedError(command.target)
+
+    def _raise_if_press_displaced(self, command: _QueuedCommand) -> None:
+        """Reject any command enqueued before an overlapping physical press."""
+        if command.press_token != self._press_generation(command.remote, command.channels):
             raise CommandDisplacedError(command.target)
 
     def overlap_token(self, config: BlindConfig) -> int:
@@ -1168,10 +1223,14 @@ class ZemismartHub:
         return self._overlap_seq(config.remote, frozenset(config.channels))
 
     def _supersede_channels(self, remote_key: str, channels: frozenset[int]) -> None:
-        """Advance each physically pressed channel's publish generation."""
+        """Advance each physically pressed channel's command generations."""
         for channel in channels:
             key = (remote_key, channel)
             self._publish_seq[key] = self._publish_seq.get(key, 0) + 1
+            press_generation = self._press_seq.pop(key, 0) + 1
+            self._press_seq[key] = press_generation
+        while len(self._press_seq) > _PRESS_SEQ_CAP:
+            del self._press_seq[next(iter(self._press_seq))]
 
     def _record_publish(self, command: _QueuedCommand) -> None:
         """Advance every published channel's sequence number."""
@@ -1194,9 +1253,13 @@ class ZemismartHub:
             return
         channels: set[int] = set()
         repeats = 0
+        press_tokens: dict[int, int] = {}
         for contributor in live:
             channels.update(contributor.channels)
             repeats = max(repeats, contributor.repeats)
+            # Only single-cover, single-channel commands are coalescible.
+            press_tokens[next(iter(contributor.channels))] = contributor.press_token
+        command.press_token = sum(press_tokens.values())
         if frozenset(channels) == command.channels:
             return
         config = replace(
@@ -1485,6 +1548,7 @@ class ZemismartHub:
                     _Contributor(
                         channels=frozenset(queued.coalesce_config.channels),
                         repeats=queued.coalesce_config.repeats,
+                        press_token=queued.press_token,
                         futures=list(queued.futures),
                     )
                 )
@@ -1688,15 +1752,18 @@ class ZemismartHub:
         async with self._publish_lock:
             if all(future.done() for future in command.futures):
                 raise CommandDisplacedError(command.target)
-            # A contributor can cancel while this command waits for the publish
-            # lock. Rebuild again at the final no-await point before enqueue.
-            self._rebuild_from_live_contributors(command)
-            self._raise_if_overlap_displaced(command)
-            body = dict(command.body)
-            body["command_id"] = command_id
-            payload = json.dumps(body, separators=(",", ":"))
-            self._register_command_ledger(command, bridge_id, command_id)
-            _, transport_error = await self._enqueue_publish(topic, payload)
+            publisher_wrapper = self._finalize_and_publish(
+                command,
+                topic,
+                bridge_id,
+                command_id,
+            )
+            _, transport_error = await self._enqueue_publish(publisher_wrapper)
+        if isinstance(transport_error, CommandDisplacedError):
+            # A ready physical-press callback ran before the publisher task.
+            # Preserve displacement semantics instead of wrapping it as a
+            # transport failure.
+            raise transport_error
         if transport_error is not None:
             # An immediate transport failure (e.g. broker down) surfaces
             # fast instead of waiting out the admission timeout. The order
@@ -1706,13 +1773,29 @@ class ZemismartHub:
         if command.published is not None:
             command.published.set()
 
+    async def _finalize_and_publish(
+        self,
+        command: _QueuedCommand,
+        topic: str,
+        bridge_id: str,
+        command_id: str,
+    ) -> None:
+        """Finalize synchronously in the publisher task, then enqueue to paho."""
+        self._rebuild_from_live_contributors(command)
+        self._raise_if_overlap_displaced(command)
+        self._raise_if_press_displaced(command)
+        body = dict(command.body)
+        body["command_id"] = command_id
+        payload = json.dumps(body, separators=(",", ":"))
+        self._register_command_ledger(command, bridge_id, command_id)
+        await self._publisher(topic, payload)
+
     async def _enqueue_publish(
         self,
-        topic: str,
-        payload: str,
+        publish: Awaitable[None],
     ) -> tuple[asyncio.Task[None], BaseException | None]:
         """Start and track one broker enqueue without awaiting its QoS-1 ack."""
-        task: asyncio.Task[None] = asyncio.ensure_future(self._publisher(topic, payload))
+        task: asyncio.Task[None] = asyncio.ensure_future(publish)
         # Track the task BEFORE the yield so a cancellation during it
         # (e.g. final unload) cannot orphan an untracked publish that then
         # enqueues after teardown; close() cancels the tracked set.
@@ -1757,6 +1840,7 @@ class ZemismartHub:
         # Keep this cheap pre-lock fast-fail; _ordered_publish repeats it at the
         # authoritative final no-await point before enqueue.
         self._raise_if_overlap_displaced(command)
+        self._raise_if_press_displaced(command)
         if command.bridge_id is not None:
             bridge = self.registry.online_bridge(command.bridge_id)
         else:
@@ -1781,6 +1865,12 @@ class ZemismartHub:
             )
             status = await self._await_status(pending.admission, command_id)
             started_at = await self._await_started(pending.started, command_id)
+            if command.remote is not None:
+                self._state_sync.record_commanded_start(
+                    command.remote.key,
+                    command.channels,
+                    started_at,
+                )
             if command.ledger_registered:
                 self._ledger.confirm(command_id, started_at)
                 ledger_confirmed = True
@@ -1867,6 +1957,8 @@ class ZemismartHub:
         body = self._command_body(config, button, stop_after_ms=stop_after_ms)
         loop = asyncio.get_running_loop()
         enqueued_at = loop.time()
+        channels = frozenset(config.channels)
+        press_token = self._press_generation(config.remote, channels)
         # Only untimed full-travel opens/closes coalesce: merging two precise
         # timed partial moves into one shared frame would force one
         # stop_after_ms on both, and a timed move carries an overlap_token
@@ -1890,7 +1982,7 @@ class ZemismartHub:
                 is_movement=button in {"UP", "DOWN"},
                 is_stop=button == "STOP",
                 remote=config.remote,
-                channels=frozenset(config.channels),
+                channels=channels,
                 coalesce_config=config if coalesces else None,
                 coalesce_button=button if coalesces else None,
                 enqueued_at=enqueued_at,
@@ -1901,8 +1993,9 @@ class ZemismartHub:
                 contributors=(
                     [
                         _Contributor(
-                            channels=frozenset(config.channels),
+                            channels=channels,
                             repeats=config.repeats,
+                            press_token=press_token,
                             futures=[future],
                         )
                     ]
@@ -1910,6 +2003,7 @@ class ZemismartHub:
                     else []
                 ),
                 overlap_token=overlap_token,
+                press_token=press_token,
             )
         )
 
@@ -1922,6 +2016,7 @@ class ZemismartHub:
         decoded = decode_b0(normalized)
         remote = RemoteIdentity(decoded["prefix"], decoded["remote_id"])
         decoded_channels = tuple(cast("Iterable[int]", decoded["chans"]))
+        channels = frozenset(decoded_channels)
         target = remote.target_key(decoded_channels)
         result = await self._async_enqueue(
             _QueuedCommand(
@@ -1933,12 +2028,13 @@ class ZemismartHub:
                 is_movement=False,
                 is_stop=False,
                 remote=remote,
-                channels=frozenset(decoded_channels),
+                channels=channels,
                 coalesce_config=None,
                 coalesce_button=None,
                 enqueued_at=asyncio.get_running_loop().time(),
                 coalesce_deadline=None,
                 futures=[asyncio.get_running_loop().create_future()],
+                press_token=self._press_generation(remote, channels),
             )
         )
         if result == "superseded":
@@ -1983,6 +2079,7 @@ class ZemismartHub:
         self._fast_inflight.clear()
         self._recent_displaced.clear()
         self._bridge_affinity.clear()
+        self._press_seq.clear()
         for command in self._queue:
             for future in command.futures:
                 future.cancel()

@@ -37,6 +37,8 @@ _EXACT_EVENT_CAP: Final = 1_024
 _DEBOUNCE_WINDOW_SECONDS: Final = 1.5
 _DEBOUNCE_TTL_SECONDS: Final = 60.0
 _DEBOUNCE_CAP: Final = 512
+_COMMANDED_START_TTL_SECONDS: Final = 60.0
+_COMMANDED_START_CAP: Final = 512
 _HOLD_TTL_SECONDS: Final = 30.0
 _HOLD_CAP: Final = 256
 _MAX_BRIDGE_ID_LENGTH: Final = 64
@@ -285,9 +287,29 @@ class CommandLedger:
         entry.windows = windows
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
 
+    def pending_overlapping(
+        self,
+        remote_key: str,
+        channels: frozenset[int],
+    ) -> tuple[tuple[str, str], ...]:
+        """Return bridge/command keys for pending overlapping transmissions."""
+        return tuple(
+            (entry.bridge_id, entry.command_id)
+            for entry in self._entries.values()
+            if entry.phase == "pending"
+            and not channels.isdisjoint(entry.channels)
+            and any(frame.signature[0] == remote_key for frame in entry.frames)
+        )
+
     def retire(self, command_id: str) -> None:
         """Remove all frame state for one command."""
         self._entries.pop(command_id, None)
+
+    def release(self, command_id: str) -> None:
+        """Retire a command unless its displaced STOP drain is still active."""
+        entry = self._entries.get(command_id)
+        if entry is not None and not entry.displaced:
+            self.retire(command_id)
 
     def displace(self, command_id: str, now: float) -> None:
         """Retire unstarted RF or re-window a confirmed command's flushed STOPs."""
@@ -411,6 +433,14 @@ class _DebounceStamp:
     seen_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandedStartStamp:
+    """Retain commanded start and receipt times for stale-press rejection."""
+
+    started_at: float
+    seen_at: float
+
+
 _ExactEventKey = tuple[str, int, int, str]
 
 
@@ -434,6 +464,10 @@ class StateSyncConsumer:
         self._now = now
         self._exact_events: dict[_ExactEventKey, float] = {}
         self._debounce: dict[FrameSignature, _DebounceStamp] = {}
+        self._commanded_starts: dict[
+            tuple[str, frozenset[int]],
+            _CommandedStartStamp,
+        ] = {}
         self._holds: deque[_HeldCapture] = deque()
         self._closed = False
         self._ledger.gc(self._now())
@@ -488,11 +522,34 @@ class StateSyncConsumer:
             )
         self._maintain(seen_at)
 
+    def record_commanded_start(
+        self,
+        remote_key: str,
+        channels: frozenset[int],
+        started_at: float,
+    ) -> None:
+        """Record a commanded RF start that outranks older overlapping presses."""
+        if self._closed:
+            return
+        seen_at = self._now()
+        self._drop_expired_commanded_starts(seen_at)
+        key = (remote_key, channels)
+        previous = self._commanded_starts.pop(key, None)
+        if previous is not None:
+            started_at = max(started_at, previous.started_at)
+        self._commanded_starts[key] = _CommandedStartStamp(
+            started_at=started_at,
+            seen_at=seen_at,
+        )
+        while len(self._commanded_starts) > _COMMANDED_START_CAP:
+            del self._commanded_starts[next(iter(self._commanded_starts))]
+
     def close(self) -> None:
         """Clear all bounded state and prevent later callback delivery."""
         self._closed = True
         self._exact_events.clear()
         self._debounce.clear()
+        self._commanded_starts.clear()
         self._holds.clear()
         self._ledger.clear()
 
@@ -522,6 +579,7 @@ class StateSyncConsumer:
         self._ledger.gc(seen_at)
         self._drop_expired_exact_events(seen_at)
         self._drop_expired_debounce_stamps(seen_at)
+        self._drop_expired_commanded_starts(seen_at)
         expired_holds: list[_HeldCapture] = []
         retained_holds: deque[_HeldCapture] = deque()
         for capture in self._holds:
@@ -558,6 +616,16 @@ class StateSyncConsumer:
         ]
         for signature in expired:
             del self._debounce[signature]
+
+    def _drop_expired_commanded_starts(self, seen_at: float) -> None:
+        """Discard commanded-start stamps past their retention horizon."""
+        expired = [
+            key
+            for key, stamp in self._commanded_starts.items()
+            if seen_at - stamp.seen_at > _COMMANDED_START_TTL_SECONDS
+        ]
+        for key in expired:
+            del self._commanded_starts[key]
 
     def _classify(
         self,
@@ -616,6 +684,13 @@ class StateSyncConsumer:
             and not recent_channels.isdisjoint(channels)
             and stamp.heard_at > heard_at
             for (recent_remote, recent_channels, _recent_button), stamp in self._debounce.items()
+        ):
+            return
+        if any(
+            recent_remote == remote_key
+            and not recent_channels.isdisjoint(channels)
+            and stamp.started_at > heard_at
+            for (recent_remote, recent_channels), stamp in self._commanded_starts.items()
         ):
             return
         previous = self._debounce.get(signature)

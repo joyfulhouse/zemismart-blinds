@@ -6,7 +6,7 @@ import asyncio
 import time
 import weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.components.cover import (
     ATTR_CURRENT_POSITION,
@@ -59,6 +59,7 @@ _ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
 _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID = "unverified_anchor_command_id"
 _ATTR_UNVERIFIED_ANCHOR_OFFLINE = "unverified_anchor_offline"
 WALL_CLOCK = time.time
+_UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
 _COVERS: weakref.WeakKeyDictionary[ZemismartHub, weakref.WeakSet[ZemismartCover]] = (
     weakref.WeakKeyDictionary()
 )
@@ -712,12 +713,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
     def _request_takeover_disarm(self) -> None:
-        """Snapshot and asynchronously disarm the timed motion being replaced."""
+        """Snapshot and asynchronously disarm the motion being replaced."""
         bridge_id = self._motion_bridge
         command_id = self._motion_command_id
-        deadline = self._motion_deadline
-        if not self._motion_timed or bridge_id is None or command_id is None:
+        if bridge_id is None or command_id is None:
             return
+        deadline = (
+            self._motion_deadline
+            if self._motion_timed
+            else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+        )
         self._hub.request_disarm(
             bridge_id,
             command_id,

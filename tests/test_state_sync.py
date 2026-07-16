@@ -35,6 +35,10 @@ _LEDGER_DISPLACED_TIME: Final = 30.0
 _LEDGER_FLUSH_STOP_TIME: Final = 30.1
 _LEDGER_STOP_OFFSET_MS: Final = 60_000
 _LEDGER_ORIGINAL_STOP_TIME: Final = 70.1
+_OLDER_PRESS_TIME: Final = 100.0
+_COMMANDED_START_TIME: Final = 105.0
+_NEWER_PRESS_TIME: Final = 106.0
+_LATE_DELIVERY_TIME: Final = 110.0
 
 
 def _frame(channels: tuple[int, ...], button: str) -> str:
@@ -226,6 +230,37 @@ def test_ledger_displace_rewindows_only_confirmed_stop_frames() -> None:
     assert ledger.match(stop, _LEDGER_ORIGINAL_STOP_TIME) is None
 
 
+def test_ledger_release_preserves_a_displaced_stop_drain() -> None:
+    """A disarm ack cannot retire a displaced command's flushed STOP window."""
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "command-1",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=500),
+            LedgerFrameSpec(
+                stop,
+                offset_ms=_LEDGER_STOP_OFFSET_MS,
+                airtime_ms=500,
+            ),
+        ],
+    )
+    ledger.confirm("command-1", _LEDGER_HANDOFF_TIME)
+    ledger.displace("command-1", _LEDGER_DISPLACED_TIME)
+
+    ledger.release("command-1")
+
+    assert ledger.match(stop, _LEDGER_FLUSH_STOP_TIME) == (
+        "confirmed",
+        "command-1",
+        _BRIDGE_A,
+    )
+
+
 def test_ledger_displace_retires_a_pending_command() -> None:
     """A never-started displaced command cannot leave a pending echo hold."""
     ledger = CommandLedger()
@@ -257,6 +292,45 @@ def test_ledger_retire_and_gc_remove_entries() -> None:
     ledger.confirm("expired", 10.0)
     ledger.gc(1_000.0)
     assert ledger.match(signature, 10.25) is None
+
+
+def test_ledger_finds_only_pending_overlapping_commands() -> None:
+    """Pre-start takeover targets only pending commands on the pressed channels."""
+    ledger = CommandLedger()
+    first = _required_signature((1,), "DOWN")
+    second = _required_signature((2,), "DOWN")
+    foreign = ("123456:0d", frozenset({1}), "DOWN")
+    ledger.register_pending(
+        "matching",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(first, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.register_pending(
+        "disjoint",
+        _BRIDGE_A,
+        (2,),
+        "DOWN",
+        [LedgerFrameSpec(second, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.register_pending(
+        "foreign",
+        _BRIDGE_B,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(foreign, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.register_pending(
+        "started",
+        _BRIDGE_B,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(first, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.confirm("started", _LEDGER_HANDOFF_TIME)
+
+    assert ledger.pending_overlapping(_REMOTE_KEY, frozenset({1})) == ((_BRIDGE_A, "matching"),)
 
 
 def test_ledger_enforces_per_bridge_and_global_caps() -> None:
@@ -543,6 +617,33 @@ def test_consumer_drops_resumed_hold_older_than_overlapping_press() -> None:
     assert [event.button for event in dispatched] == ["DOWN"]
 
 
+def test_consumer_drops_press_older_than_overlapping_commanded_start() -> None:
+    """A late older physical capture cannot replace a newer commanded start."""
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(CommandLedger(), dispatched, [], [_LATE_DELIVERY_TIME])
+    signature = _required_signature((1,), "UP")
+    consumer.record_commanded_start(
+        _REMOTE_KEY,
+        frozenset({1}),
+        _COMMANDED_START_TIME,
+    )
+
+    consumer._dispatch_press(
+        signature,
+        _OLDER_PRESS_TIME,
+        _BRIDGE_A,
+        _LATE_DELIVERY_TIME,
+    )
+    consumer._dispatch_press(
+        signature,
+        _NEWER_PRESS_TIME,
+        _BRIDGE_A,
+        _LATE_DELIVERY_TIME,
+    )
+
+    assert [event.heard_at for event in dispatched] == [_NEWER_PRESS_TIME]
+
+
 def test_consumer_projects_fresh_press_at_receipt_after_long_quiet_gap() -> None:
     """A serially ambiguous quiet gap cannot create an ancient press time."""
     clock = BridgeClock()
@@ -576,9 +677,11 @@ def test_consumer_close_clears_state_and_stops_dispatch() -> None:
     dispatched: list[HeardEvent] = []
     consumer = _consumer(CommandLedger(), dispatched, [], [10.0])
     consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), 10.0)
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), 10.0)
 
     consumer.close()
     consumer.close()
     consumer.handle_rx(_BRIDGE_A, _BOOT, 2_000, _frame((1,), "DOWN"), 11.0)
 
     assert len(dispatched) == 1
+    assert consumer._commanded_starts == {}
