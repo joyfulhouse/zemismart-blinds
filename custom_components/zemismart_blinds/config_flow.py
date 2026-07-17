@@ -29,7 +29,10 @@ from .codec import (
 )
 from .const import (
     CONF_AREA_ID,
+    CONF_BASE_DOWN,
+    CONF_BASE_STOP,
     CONF_BASE_TRAILER,
+    CONF_BASE_UP,
     CONF_BRIDGE,
     CONF_CALIBRATION_BASE,
     CONF_CALIBRATION_BUTTON,
@@ -71,7 +74,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
     from homeassistant.components.mqtt.models import ReceiveMessage
-    from homeassistant.config_entries import ConfigFlowResult
+    from homeassistant.config_entries import ConfigFlowResult, SubentryFlowResult
     from homeassistant.core import HomeAssistant
 
     type Unsubscriber = Callable[[], None]
@@ -441,6 +444,30 @@ def _remote_settings_schema(suggested: Mapping[str, object] | None) -> vol.Schem
     )
 
 
+def _reconfigure_edit_schema(suggested: Mapping[str, object]) -> vol.Schema:
+    """Extend remote settings with editable command calibration bases."""
+    return _remote_settings_schema(suggested).extend(
+        {
+            vol.Required(
+                CONF_BASE_UP,
+                default=str(suggested.get(CONF_BASE_UP, "")),
+            ): selector.TextSelector(),
+            vol.Required(
+                CONF_BASE_DOWN,
+                default=str(suggested.get(CONF_BASE_DOWN, "")),
+            ): selector.TextSelector(),
+            vol.Required(
+                CONF_BASE_STOP,
+                default=str(suggested.get(CONF_BASE_STOP, "")),
+            ): selector.TextSelector(),
+            vol.Optional(
+                CONF_BASE_TRAILER,
+                default=str(suggested.get(CONF_BASE_TRAILER, "")),
+            ): selector.TextSelector(),
+        }
+    )
+
+
 def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
     """Build one wizard cover form: name, channels, optional travel times."""
     values = suggested or {}
@@ -532,10 +559,98 @@ def _learn_setup_schema(
     )
 
 
+def _sibling_covers(
+    entry: config_entries.ConfigEntry,
+    *,
+    exclude_subentry_id: str | None = None,
+) -> list[CoverConfig]:
+    """Parse every cover subentry of one entry except the excluded one."""
+    covers: list[CoverConfig] = []
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != "cover":
+            continue
+        if exclude_subentry_id is not None and subentry.subentry_id == exclude_subentry_id:
+            continue
+        with suppress(TypeError, ValueError):
+            covers.append(CoverConfig.from_subentry(subentry.data))
+    return covers
+
+
+class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
+    """Add or reconfigure one cover on an existing remote entry."""
+
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Add one cover subentry."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cover, errors = _validate_cover_input(
+                user_input,
+                _sibling_covers(self._get_entry()),
+            )
+            if cover is not None:
+                return self.async_create_entry(
+                    data=cover.as_dict(),
+                    title=cover.name,
+                    unique_id=cover.channel_key,
+                )
+        return self.async_show_form(
+            step_id="user",
+            data_schema=_cover_schema(user_input or {}),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> SubentryFlowResult:
+        """Reconfigure one cover while preserving hidden travel calibration."""
+        entry = self._get_entry()
+        subentry = self._get_reconfigure_subentry()
+        errors: dict[str, str] = {}
+        suggested: Mapping[str, object] = subentry.data
+        if user_input is not None:
+            merged = dict(user_input)
+            for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
+                stored = subentry.data.get(key)
+                if key not in merged and stored not in (None, ""):
+                    merged[key] = stored
+            cover, errors = _validate_cover_input(
+                merged,
+                _sibling_covers(entry, exclude_subentry_id=subentry.subentry_id),
+            )
+            if cover is not None:
+                return self.async_update_and_abort(
+                    entry,
+                    subentry,
+                    data=cover.as_dict(),
+                    title=cover.name,
+                    unique_id=cover.channel_key,
+                )
+            suggested = user_input
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=_cover_schema(suggested),
+            errors=errors,
+        )
+
+
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
     VERSION = 1
+
+    @classmethod
+    @callback
+    def async_get_supported_subentry_types(
+        cls,
+        config_entry: config_entries.ConfigEntry,
+    ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
+        """Expose per-cover subentry management on remote entries."""
+        del config_entry
+        return {"cover": CoverSubentryFlow}
 
     _capture: _LearnCapture | None = None
     _covers: list[CoverConfig] | None = None
@@ -548,6 +663,113 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _remote: RemoteConfig | None = None
     _sniff_session_id: str | None = None
     _sniff_task: asyncio.Task[Literal["captured", "timeout"]] | None = None
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer identity relearning or direct settings edits."""
+        del user_input
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["reconfigure_learn", "reconfigure_edit"],
+        )
+
+    async def async_step_reconfigure_learn(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Reuse guided capture to replace only the remote identity."""
+        del user_input
+        current = RemoteConfig.from_entry(self._get_reconfigure_entry().data)
+        self._learn_suggested = {
+            CONF_NAME: current.name,
+            CONF_AREA_ID: current.area_id,
+        }
+        self._learn_registry = None
+        return await self.async_step_learn_setup()
+
+    async def async_step_reconfigure_apply(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Apply a captured identity while preserving remote settings."""
+        del user_input
+        if self._identity is None:
+            return await self.async_step_reconfigure_learn()
+        entry = self._get_reconfigure_entry()
+        current = RemoteConfig.from_entry(entry.data)
+        updated = RemoteConfig(
+            name=current.name,
+            remote=self._identity,
+            area_id=current.area_id,
+            repeats=current.repeats,
+            coalesce_window_ms=current.coalesce_window_ms,
+        )
+        if any(
+            other.entry_id != entry.entry_id and other.unique_id == updated.key
+            for other in self.hass.config_entries.async_entries(DOMAIN)
+        ):
+            return self.async_abort(reason="already_configured")
+        return self.async_update_reload_and_abort(
+            entry,
+            title=updated.name,
+            unique_id=updated.key,
+            data=updated.as_dict(),
+        )
+
+    async def async_step_reconfigure_edit(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Edit remote settings and calibration without changing identity."""
+        entry = self._get_reconfigure_entry()
+        current = RemoteConfig.from_entry(entry.data)
+        errors: dict[str, str] = {}
+        suggested: Mapping[str, object] = current.as_dict()
+        if user_input is not None:
+            try:
+                flattened = _flatten_details(user_input)
+                suggested = flattened
+                raw_trailer = str(flattened.get(CONF_BASE_TRAILER, "")).strip()
+                identity = RemoteIdentity(
+                    prefix=current.remote.prefix,
+                    remote_id=current.remote.remote_id,
+                    bases=CommandBases(
+                        up=parse_hex(flattened.get(CONF_BASE_UP), CONF_BASE_UP, 16),
+                        down=parse_hex(flattened.get(CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
+                        stop=parse_hex(flattened.get(CONF_BASE_STOP), CONF_BASE_STOP, 16),
+                        trailer=(
+                            parse_hex(raw_trailer, CONF_BASE_TRAILER, 16) if raw_trailer else None
+                        ),
+                    ),
+                )
+                updated = RemoteConfig(
+                    name=str(flattened.get(CONF_NAME, "")),
+                    remote=identity,
+                    area_id=str(flattened.get(CONF_AREA_ID, "")),
+                    repeats=whole_number(flattened.get(CONF_REPEATS), CONF_REPEATS),
+                    coalesce_window_ms=whole_number(
+                        flattened.get(
+                            CONF_COALESCE_WINDOW_MS,
+                            DEFAULT_COALESCE_WINDOW_MS,
+                        ),
+                        CONF_COALESCE_WINDOW_MS,
+                    ),
+                )
+            except TypeError, ValueError:
+                errors["base"] = "invalid_config"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry,
+                    title=updated.name,
+                    data=updated.as_dict(),
+                )
+        return self.async_show_form(
+            step_id="reconfigure_edit",
+            data_schema=_reconfigure_edit_schema(suggested),
+            errors=errors,
+        )
 
     async def async_step_user(
         self,
@@ -689,9 +911,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._identity = _remote_identity_from_capture(capture)
         except ValueError:
             return await self.async_step_learn_timeout()
+        menu_options = ["remote_settings", "learn_retry", "advanced"]
+        if self.source == config_entries.SOURCE_RECONFIGURE:
+            menu_options = ["reconfigure_apply", "learn_retry"]
         return self.async_show_menu(
             step_id="learn_confirm",
-            menu_options=["remote_settings", "learn_retry", "advanced"],
+            menu_options=menu_options,
             description_placeholders={
                 "prefix": f"0x{capture.prefix:06x}",
                 "remote_id": f"0x{capture.remote_id:02x}",
