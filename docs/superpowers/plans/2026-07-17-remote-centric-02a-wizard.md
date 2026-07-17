@@ -515,7 +515,7 @@ and on the flow class:
 
 - [ ] **Step 4:** `uv run pytest tests/test_config_flow.py -k manual_identity -v` → PASS. (Flow-walk coverage of `remote_settings` arrives with Tasks 4–5's wizard tests; full-file collection may still fail on not-yet-updated tests — that is expected until Task 6.)
 
-- [ ] **Step 5:** ruff both files; mypy `--strict` on `config_flow.py`. (Controller commit: `feat(flow): remote identity helpers and remote_settings step`.)
+- [ ] **Step 5:** ruff both files. **No mypy gate here**: `async_step_remote_settings` forward-references `async_step_cover`, which Task 4 introduces — Tasks 3+4 are one type-checkable unit and the strict-mypy gate for `config_flow.py` runs at the end of Task 4. (Controller commit after Task 4.)
 
 ---
 
@@ -1009,6 +1009,13 @@ def _known_remote_pairs(hass: HomeAssistant) -> set[tuple[int, int]]:
   - `test_reconfigure_relearn_reloads_and_clears_stale_options`
   - `test_reconfigure_edit_keeps_remote_and_clears_options`
   - `test_options_flow_still_edits_travel_and_area`
+  - In `tests/test_init.py`:
+    `test_flow_rejects_same_remote_channel_overlap_across_areas` (it imports
+    the deleted `_cross_area_overlap`; the cross-area guard is intentionally
+    gone — per-remote area replaces it). Check test_init.py for any other
+    import of deleted config_flow names (`known_remotes`,
+    `_propagate_calibration`, options flow) and delete/adapt those tests the
+    same way.
   Also delete `details_input()` and `real_entry()` if nothing references them
   afterward (check with grep; `real_entry` may still be used by kept tests —
   keep it if so).
