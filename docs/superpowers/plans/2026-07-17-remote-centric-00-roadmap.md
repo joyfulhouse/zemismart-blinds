@@ -51,18 +51,32 @@ unmodified.
 > in Plan 03 to keep the package type-clean. `BlindConfig` is untouched in
 > Plan 01.
 
-### Plan 02 — Config flow: wizard, subentry flows, entry reconfigure
+### Plan 02a — Wizard & runtime shim — DETAILED, ready
 
-Rewrites `config_flow.py` onto the new types and `strings.json`/`translations`
-for the new steps. Registers `async_get_supported_subentry_types` →
-`{"cover": CoverSubentryFlow}`. Wizard (learn/manual/virtual → remote settings
-→ cover loop → `async_create_entry(subentries=[...])` with final whole-list
-laminar+uniqueness validation). Subentry add/reconfigure/delete
-(`async_update_and_abort`, hidden-travel-key carry-forward, current-role
-validation). Entry reconfigure (relearn with collision scan; edit settings).
-Deletes the options flow, `_propagate_calibration`, `_cross_area_overlap`,
-reuse path. Deliverable: `test_config_flow.py` green for entry+subentry
-creation and all rejection paths.
+`docs/superpowers/plans/2026-07-17-remote-centric-02a-wizard.md`
+
+Rewrites the creation flow: learn/manual/virtual → remote settings → cover
+loop → `async_create_entry(subentries=[...])` with final whole-list
+laminar+uniqueness validation and the explicit duplicate-remote abort guard.
+Deletes the options flow, reuse path, old reconfigure,
+`_propagate_calibration`, `_cross_area_overlap`. Adds `RemoteRuntime` and the
+dual-format loader in `__init__.py`/`cover.py` (remote entries load with zero
+entities until Plan 03). Deliverable: wizard tests green, full suite green.
+**Mid-branch gap (restored in 02b):** no reconfigure/options UI.
+
+### Plan 02b — Subentry flows, entry reconfigure, strings
+
+Registers `async_get_supported_subentry_types` → `{"cover": CoverSubentryFlow}`
+(add/reconfigure with hidden-travel-key carry-forward and current-role
+validation; native delete). New entry reconfigure (relearn with explicit
+collision scan; edit settings incl. calibration fields). Rewrites
+`strings.json`/`translations/en.json` for the new step topology
+(`remote_settings`, `cover`, `cover_menu`, subentry section, new errors
+`travel_required`/`overlapping_channels`/`duplicate_channels`/
+`channel_conflict`). Interim: entry reconfigure uses
+`async_update_reload_and_abort` until Plan 04 installs the update listener as
+sole reload owner. Deliverable: `test_config_flow.py` green for subentry and
+reconfigure paths.
 
 ### Plan 03 — Entities, coordinator, device topology
 
