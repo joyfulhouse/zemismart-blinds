@@ -37,11 +37,19 @@ at every checkpoint (spec guardrail).
 `docs/superpowers/plans/2026-07-17-remote-centric-01-data-model.md`
 
 New pure types added to `models.py` without touching any consumer:
-`Role`, `CoverConfig`, `RemoteConfig`, laminar channel-set validation, role &
-member derivation, and `BlindConfig.derive(...)` with an explicit `role` and
-optional (aggregate-only) travel times. Fully unit-tested in `test_models.py`.
-Deliverable: `uv run pytest tests/test_models.py` green; integration still
-loads via the untouched legacy path; `test_state_sync.py` unmodified.
+`Role`, `CoverConfig`, `RemoteConfig`, laminar channel-set validation, and role
+& member derivation (`derive_role`, `member_covers`). Fully unit-tested in
+`test_models.py`. Deliverable: `uv run pytest tests/test_models.py` green;
+integration still loads via the untouched legacy path; `test_state_sync.py`
+unmodified.
+
+> **Scope correction (during execution):** the derived-`BlindConfig`
+> runtime type (`BlindConfig.derive`, `role` field, optional aggregate-only
+> travel, `is_aggregate`) was **moved out of Plan 01 into Plan 03**. Retyping
+> `BlindConfig.travel_*` to `float | None` breaks `mypy --strict` on the
+> unchanged `cover.py`, so that change must land with its `cover.py` consumer
+> in Plan 03 to keep the package type-clean. `BlindConfig` is untouched in
+> Plan 01.
 
 ### Plan 02 — Config flow: wizard, subentry flows, entry reconfigure
 
@@ -58,10 +66,13 @@ creation and all rejection paths.
 
 ### Plan 03 — Entities, coordinator, device topology
 
-Adds `coordinator.py` (per-entry: cover index, role/membership map,
-press-ownership arbitration, forward/reverse notification, batched
-recomputation). Migrates `cover.py`: leaf entity keeps today's model but
-unique_id/device become subentry-based; new aggregate entity class (state from
+Adds the derived-`BlindConfig` runtime type first (`BlindConfig.derive`,
+`role` field, optional aggregate-only travel, `is_aggregate` — moved here from
+Plan 01 so it lands with its consumer). Then adds `coordinator.py` (per-entry:
+cover index, role/membership map, press-ownership arbitration, forward/reverse
+notification, batched recomputation). Migrates `cover.py`: leaf entity keeps
+today's model but unique_id/device become subentry-based; new aggregate entity
+class (state from
 available members, single-frame open/close/stop + member model start/freeze,
 concurrent typed set_position fan-out with STOP preemption). Parent-device-
 first creation; per-subentry `async_add_entities(config_subentry_id=...)`;

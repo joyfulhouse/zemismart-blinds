@@ -752,270 +752,38 @@ git commit -m "feat(models): derive cover roles and leaf membership"
 
 ---
 
-## Task 5: Derived `BlindConfig` with explicit role and optional travel
+## Task 5 (moved to Plan 03): Derived `BlindConfig` with explicit role
 
-**Files:**
-- Modify: `custom_components/zemismart_blinds/models.py`
-- Test: `tests/test_models.py`
+**Deferred — do NOT implement in Plan 01.** During Plan 01 execution, Codex
+GPT-5.6-sol found that retyping `BlindConfig.travel_up/travel_down` to
+`float | None` breaks `mypy --strict` on the **unchanged** `cover.py`, whose
+leaf travel-time arithmetic requires a non-`None` `float`. Plan 01 forbids
+consumer edits and requires whole-package strict mypy to stay clean, so the
+`BlindConfig` change cannot land here.
 
-**Interfaces:**
-- Consumes: `RemoteConfig`, `CoverConfig`, `Role`.
-- Produces (additions to the existing `BlindConfig`):
-  - New field `role: Role = Role.LEAF` (last field, defaulted so existing
-    constructions and `from_mapping` stay valid).
-  - `travel_up` / `travel_down` typed `float | None` (still required when
-    `role is Role.LEAF`; may be `None` only for `Role.AGGREGATE`).
-  - New property `is_aggregate -> bool` (`role is Role.AGGREGATE`).
-  - New classmethod
-    `derive(remote: RemoteConfig, cover: CoverConfig, role: Role) -> BlindConfig`.
+Resolution: `BlindConfig.derive(remote, cover, role)`, the `role: Role` field,
+optional (aggregate-only) travel, and `is_aggregate` move to **Plan 03**
+(entities), where `cover.py` is migrated to the leaf/aggregate split in the
+same phase — so the type change and its consumer land together and the package
+stays green. The tests originally listed here move with it.
 
-**Behavior contract preserved:** a `BlindConfig` with `role is Role.LEAF` MUST
-still validate finite `>0 <= MAX_TRAVEL_SECONDS` travel times (existing
-guarantee that `cover.py`'s arithmetic relies on). Only `Role.AGGREGATE` may
-carry `None` travel.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/test_models.py`:
-
-```python
-def test_blindconfig_defaults_to_leaf_role() -> None:
-    from custom_components.zemismart_blinds.models import BlindConfig, Role
-
-    config = BlindConfig(
-        name="Sink",
-        remote=_remote_identity(),
-        channels=(5,),
-        travel_up=9.0,
-        travel_down=9.0,
-        area_id="kitchen",
-        repeats=5,
-    )
-    assert config.role is Role.LEAF
-    assert config.is_aggregate is False
-
-
-def test_blindconfig_leaf_still_requires_travel() -> None:
-    from custom_components.zemismart_blinds.models import BlindConfig, Role
-
-    with pytest.raises(ValueError, match="travel"):
-        BlindConfig(
-            name="Sink",
-            remote=_remote_identity(),
-            channels=(5,),
-            travel_up=None,
-            travel_down=None,
-            area_id="kitchen",
-            repeats=5,
-            role=Role.LEAF,
-        )
-
-
-def test_blindconfig_aggregate_allows_no_travel() -> None:
-    from custom_components.zemismart_blinds.models import BlindConfig, Role
-
-    config = BlindConfig(
-        name="All",
-        remote=_remote_identity(),
-        channels=(1, 2, 3, 4, 5, 6),
-        travel_up=None,
-        travel_down=None,
-        area_id="kitchen",
-        repeats=5,
-        role=Role.AGGREGATE,
-    )
-    assert config.is_aggregate is True
-    assert config.travel_up is None
-
-
-def test_blindconfig_derive_from_remote_and_cover() -> None:
-    from custom_components.zemismart_blinds.models import (
-        BlindConfig,
-        CoverConfig,
-        RemoteConfig,
-        Role,
-    )
-
-    remote = RemoteConfig(
-        name="Kitchen remote",
-        remote=_remote_identity(),
-        area_id="kitchen",
-        repeats=7,
-        coalesce_window_ms=200,
-    )
-    leaf = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
-    derived = BlindConfig.derive(remote, leaf, Role.LEAF)
-    assert derived.name == "Sink"
-    assert derived.channels == (5,)
-    assert derived.area_id == "kitchen"
-    assert derived.repeats == 7
-    assert derived.coalesce_window_ms == 200
-    assert derived.travel_up == 9.0
-    assert derived.role is Role.LEAF
-    assert derived.remote.key == remote.key
-
-    aggregate_cover = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
-    aggregate = BlindConfig.derive(remote, aggregate_cover, Role.AGGREGATE)
-    assert aggregate.is_aggregate is True
-    assert aggregate.travel_up is None
-
-
-def test_blindconfig_from_mapping_unchanged_and_leaf() -> None:
-    from custom_components.zemismart_blinds.models import BlindConfig, Role
-
-    config = BlindConfig(
-        name="Sink",
-        remote=_remote_identity(),
-        channels=(5,),
-        travel_up=9.0,
-        travel_down=9.0,
-        area_id="kitchen",
-        repeats=5,
-    )
-    restored = BlindConfig.from_mapping(config.as_dict())
-    assert restored.role is Role.LEAF
-    assert restored.travel_up == 9.0
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-```bash
-uv run pytest tests/test_models.py -k "blindconfig" -v
-```
-
-Expected: FAIL — `TypeError` on the `role=` keyword and/or `is_aggregate`/
-`derive` missing.
-
-- [ ] **Step 3: Modify `BlindConfig`**
-
-In the existing `@dataclass(frozen=True, slots=True) class BlindConfig`:
-
-1. Change the travel field annotations to optional and add the `role` field
-   **after** `coalesce_window_ms` (defaulted fields must stay last):
-
-```python
-    name: str
-    remote: RemoteIdentity
-    channels: tuple[int, ...]
-    travel_up: float | None
-    travel_down: float | None
-    area_id: str
-    repeats: int
-    coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
-    role: Role = Role.LEAF
-```
-
-2. In `__post_init__`, replace the existing travel-time validation block
-
-```python
-        if not all(
-            math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
-            for value in (self.travel_up, self.travel_down)
-        ):
-            ...
-            raise ValueError(msg)
-```
-
-with role-aware validation:
-
-```python
-        if self.role is Role.LEAF:
-            if self.travel_up is None or self.travel_down is None:
-                msg = "leaf covers require travel_up and travel_down"
-                raise ValueError(msg)
-            if not all(
-                math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
-                for value in (self.travel_up, self.travel_down)
-            ):
-                # NaN slips through plain comparisons and would leave the
-                # position model "moving" forever; the upper bound keeps every
-                # derivable stop_after_ms inside the firmware's 1-hour range.
-                msg = f"travel times must be finite, >0, at most {MAX_TRAVEL_SECONDS}"
-                raise ValueError(msg)
-        else:
-            for value in (self.travel_up, self.travel_down):
-                if value is not None and not (
-                    math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
-                ):
-                    msg = f"travel times must be finite, >0, at most {MAX_TRAVEL_SECONDS}"
-                    raise ValueError(msg)
-```
-
-3. Add the property and classmethod (place near `is_group`):
-
-```python
-    @property
-    def is_aggregate(self) -> bool:
-        """Return whether this cover aggregates member covers' state."""
-        return self.role is Role.AGGREGATE
-
-    @classmethod
-    def derive(
-        cls,
-        remote: RemoteConfig,
-        cover: CoverConfig,
-        role: Role,
-    ) -> BlindConfig:
-        """Build the runtime config for one cover from its remote and subentry."""
-        return cls(
-            name=cover.name,
-            remote=remote.remote,
-            channels=cover.channels,
-            travel_up=cover.travel_up,
-            travel_down=cover.travel_down,
-            area_id=remote.area_id,
-            repeats=remote.repeats,
-            coalesce_window_ms=remote.coalesce_window_ms,
-            role=role,
-        )
-```
-
-4. In the existing `from_mapping`, the `cls(...)` call does not pass `role`, so
-   it defaults to `Role.LEAF` — leave it as-is. `as_dict()` does not serialize
-   `role` (role is derived, never stored) — leave it as-is.
-
-- [ ] **Step 4: Run the tests to verify they pass**
-
-```bash
-uv run pytest tests/test_models.py -k "blindconfig" -v
-```
-
-Expected: PASS (5 tests).
-
-- [ ] **Step 5: Run the FULL suite — nothing regressed**
-
-```bash
-uv run pytest -q
-```
-
-Expected: all pass, including `tests/test_state_sync.py`, `tests/test_cover.py`,
-`tests/test_config_flow.py` unmodified. If any legacy construction of
-`BlindConfig` fails on the now-optional travel typing, it is a real regression —
-fix by confirming those call sites pass `Role.LEAF` semantics (they pass float
-travel, so the default `Role.LEAF` applies and validation is unchanged).
-
-- [ ] **Step 6: Lint, type-check, commit**
-
-```bash
-uv run ruff check --fix custom_components/zemismart_blinds/models.py tests/test_models.py
-uv run ruff format custom_components/zemismart_blinds/models.py tests/test_models.py
-uv run mypy --strict custom_components/zemismart_blinds/
-git add custom_components/zemismart_blinds/models.py tests/test_models.py
-git commit -m "feat(models): derive BlindConfig with explicit role and optional travel"
-```
+Plan 01 leaves the existing `BlindConfig` completely untouched. Its consumers
+(`cover.py`, `config_flow.py`, `__init__.py`) keep loading the integration via
+the legacy path.
 
 ---
 
 ## Definition of done (Plan 01)
 
 - [ ] `uv run pytest -q` fully green.
-- [ ] `uv run mypy --strict custom_components/zemismart_blinds/` clean.
+- [ ] `uv run mypy --strict custom_components/zemismart_blinds/` clean
+  (whole package — passes because `BlindConfig` is untouched).
 - [ ] `uv run ruff check custom_components/zemismart_blinds/ tests/` clean.
 - [ ] `tests/test_state_sync.py` unchanged (verify with `git diff --stat main -- tests/test_state_sync.py` shows no change).
 - [ ] Only `models.py` and `tests/test_models.py` were modified.
 - [ ] New public names exist and are importable: `Role`, `CoverConfig`,
-  `RemoteConfig`, `laminar_conflict`, `derive_role`, `member_covers`,
-  `BlindConfig.derive`, `BlindConfig.is_aggregate`.
+  `RemoteConfig`, `laminar_conflict`, `derive_role`, `member_covers`.
+  (`BlindConfig.derive`/`is_aggregate` arrive in Plan 03.)
 
 Then author Plan 02 (config flow) grounded in these real types.
 
@@ -1023,11 +791,13 @@ Then author Plan 02 (config flow) grounded in these real types.
 
 - **Spec coverage (this phase):** data-model section of the spec — remote
   fields, cover fields with optional travel, laminar rule, leaves-only
-  membership, explicit role, derived `BlindConfig` — all covered by Tasks 1–5.
-  Device/flow/lifecycle sections are out of scope for Plan 01 (Plans 02–04).
-- **Type consistency:** `channel_key` uses `-`; `RemoteConfig.key`/`BlindConfig.remote_key`
-  use `RemoteIdentity.key` (`prefix:remote_id`); `laminar_conflict` returns the
+  membership — covered by Tasks 1–4. The derived-`BlindConfig`/role runtime
+  type is deferred to Plan 03 (lands with its `cover.py` consumer to keep the
+  package type-clean). Device/flow/lifecycle sections are Plans 02–04.
+- **Type consistency:** `channel_key` uses `-`; `RemoteConfig.key` uses
+  `RemoteIdentity.key` (`prefix:remote_id`); `laminar_conflict` returns the
   string keys `"duplicate_channels"`/`"overlapping_channels"` that Plan 02's
   flow will map to form errors. `derive_role`/`member_covers` accept
   `Iterable[CoverConfig]` and are pure.
-- **No placeholders:** every code and test step is complete and runnable.
+- **No placeholders:** every code and test step in Tasks 1–4 is complete and
+  runnable.
