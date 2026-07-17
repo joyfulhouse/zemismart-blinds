@@ -58,6 +58,10 @@ _DISARM_ACK_DELAY_SECONDS: Final = 0.1
 _DISARM_TIMEOUT_LOWER_BOUND_SECONDS: Final = 0.12
 _DISARM_PENDING_DEADLINE_SECONDS: Final = 0.08
 _DISARM_BACKOFF_SCHEDULE: Final = (0.25, 0.5, 1.0, 2.0, 4.0, 5.0, 5.0)
+_TAKEOVER_GENERIC_DEADLINE_SECONDS: Final = 0.04
+_TAKEOVER_OWNED_DEADLINE_SECONDS: Final = 0.16
+_TAKEOVER_AFTER_GENERIC_SECONDS: Final = 0.07
+_TAKEOVER_TIMEOUT_LOWER_BOUND_SECONDS: Final = 0.13
 _DISPLACED_STOP_AFTER_MS: Final = 120_000
 _DISPLACED_AT: Final = 140.0
 _DISPLACED_FLUSH_AT: Final = 140.1
@@ -1416,6 +1420,80 @@ async def test_joined_disarm_times_out_at_widest_deadline() -> None:
         await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
 
         assert loop.time() - started_at >= _DISARM_TIMEOUT_LOWER_BOUND_SECONDS
+        assert request.waiter.cancelled()
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_later_cover_owned_press_widens_live_ledger_disarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cover safety horizon widens a generic request through real dispatch."""
+    monkeypatch.setattr(
+        models_module,
+        "_PRESTART_DISARM_DEADLINE_SECONDS",
+        _TAKEOVER_GENERIC_DEADLINE_SECONDS,
+    )
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    state = TakeoverCoverState(None, None, None, None, False)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            accept_and_start(hub, "bridge-a", json.loads(payload))
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "ledger-command",
+    )
+    hub.register_rx_listener(
+        remote_key,
+        frozenset({1}),
+        lambda _event: None,
+        takeover_state=lambda: state,
+    )
+    raw_frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_BASES))
+    await hub.async_send_raw("bridge-a", raw_frame, 2)
+    event = HeardEvent(
+        button="DOWN",
+        chans=frozenset({1}),
+        remote_key=remote_key,
+        heard_at=hub._now(),
+        bridge_id="synthetic-rx-bridge",
+    )
+    started_at = asyncio.get_running_loop().time()
+    hub._dispatch_heard(event)
+    request = hub._disarm_requests[("bridge-a", "ledger-command")]
+    generic_deadline = request.deadline
+    generic_loop_deadline = request.loop_deadline
+    owned_deadline = hub._now() + _TAKEOVER_OWNED_DEADLINE_SECONDS
+    state = TakeoverCoverState(
+        "bridge-a",
+        "ledger-command",
+        "UP",
+        owned_deadline,
+        False,
+    )
+    task = request.task
+    assert task is not None
+    try:
+        hub._dispatch_heard(event)
+
+        assert hub._disarm_requests[("bridge-a", "ledger-command")] is request
+        assert request.deadline == pytest.approx(owned_deadline, abs=0.001, rel=0)
+        assert request.deadline > generic_deadline
+        assert request.loop_deadline > generic_loop_deadline
+        await asyncio.sleep(_TAKEOVER_AFTER_GENERIC_SECONDS)
+        assert not task.done()
+        await asyncio.wait_for(task, timeout=_DISARM_TEST_DEADLINE_SECONDS)
+
+        assert (
+            asyncio.get_running_loop().time() - started_at >= _TAKEOVER_TIMEOUT_LOWER_BOUND_SECONDS
+        )
         assert request.waiter.cancelled()
     finally:
         hub.close()

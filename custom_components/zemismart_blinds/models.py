@@ -575,6 +575,7 @@ class _DisarmRequest:
     pressed_channels: set[int] = field(default_factory=set)
     remote_key: str | None = None
     command_button: str | None = None
+    command_has_fail_safe_stop: bool = False
     task: asyncio.Task[None] | None = None
 
 
@@ -587,6 +588,7 @@ class TakeoverCoverState:
     button: Button | None
     disarm_deadline: float | None
     stopped_by_heard: bool
+    has_fail_safe_stop: bool = False
 
 
 @dataclass(slots=True)
@@ -599,6 +601,7 @@ class _TakeoverTarget:
     button: str
     confirmed: bool | None
     owned_deadline: float | None = None
+    command_has_fail_safe_stop: bool = False
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -610,6 +613,7 @@ class _RxListener:
     callback: Callable[[HeardEvent], None]
     takeover_state: Callable[[], TakeoverCoverState] | None = None
     invalidate_takeover: Callable[[], None] | None = None
+    retire_takeover: Callable[[str, str], None] | None = None
 
 
 @dataclass(slots=True)
@@ -839,6 +843,7 @@ class ZemismartHub:
         *,
         takeover_state: Callable[[], TakeoverCoverState] | None = None,
         invalidate_takeover: Callable[[], None] | None = None,
+        retire_takeover: Callable[[str, str], None] | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
         listener = _RxListener(
@@ -847,6 +852,7 @@ class ZemismartHub:
             callback,
             takeover_state,
             invalidate_takeover,
+            retire_takeover,
         )
 
         def unsubscribe() -> None:
@@ -945,14 +951,19 @@ class ZemismartHub:
         for target in self._takeover_targets(event, listeners, now):
             key = (target.bridge_id, target.command_id)
             request = self._disarm_requests.get(key)
-            if request is None or request.waiter.done():
-                deadline = target.owned_deadline
-                if deadline is None:
-                    deadline = now + _PRESTART_DISARM_DEADLINE_SECONDS
+            if target.owned_deadline is not None:
                 request = self._start_disarm_request(
                     target.bridge_id,
                     target.command_id,
-                    deadline,
+                    target.owned_deadline,
+                    command_has_fail_safe_stop=target.command_has_fail_safe_stop,
+                )
+            elif request is None or request.waiter.done():
+                request = self._start_disarm_request(
+                    target.bridge_id,
+                    target.command_id,
+                    now + _PRESTART_DISARM_DEADLINE_SECONDS,
+                    command_has_fail_safe_stop=target.command_has_fail_safe_stop,
                 )
             self._merge_takeover_context(request, event, target)
             self._evaluate_takeover_resolution(request, None)
@@ -1023,9 +1034,11 @@ class ZemismartHub:
                     button=state.button,
                     confirmed=None,
                     owned_deadline=state.disarm_deadline,
+                    command_has_fail_safe_stop=state.has_fail_safe_stop,
                 )
             return
         target.channels |= listener.channels
+        target.command_has_fail_safe_stop |= state.has_fail_safe_stop
         if target.owned_deadline is None:
             target.owned_deadline = state.disarm_deadline
         else:
@@ -1041,6 +1054,7 @@ class ZemismartHub:
         request.remote_key = event.remote_key
         request.command_channels |= target.channels
         request.command_button = target.button
+        request.command_has_fail_safe_stop |= target.command_has_fail_safe_stop
         request.pressed_channels.update(event.chans & target.channels)
 
     def _evaluate_takeover_resolution(
@@ -1163,7 +1177,7 @@ class ZemismartHub:
             self._evaluate_takeover_resolution(
                 disarm_request,
                 "displaced",
-                displaced_flushed=flushed,
+                displaced_flushed=(flushed or disarm_request.command_has_fail_safe_stop),
             )
             disarm_request.waiter.set_result(None)
         self._remember_displaced(command_id)
@@ -1237,7 +1251,14 @@ class ZemismartHub:
         self._ledger.release(command_id)
         self._state_sync.resume_holds(command_id)
         self._evaluate_takeover_resolution(request, "disarmed")
+        self._retire_cover_takeover(bridge_id, command_id)
         request.waiter.set_result(None)
+
+    def _retire_cover_takeover(self, bridge_id: str, command_id: str) -> None:
+        """Notify current covers that a command's armed STOP is gone."""
+        for listener in tuple(self._rx_listeners):
+            if listener.retire_takeover is not None:
+                listener.retire_takeover(bridge_id, command_id)
 
     def _resolve_disarmed_pending(self, bridge_id: str, command_id: str) -> None:
         """Displace the pending lifecycle future aborted by a disarm ack."""
@@ -1255,6 +1276,8 @@ class ZemismartHub:
         bridge_id: str,
         command_id: str,
         deadline: float,
+        *,
+        command_has_fail_safe_stop: bool = False,
     ) -> _DisarmRequest:
         """Start or join one request, replacing only a resolved predecessor."""
         loop = asyncio.get_running_loop()
@@ -1262,6 +1285,7 @@ class ZemismartHub:
         existing = self._disarm_requests.get(key)
         if existing is not None and not existing.waiter.done():
             existing.deadline = max(existing.deadline, deadline)
+            existing.command_has_fail_safe_stop |= command_has_fail_safe_stop
             existing.loop_deadline = max(
                 existing.loop_deadline,
                 loop.time() + max(0.0, deadline - self._now()),
@@ -1274,6 +1298,7 @@ class ZemismartHub:
             waiter=loop.create_future(),
             deadline=deadline,
             loop_deadline=loop.time() + remaining,
+            command_has_fail_safe_stop=command_has_fail_safe_stop,
         )
         self._disarm_requests[key] = request
         request.task = asyncio.create_task(
