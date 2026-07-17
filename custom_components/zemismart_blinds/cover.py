@@ -32,6 +32,7 @@ from .models import (
     CommandAckTimeoutError,
     CommandStartedTimeoutError,
     EntryRuntime,
+    RemoteRuntime,
     TakeoverCoverState,
     ZemismartHub,
 )
@@ -79,12 +80,16 @@ class _MotionStart:
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry[EntryRuntime],
+    entry: ConfigEntry[EntryRuntime | RemoteRuntime],
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create exactly one cover entity for this blind/group entry."""
+    """Create cover entities for one legacy blind/group entry."""
     del hass
-    async_add_entities([ZemismartCover(entry.entry_id, entry.runtime_data)])
+    runtime = entry.runtime_data
+    if isinstance(runtime, RemoteRuntime):
+        # Remote-centric entries grow per-subentry entities in Plan 03.
+        return
+    async_add_entities([ZemismartCover(entry.entry_id, runtime)])
 
 
 def _number(value: object) -> float | None:

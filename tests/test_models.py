@@ -3852,3 +3852,26 @@ async def test_close_cancels_background_publish_tasks() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     release.set()
+
+
+def test_remote_runtime_carries_remote_and_hub() -> None:
+    from custom_components.zemismart_blinds.models import (
+        BridgeRegistry,
+        RemoteConfig,
+        RemoteRuntime,
+        ZemismartHub,
+    )
+
+    async def publisher(_topic: str, _payload: str) -> None:
+        return None
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=5,
+    )
+    runtime = RemoteRuntime(remote=remote, hub=hub)
+    assert runtime.remote is remote
+    assert runtime.hub is hub

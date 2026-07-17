@@ -2524,6 +2524,14 @@ class EntryRuntime:
 
 
 @dataclass(slots=True)
+class RemoteRuntime:
+    """Runtime data owned by one remote-centric config entry."""
+
+    remote: RemoteConfig
+    hub: ZemismartHub
+
+
+@dataclass(slots=True)
 class DomainRuntime:
     """MQTT registry/subscriptions shared by every config entry."""
 

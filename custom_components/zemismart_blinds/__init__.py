@@ -18,6 +18,7 @@ from .const import (
     CONF_BASE_DOWN,
     CONF_BASE_STOP,
     CONF_BASE_UP,
+    CONF_CHANNELS,
     CONF_PREFIX,
     CONF_REMOTE_ID,
     DEFAULT_REPEATS,
@@ -35,6 +36,8 @@ from .models import (
     BridgeRegistry,
     DomainRuntime,
     EntryRuntime,
+    RemoteConfig,
+    RemoteRuntime,
     ZemismartHub,
 )
 
@@ -44,7 +47,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
     from homeassistant.helpers.typing import ConfigType
 
-    type ZemismartConfigEntry = ConfigEntry[EntryRuntime]
+    type ZemismartConfigEntry = ConfigEntry[EntryRuntime | RemoteRuntime]
 
 
 def _entry_config(entry: ZemismartConfigEntry) -> BlindConfig:
@@ -320,7 +323,7 @@ async def async_setup_entry(
     """Set up one blind/group entry and the shared MQTT runtime."""
     from homeassistant.const import Platform
 
-    config = _entry_config(entry)
+    legacy_config = None if CONF_CHANNELS not in entry.data else _entry_config(entry)
     while True:
         candidate = _create_domain_runtime(hass)
         runtime = cast("DomainRuntime", hass.data.setdefault(DOMAIN, candidate))
@@ -334,12 +337,22 @@ async def async_setup_entry(
                     continue
                 if not runtime.initialized:
                     await _async_initialize_domain_runtime(hass, runtime)
-                entry.runtime_data = EntryRuntime(config=config, hub=runtime.hub)
+                if legacy_config is None:
+                    entry.runtime_data = RemoteRuntime(
+                        remote=RemoteConfig.from_entry(entry.data),
+                        hub=runtime.hub,
+                    )
+                else:
+                    entry.runtime_data = EntryRuntime(
+                        config=legacy_config,
+                        hub=runtime.hub,
+                    )
                 if entry.entry_id in runtime.loaded_entries:
                     failed = False
                     return True
                 await hass.config_entries.async_forward_entry_setups(entry, [Platform.COVER])
-                await _async_assign_device_area(hass, entry, config)
+                if legacy_config is not None:
+                    await _async_assign_device_area(hass, entry, legacy_config)
                 runtime.loaded_entries.add(entry.entry_id)
                 failed = False
                 return True

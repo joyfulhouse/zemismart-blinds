@@ -42,7 +42,7 @@ from custom_components.zemismart_blinds.state_sync import (
     LedgerFrameSpec,
     frame_signature,
 )
-from tests.synthetic import TEST_CH12_UP_B0
+from tests.synthetic import TEST_BASES, TEST_CH12_UP_B0, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -95,6 +95,62 @@ def message(
         subscribed_topic=topic,
         timestamp=timestamp,
     )
+
+
+@pytest.mark.asyncio
+async def test_remote_format_entry_sets_up_with_no_entities(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote-centric entry loads the shared runtime and adds no covers yet."""
+    from homeassistant import config_entries as ha_config_entries
+
+    from custom_components.zemismart_blinds.models import (
+        RemoteConfig,
+        RemoteIdentity,
+        RemoteRuntime,
+    )
+
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        area_id="kitchen",
+        repeats=5,
+    )
+    entry = ConfigEntry(
+        data=remote.as_dict(),
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id="remote-entry-1",
+        minor_version=1,
+        options={},
+        source=ha_config_entries.SOURCE_USER,
+        subentries_data=None,
+        title=remote.name,
+        unique_id=remote.key,
+        version=1,
+    )
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    assert await async_setup_entry(hass, entry)
+
+    runtime = entry.runtime_data
+    assert isinstance(runtime, RemoteRuntime)
+    assert runtime.remote == remote
+    assert [state for state in hass.states.async_all("cover")] == []
 
 
 def test_rx_handler_drops_retained_and_malformed_messages(
