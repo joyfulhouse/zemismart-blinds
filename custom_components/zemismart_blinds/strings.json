@@ -6,8 +6,8 @@
     },
     "step": {
       "user": {
-        "title": "Add one blind or group",
-        "description": "Learn the remote automatically, or use an Advanced setup method.",
+        "title": "Add a Zemismart remote",
+        "description": "Learn the remote automatically, or use an Advanced setup method. You will add its covers (blinds and groups) next.",
         "menu_options": {
           "learn": "Learn from remote",
           "advanced": "Advanced"
@@ -156,7 +156,7 @@
     "error": {
       "invalid_config": "Check the remote identity, calibration, channel set, travel times, area, and Advanced settings.",
       "bridge_unavailable": "Choose a bridge that was discovered as online.",
-      "already_configured": "Another device already uses this remote channel set.",
+      "already_configured": "This remote is already configured by another entry.",
       "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
       "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
       "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
@@ -164,6 +164,7 @@
     "abort": {
       "already_configured": "This remote is already configured.",
       "reconfigure_successful": "The remote was reconfigured successfully.",
+      "legacy_not_supported": "This entry uses the old per-blind format. Delete it and add its remote again instead of reconfiguring.",
       "channel_conflict": "The collected covers conflict; start over."
     }
   },
@@ -209,6 +210,10 @@
         "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
         "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
         "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
+      },
+      "abort": {
+        "reconfigure_successful": "The cover was reconfigured successfully.",
+        "already_configured": "Another cover of this remote already uses exactly these channels."
       }
     }
   },

@@ -6,6 +6,8 @@ import asyncio
 import inspect
 import json
 from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -44,6 +46,7 @@ from custom_components.zemismart_blinds.const import (
     MQTT_ROOT,
 )
 from custom_components.zemismart_blinds.models import (
+    BlindConfig,
     CoverConfig,
     RemoteConfig,
     RemoteIdentity,
@@ -382,6 +385,15 @@ def current_flow(hass: HomeAssistant, flow_id: str) -> ConfigFlowResult:
     return hass.config_entries.flow.async_get(flow_id)
 
 
+def schema_suggested_values(schema: Any) -> dict[str, object]:
+    """Serialize suggested values from a Home Assistant form schema."""
+    return {
+        str(marker.schema): marker.description["suggested_value"]
+        for marker in schema.schema
+        if marker.description and "suggested_value" in marker.description
+    }
+
+
 def manual_input(**overrides: object) -> dict[str, Any]:
     """Return representative manual identity input with one explicit UP base."""
     values: dict[str, Any] = {
@@ -393,6 +405,29 @@ def manual_input(**overrides: object) -> dict[str, Any]:
     }
     values.update(overrides)
     return values
+
+
+def stored_config_entry(
+    data: dict[str, object],
+    *,
+    entry_id: str,
+    title: str,
+    unique_id: str,
+) -> ConfigEntry:
+    """Build a real stored entry without driving the config flow."""
+    return config_entries.ConfigEntry(
+        data=data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=1,
+        options={},
+        source=config_entries.SOURCE_USER,
+        subentries_data=None,
+        title=title,
+        unique_id=unique_id,
+        version=1,
+    )
 
 
 def test_manual_identity_derives_action_bases_from_one_direct_base() -> None:
@@ -449,16 +484,7 @@ def test_validate_cover_input_travel_required_for_born_leaf() -> None:
 
 def test_validate_cover_input_laminar_errors() -> None:
     """Duplicates and partial overlaps map to channel-field form errors."""
-    from custom_components.zemismart_blinds.models import CoverConfig
-
-    collected = [
-        CoverConfig(
-            name="Slider",
-            channels=(1, 2, 3),
-            travel_up=12.0,
-            travel_down=12.0,
-        )
-    ]
+    collected = [(1, 2, 3)]
     _cover, errors = config_flow_module._validate_cover_input(
         {
             CONF_NAME: "X",
@@ -483,22 +509,7 @@ def test_validate_cover_input_laminar_errors() -> None:
 
 def test_validate_cover_input_born_aggregate_travel_optional() -> None:
     """Strictly containing a collected cover lifts the travel requirement."""
-    from custom_components.zemismart_blinds.models import CoverConfig
-
-    collected = [
-        CoverConfig(
-            name="Slider",
-            channels=(1, 2, 3),
-            travel_up=12.0,
-            travel_down=12.0,
-        ),
-        CoverConfig(
-            name="Counter",
-            channels=(4,),
-            travel_up=8.0,
-            travel_down=8.0,
-        ),
-    ]
+    collected = [(1, 2, 3), (4,)]
     cover, errors = config_flow_module._validate_cover_input(
         {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3,4,5,6"},
         collected,
@@ -507,6 +518,40 @@ def test_validate_cover_input_born_aggregate_travel_optional() -> None:
     assert cover is not None
     assert cover.channel_key == "1-2-3-4-5-6"
     assert cover.travel_up is None
+
+
+def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
+    """Remote and subentry copy stays exact in both English JSON files."""
+    integration_dir = Path(__file__).parents[1] / "custom_components" / DOMAIN
+    strings_bytes = (integration_dir / "strings.json").read_bytes()
+    translations_bytes = (integration_dir / "translations" / "en.json").read_bytes()
+    assert strings_bytes == translations_bytes
+    strings = json.loads(strings_bytes)
+
+    assert strings["config"]["step"]["user"] == {
+        "title": "Add a Zemismart remote",
+        "description": (
+            "Learn the remote automatically, or use an Advanced setup method. "
+            "You will add its covers (blinds and groups) next."
+        ),
+        "menu_options": {
+            "learn": "Learn from remote",
+            "advanced": "Advanced",
+        },
+    }
+    assert strings["config"]["error"]["already_configured"] == (
+        "This remote is already configured by another entry."
+    )
+    assert strings["config"]["abort"]["legacy_not_supported"] == (
+        "This entry uses the old per-blind format. Delete it and add its remote "
+        "again instead of reconfiguring."
+    )
+    assert strings["config_subentries"]["cover"]["abort"] == {
+        "reconfigure_successful": "The cover was reconfigured successfully.",
+        "already_configured": (
+            "Another cover of this remote already uses exactly these channels."
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -522,6 +567,64 @@ async def test_user_starts_with_learn_and_advanced_menu(hass: Any) -> None:
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "user"
     assert result["menu_options"] == ["learn", "advanced"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
+    hass: HomeAssistant,
+) -> None:
+    """Legacy per-blind entries stay outside remote-only management flows."""
+    prepare_config_flow(hass)
+    legacy = BlindConfig(
+        name="Legacy blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
+        channels=(1, 2),
+        travel_up=12.0,
+        travel_down=12.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    legacy_entry = stored_config_entry(
+        legacy.as_dict(),
+        entry_id="legacy-entry",
+        title=legacy.name,
+        unique_id=f"{legacy.remote.key}:1-2",
+    )
+    remote = RemoteConfig(
+        name="Remote",
+        remote=legacy.remote,
+        area_id="kitchen",
+        repeats=5,
+    )
+    remote_entry = stored_config_entry(
+        remote.as_dict(),
+        entry_id="remote-entry",
+        title=remote.name,
+        unique_id=remote.key,
+    )
+
+    assert (
+        config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
+            legacy_entry
+        )
+        == {}
+    )
+    assert config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
+        remote_entry
+    ) == {
+        "cover": config_flow_module.CoverSubentryFlow
+    }
+
+    await hass.config_entries.async_add(legacy_entry)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": legacy_entry.entry_id,
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "legacy_not_supported"
 
 
 @pytest.mark.asyncio
@@ -675,6 +778,13 @@ async def test_learn_wizard_creates_remote_entry_with_cover_subentries(
     )
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+    error_schema = result["data_schema"]
+    assert error_schema is not None
+    error_suggestions = schema_suggested_values(error_schema)
+    assert error_suggestions[CONF_TRAVEL_UP] == 9
+    assert error_suggestions[CONF_TRAVEL_DOWN] == 9
+    assert CONF_TRAVEL_UP not in error_schema({})
+    assert CONF_TRAVEL_DOWN not in error_schema({})
     result = await hass.config_entries.flow.async_configure(
         flow_id,
         {CONF_NAME: "Sink", CONF_CHANNELS: "5"},
@@ -744,6 +854,77 @@ async def test_learn_allows_explicit_online_bridge_override(
     )
     hass.config_entries.flow.async_abort(flow_id)
     await fake.wait_for_publications(2)
+
+
+@pytest.mark.asyncio
+async def test_advanced_setup_clears_learned_cover_channel_prefill(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leaving Learn for Advanced cannot leak captured channels into Manual."""
+    prepare_config_flow(hass, monkeypatch)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Learned shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: "bridge-a",
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    rx = fake.rx_subscriptions()[0]
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 3}),
+    )
+    await fake.wait_for_publications(2)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "advanced"},
+    )
+    assert result["step_id"] == "advanced"
+    await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "manual"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        manual_input(base_trailer=""),
+    )
+    assert result["step_id"] == "remote_settings"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Manual remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+
+    assert result["step_id"] == "cover"
+    schema = result["data_schema"]
+    assert schema is not None
+    assert schema(
+        {
+            CONF_NAME: "Manual cover",
+            CONF_TRAVEL_UP: 12,
+            CONF_TRAVEL_DOWN: 12,
+        }
+    )[CONF_CHANNELS] == ""
 
 
 @pytest.mark.asyncio
@@ -990,6 +1171,44 @@ async def test_learn_without_online_bridges_offers_advanced(
 
 
 @pytest.mark.asyncio
+async def test_reconfigure_learn_without_online_bridges_hides_advanced(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relearn failures cannot escape into new-entry Advanced setup paths."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    fake = FakeMqtt(bridges={})
+    install_mqtt(monkeypatch, fake)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "reconfigure_learn"},
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_unavailable"
+    assert result["menu_options"] == ["learn_setup"]
+
+
+@pytest.mark.asyncio
 async def test_learn_without_mqtt_offers_advanced(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -1173,6 +1392,145 @@ async def test_subentry_add_rejects_partial_overlap_and_duplicate(
 
 
 @pytest.mark.asyncio
+async def test_subentry_add_fails_closed_for_unparseable_sibling_channels(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable sibling blocks cover mutations instead of disappearing."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    sibling = next(iter(entry.subentries.values()))
+    hass.config_entries.async_update_subentry(
+        entry,
+        sibling,
+        data={CONF_NAME: "x", CONF_CHANNELS: "not-a-channel"},
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Sink",
+            CONF_CHANNELS: "5",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_config"}
+
+
+@pytest.mark.asyncio
+async def test_subentry_add_validates_channels_from_malformed_travel_sibling(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parseable sibling channels still participate when its travel is corrupt."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    sibling = next(iter(entry.subentries.values()))
+    hass.config_entries.async_update_subentry(
+        entry,
+        sibling,
+        data={
+            CONF_NAME: "x",
+            CONF_CHANNELS: "1,2",
+            CONF_TRAVEL_UP: "garbage",
+            CONF_TRAVEL_DOWN: "garbage",
+        },
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Overlap",
+            CONF_CHANNELS: "2,3",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+
+
+@pytest.mark.asyncio
+async def test_subentry_reconfigure_prefills_display_values(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconfigure suggestions display storage values in form-friendly shapes."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 13,
+            }
+        ],
+    )
+    slider = next(iter(entry.subentries.values()))
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "subentry_id": slider.subentry_id,
+        },
+    )
+    schema = result["data_schema"]
+    assert schema is not None
+    suggested = schema_suggested_values(schema)
+    assert suggested[CONF_CHANNELS] == "1,2,3"
+    assert suggested[CONF_TRAVEL_UP] == 12.0
+    assert suggested[CONF_TRAVEL_DOWN] == 13.0
+
+    suggested[CONF_NAME] = "Renamed slider"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        schema(suggested),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    updated = next(iter(entry.subentries.values()))
+    restored = CoverConfig.from_subentry(updated.data)
+    assert updated.title == "Renamed slider"
+    assert restored.channels == (1, 2, 3)
+    assert restored.travel_up == 12.0
+    assert restored.travel_down == 13.0
+
+
+@pytest.mark.asyncio
 async def test_subentry_reconfigure_carries_hidden_travel_forward(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -1351,11 +1709,13 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
     assert schema is not None
     setup_values = schema({})
     assert setup_values[CONF_NAME] == "Kitchen remote"
+    setup_values[CONF_NAME] = "Renamed remote"
+    setup_values[CONF_AREA_ID] = "pantry"
     result = await hass.config_entries.flow.async_configure(flow_id, setup_values)
     assert result["type"] is FlowResultType.SHOW_PROGRESS
     await fake.wait_for_publications(1)
     rx = fake.rx_subscriptions()[0]
-    # Emit on the subscription's own topic: the entry's area ("kitchen")
+    # Emit on the subscription's own topic: the edited area ("pantry")
     # matches no fake bridge, so automatic selection routes to the default
     # bridge — hardcoding a bridge id here would miss the capture handler's
     # exact-topic check.
@@ -1378,7 +1738,9 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
     updated = RemoteConfig.from_entry(entry.data)
     assert updated.key == f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x}"
     assert entry.unique_id == updated.key
-    assert updated.name == "Kitchen remote"
+    assert updated.name == "Renamed remote"
+    assert updated.area_id == "pantry"
+    assert entry.title == "Renamed remote"
     assert [subentry.unique_id for subentry in entry.subentries.values()] == ["1-2"]
 
 

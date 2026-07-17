@@ -7,7 +7,7 @@ import functools
 import json
 import logging
 import secrets
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -495,19 +495,51 @@ def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
     return vol.Schema(fields)
 
 
+def _cover_display_values(
+    data: Mapping[str, object],
+    title: str,
+) -> dict[str, object]:
+    """Convert stored cover data to values suitable for form suggestions."""
+    try:
+        cover = CoverConfig.from_subentry(data)
+    except TypeError, ValueError:
+        suggested: dict[str, object] = {CONF_NAME: title}
+        if (raw_channels := data.get(CONF_CHANNELS)) is not None:
+            if isinstance(raw_channels, str):
+                channels_text = raw_channels
+            elif isinstance(raw_channels, Iterable):
+                channels_text = ",".join(str(channel) for channel in raw_channels)
+            else:
+                channels_text = str(raw_channels)
+            suggested[CONF_CHANNELS] = channels_text
+        return suggested
+
+    suggested = {
+        CONF_NAME: cover.name,
+        CONF_CHANNELS: ",".join(str(channel) for channel in cover.channels),
+    }
+    for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
+        if (stored := data.get(key)) not in (None, ""):
+            suggested[key] = stored
+    return suggested
+
+
 def _validate_cover_input(
     user_input: Mapping[str, Any],
-    collected: list[CoverConfig],
+    existing: list[tuple[int, ...]],
 ) -> tuple[CoverConfig | None, dict[str, str]]:
     """Validate one wizard cover form against the covers collected so far."""
     try:
         channels = parse_channels(user_input.get(CONF_CHANNELS, ""))
     except ValueError:
         return None, {CONF_CHANNELS: "invalid_config"}
-    conflict = laminar_conflict(channels, [cover.channels for cover in collected])
+    conflict = laminar_conflict(channels, existing)
     if conflict is not None:
         return None, {CONF_CHANNELS: conflict}
-    born_aggregate = any(frozenset(cover.channels) < frozenset(channels) for cover in collected)
+    born_aggregate = any(
+        frozenset(sibling_channels) < frozenset(channels)
+        for sibling_channels in existing
+    )
     raw_up = user_input.get(CONF_TRAVEL_UP)
     raw_down = user_input.get(CONF_TRAVEL_DOWN)
     if not born_aggregate and (raw_up is None or raw_down is None):
@@ -559,21 +591,28 @@ def _learn_setup_schema(
     )
 
 
-def _sibling_covers(
+def _sibling_channel_sets(
     entry: config_entries.ConfigEntry,
     *,
     exclude_subentry_id: str | None = None,
-) -> list[CoverConfig]:
-    """Parse every cover subentry of one entry except the excluded one."""
-    covers: list[CoverConfig] = []
+) -> list[tuple[int, ...]]:
+    """Load every sibling channel set, failing closed on unreadable channels."""
+    channel_sets: list[tuple[int, ...]] = []
     for subentry in entry.subentries.values():
         if subentry.subentry_type != "cover":
             continue
         if exclude_subentry_id is not None and subentry.subentry_id == exclude_subentry_id:
             continue
-        with suppress(TypeError, ValueError):
-            covers.append(CoverConfig.from_subentry(subentry.data))
-    return covers
+        try:
+            channels = CoverConfig.from_subentry(subentry.data).channels
+        except TypeError, ValueError:
+            try:
+                channels = parse_channels(subentry.data.get(CONF_CHANNELS, ""))
+            except (TypeError, ValueError) as err:
+                msg = f"invalid sibling cover channels: {subentry.subentry_id}"
+                raise ValueError(msg) from err
+        channel_sets.append(channels)
+    return channel_sets
 
 
 class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
@@ -586,16 +625,18 @@ class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
         """Add one cover subentry."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            cover, errors = _validate_cover_input(
-                user_input,
-                _sibling_covers(self._get_entry()),
-            )
-            if cover is not None:
-                return self.async_create_entry(
-                    data=cover.as_dict(),
-                    title=cover.name,
-                    unique_id=cover.channel_key,
-                )
+            try:
+                existing = _sibling_channel_sets(self._get_entry())
+            except ValueError:
+                errors = {"base": "invalid_config"}
+            else:
+                cover, errors = _validate_cover_input(user_input, existing)
+                if cover is not None:
+                    return self.async_create_entry(
+                        data=cover.as_dict(),
+                        title=cover.name,
+                        unique_id=cover.channel_key,
+                    )
         return self.async_show_form(
             step_id="user",
             data_schema=_cover_schema(user_input or {}),
@@ -610,29 +651,40 @@ class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
         entry = self._get_entry()
         subentry = self._get_reconfigure_subentry()
         errors: dict[str, str] = {}
-        suggested: Mapping[str, object] = subentry.data
+        suggested: Mapping[str, object] = _cover_display_values(
+            subentry.data,
+            subentry.title,
+        )
         if user_input is not None:
             merged = dict(user_input)
             for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
                 stored = subentry.data.get(key)
                 if key not in merged and stored not in (None, ""):
                     merged[key] = stored
-            cover, errors = _validate_cover_input(
-                merged,
-                _sibling_covers(entry, exclude_subentry_id=subentry.subentry_id),
-            )
-            if cover is not None:
-                return self.async_update_and_abort(
+            try:
+                existing = _sibling_channel_sets(
                     entry,
-                    subentry,
-                    data=cover.as_dict(),
-                    title=cover.name,
-                    unique_id=cover.channel_key,
+                    exclude_subentry_id=subentry.subentry_id,
                 )
+            except ValueError:
+                errors = {"base": "invalid_config"}
+            else:
+                cover, errors = _validate_cover_input(merged, existing)
+                if cover is not None:
+                    return self.async_update_and_abort(
+                        entry,
+                        subentry,
+                        data=cover.as_dict(),
+                        title=cover.name,
+                        unique_id=cover.channel_key,
+                    )
             suggested = user_input
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=_cover_schema(suggested),
+            data_schema=self.add_suggested_values_to_schema(
+                _cover_schema(None),
+                suggested,
+            ),
             errors=errors,
         )
 
@@ -649,7 +701,8 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry: config_entries.ConfigEntry,
     ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
         """Expose per-cover subentry management on remote entries."""
-        del config_entry
+        if CONF_CHANNELS in config_entry.data:
+            return {}
         return {"cover": CoverSubentryFlow}
 
     _capture: _LearnCapture | None = None
@@ -669,6 +722,8 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Offer identity relearning or direct settings edits."""
+        if CONF_CHANNELS in self._get_reconfigure_entry().data:
+            return self.async_abort(reason="legacy_not_supported")
         del user_input
         return self.async_show_menu(
             step_id="reconfigure",
@@ -700,9 +755,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         current = RemoteConfig.from_entry(entry.data)
         updated = RemoteConfig(
-            name=current.name,
+            name=self._learn_name if self._learn_name is not None else current.name,
             remote=self._identity,
-            area_id=current.area_id,
+            area_id=(
+                self._learn_area_id
+                if self._learn_area_id is not None
+                else current.area_id
+            ),
             repeats=current.repeats,
             coalesce_window_ms=current.coalesce_window_ms,
         )
@@ -834,6 +893,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    def _learn_failure_menu_options(self, retry_step: str) -> list[str]:
+        """Return failure recovery paths appropriate to the flow source."""
+        menu_options = [retry_step]
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            menu_options.append("advanced")
+        return menu_options
+
     async def async_step_learn_unavailable(
         self,
         user_input: dict[str, Any] | None = None,
@@ -843,7 +909,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._learn_registry = None
         return self.async_show_menu(
             step_id="learn_unavailable",
-            menu_options=["learn_setup", "advanced"],
+            menu_options=self._learn_failure_menu_options("learn_setup"),
         )
 
     async def async_step_learn_sniff(
@@ -895,7 +961,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         del user_input
         return self.async_show_menu(
             step_id="learn_timeout",
-            menu_options=["learn_retry", "advanced"],
+            menu_options=self._learn_failure_menu_options("learn_retry"),
         )
 
     async def async_step_learn_confirm(
@@ -932,6 +998,8 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Offer manual and virtual identity paths."""
+        self._capture = None
+        self._sniff_session_id = None
         del user_input
         return self.async_show_menu(
             step_id="advanced",
@@ -1008,7 +1076,10 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return await self.async_step_user()
         errors: dict[str, str] = {}
         if user_input is not None:
-            cover, errors = _validate_cover_input(user_input, self._covers)
+            cover, errors = _validate_cover_input(
+                user_input,
+                [cover_config.channels for cover_config in self._covers],
+            )
             if cover is not None:
                 self._covers.append(cover)
                 return await self.async_step_cover_menu()
@@ -1017,9 +1088,15 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             suggested[CONF_CHANNELS] = ",".join(map(str, self._capture.channels))
         if user_input is not None:
             suggested = dict(user_input)
+        data_schema = _cover_schema(suggested)
+        if user_input is not None:
+            data_schema = self.add_suggested_values_to_schema(
+                _cover_schema(None),
+                suggested,
+            )
         return self.async_show_form(
             step_id="cover",
-            data_schema=_cover_schema(suggested),
+            data_schema=data_schema,
             errors=errors,
             description_placeholders={"count": str(len(self._covers))},
         )
