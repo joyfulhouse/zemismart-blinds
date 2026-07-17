@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-17
+
+Live state sync: physical remote presses now move the matching covers.
+
+### Added
+
+- **Live state sync from physical remotes** (with companion firmware v1.1.0): bridges
+  idle-listen and publish heard presses on `rf433/<bridge_id>/rx`; correlated UP/DOWN/STOP
+  presses update the matching cover motion models — observation only, RX never transmits.
+  Includes suppression of the integration's own command echoes heard by other bridges,
+  cross-bridge replay/dedup, heard-STOP freeze semantics, and takeover/disarm interplay
+  validated across a 12-round adversarial review.
+- Guided sniff-based onboarding and reconfigure ("Learn from remote") wizard using bounded
+  bucket-sniff windows on any online bridge.
+
+### Fixed
+
+- **OEM truncated-trailer captures decode**: some remotes (live-captured office `5cad7c`)
+  transmit 64 payload bits plus a single trailer 0-read instead of the nominal `[1, 0]`;
+  receive-side decoding (`decode_rx_capture`) now tolerates it, while transport
+  encode/decode stays strict. Presses from such remotes were previously dropped silently.
+- Release-hardening rounds 11–16 on the cover/scheduler core (displaced-STOP freeze
+  regression, timeout snapshot coverage, restore ordering, echo anchoring, teardown race).
+
+[0.2.0]: https://github.com/joyfulhouse/zemismart-blinds/releases/tag/v0.2.0
+
 ## [0.1.0] - 2026-07-14
 
 First public release.
