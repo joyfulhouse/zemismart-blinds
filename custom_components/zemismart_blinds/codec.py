@@ -524,6 +524,18 @@ def decode_b0(hexstr: str) -> DecodedFrame:
     return _decode_frame(hexstr, allow_missing_trailer=False)
 
 
+def decode_rx_capture(hexstr: str) -> DecodedFrame:
+    """Decode one live bridge capture, tolerating OEM trailer truncation.
+
+    Physical remotes do not all put the nominal ``[1, 0]`` trailer on air: the
+    office ``5cad7c`` remote's presses capture one pair short, as a single
+    trailing 0-read (live-captured 2026-07-17). Receive-side decoding accepts
+    that truncation; transport frames built by :func:`encode_b0` and validated
+    by :func:`decode_b0` stay strict.
+    """
+    return _decode_frame(hexstr, allow_missing_trailer=True)
+
+
 def decode_reference_b0(hexstr: str) -> DecodedFrame:
     """Decode a reference, including legacy B0 frames with a truncated trailer."""
     return _decode_frame(hexstr, allow_missing_trailer=True)

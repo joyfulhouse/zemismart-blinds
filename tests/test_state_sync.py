@@ -92,6 +92,25 @@ def test_frame_signature_ignores_non_movement_and_garbage(frame: str) -> None:
     assert frame_signature(frame) is None
 
 
+def test_frame_signature_decodes_live_truncated_trailer_capture() -> None:
+    """A real OEM capture with a truncated trailer still classifies.
+
+    Live Office-bridge capture of the physical 5cad7c:da remote's ALL/UP press
+    (2026-07-17): 64 payload bits plus a single trailer 0-read. Every press
+    was silently dropped here while this decode was strict.
+    """
+    live_up = (
+        "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
+        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A192A1A1A19"
+        "2A1A1955"
+    )
+    assert frame_signature(live_up) == (
+        "5cad7c:da",
+        frozenset({1, 2, 3, 4, 5, 6}),
+        "UP",
+    )
+
+
 def test_bridge_clock_tracks_steady_samples() -> None:
     """Steady samples preserve the bridge-to-HA time offset."""
     clock = BridgeClock()

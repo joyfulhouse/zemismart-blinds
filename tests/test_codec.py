@@ -18,6 +18,7 @@ from custom_components.zemismart_blinds.codec import (
     channel_field,
     decode_b0,
     decode_reference_b0,
+    decode_rx_capture,
     derive_base,
     derive_bases,
     derive_bases_from_base,
@@ -128,6 +129,52 @@ def test_reference_decoder_accepts_short_trailer_without_weakening_decode() -> N
     }
     with pytest.raises(ValueError, match="64 payload bits"):
         decode_b0(short)
+
+
+LIVE_OFFICE_B1_CAPTURES = (
+    # Live Office-bridge captures of the physical 5cad7c:da remote's ALL
+    # presses (2026-07-17). The remote transmits 64 payload bits plus a
+    # trailer that captures as a single 0-read — one pair short of nominal.
+    (
+        "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
+        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A192A1A1A19"
+        "2A1A1955",
+        0xF4BB,  # UP
+    ),
+    (
+        "AAB10413EC0276012C144638192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
+        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A192A1A1A1A19292A1929292929"
+        "2A1A1955",
+        0xBC83,  # DOWN
+    ),
+    (
+        "AAB10413EC0276012C145038192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
+        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A192A1A1A19292A192A192929"
+        "2A1A1955",
+        0xDCA3,  # STOP
+    ),
+)
+
+
+@pytest.mark.parametrize(("raw", "cmd"), LIVE_OFFICE_B1_CAPTURES)
+def test_rx_capture_decoder_accepts_live_oem_truncated_trailer(raw: str, cmd: int) -> None:
+    """Live captures of a truncated-trailer OEM remote decode for RX use only."""
+    assert decode_rx_capture(raw) == {
+        "prefix": 0x5CAD7C,
+        "remote_id": 0xDA,
+        "channel": 0xC0FF,
+        "chans": [1, 2, 3, 4, 5, 6],
+        "cmd": cmd,
+    }
+    # Transport decoding stays strict: these frames are receive-only evidence.
+    with pytest.raises(ValueError, match="64 payload bits"):
+        decode_b0(raw)
+
+
+def test_rx_capture_decoder_matches_strict_decode_on_full_frames() -> None:
+    """The RX decoder is a strict superset: nominal frames decode identically."""
+    assert decode_rx_capture(TEST_CH12_UP_B0) == decode_b0(TEST_CH12_UP_B0)
+    assert decode_rx_capture(TEST_ALL_UP_B0) == decode_b0(TEST_ALL_UP_B0)
 
 
 def test_all_channel_reference_derives_single_channel_command() -> None:

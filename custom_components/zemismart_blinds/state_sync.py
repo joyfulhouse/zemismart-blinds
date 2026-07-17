@@ -7,7 +7,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
-from .codec import decode_b0, infer_action_button
+from .codec import decode_rx_capture, infer_action_button
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,9 +47,14 @@ _MAX_RAW_FRAME_LENGTH: Final = 4 * _MAX_NORMALIZED_FRAME_LENGTH
 
 
 def frame_signature(frame_hex: str) -> FrameSignature | None:
-    """Decode one movement frame into its remote, channels, and button."""
+    """Decode one movement frame into its remote, channels, and button.
+
+    Captures use the trailer-tolerant RX decoder: physical remotes may put a
+    truncated trailer on air, and our own transmitted frames (always nominal)
+    still decode to the identical signature, so echo comparison is unaffected.
+    """
     try:
-        decoded = decode_b0(frame_hex)
+        decoded = decode_rx_capture(frame_hex)
         button = infer_action_button(decoded["chans"], decoded["cmd"])
     except ValueError:
         return None
