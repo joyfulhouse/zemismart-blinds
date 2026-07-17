@@ -323,6 +323,152 @@ class CoverConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteConfig:
+    """One remote config entry: identity, calibration, routing, transport."""
+
+    name: str
+    remote: RemoteIdentity
+    area_id: str
+    repeats: int
+    coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
+
+    def __post_init__(self) -> None:
+        """Normalize and validate at the entry-storage boundary."""
+        name = self.name.strip()
+        area_id = self.area_id.strip()
+        if not name:
+            msg = "remote name must not be empty"
+            raise ValueError(msg)
+        if not area_id:
+            msg = "area_id must not be empty"
+            raise ValueError(msg)
+        if self.remote.bases is None:
+            msg = "remote calibration is required"
+            raise ValueError(msg)
+        if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
+            msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
+            raise ValueError(msg)
+        if (
+            isinstance(self.coalesce_window_ms, bool)
+            or not isinstance(self.coalesce_window_ms, int)
+            or not 0 <= self.coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
+        ):
+            msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
+            raise ValueError(msg)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "area_id", area_id)
+
+    @property
+    def key(self) -> str:
+        """Return the remote-identity key used as the entry unique_id."""
+        return self.remote.key
+
+    @classmethod
+    def from_entry(cls, data: Mapping[str, object]) -> RemoteConfig:
+        """Build one remote from HA config-entry data."""
+        prefix = parse_hex(_required(data, CONF_PREFIX), CONF_PREFIX, 24)
+        remote_id = parse_hex(_required(data, CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
+        configured = [key in data for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
+        if any(configured) and not all(configured):
+            msg = "base_up, base_down, and base_stop must be configured together"
+            raise ValueError(msg)
+        bases = (
+            CommandBases(
+                up=parse_hex(_required(data, CONF_BASE_UP), CONF_BASE_UP, 16),
+                down=parse_hex(_required(data, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
+                stop=parse_hex(_required(data, CONF_BASE_STOP), CONF_BASE_STOP, 16),
+                trailer=(
+                    parse_hex(data[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
+                    if data.get(CONF_BASE_TRAILER) not in (None, "")
+                    else None
+                ),
+            )
+            if all(configured)
+            else None
+        )
+        remote = RemoteIdentity(prefix=prefix, remote_id=remote_id, bases=bases)
+        return cls(
+            name=str(_required(data, CONF_NAME)),
+            remote=remote,
+            area_id=str(_required(data, CONF_AREA_ID)),
+            repeats=whole_number(_required(data, CONF_REPEATS), CONF_REPEATS),
+            coalesce_window_ms=whole_number(
+                data.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
+                CONF_COALESCE_WINDOW_MS,
+            ),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return JSON-safe config-entry storage values."""
+        assert self.remote.bases is not None
+        values: dict[str, object] = {
+            CONF_NAME: self.name,
+            CONF_PREFIX: f"{self.remote.prefix:06x}",
+            CONF_REMOTE_ID: f"{self.remote.remote_id:02x}",
+            CONF_AREA_ID: self.area_id,
+            CONF_REPEATS: self.repeats,
+            CONF_COALESCE_WINDOW_MS: self.coalesce_window_ms,
+            CONF_BASE_UP: f"{self.remote.bases.up:04x}",
+            CONF_BASE_DOWN: f"{self.remote.bases.down:04x}",
+            CONF_BASE_STOP: f"{self.remote.bases.stop:04x}",
+        }
+        values[CONF_BASE_TRAILER] = (
+            f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
+        )
+        return values
+
+
+def laminar_conflict(
+    new_channels: Iterable[int],
+    existing: Iterable[Iterable[int]],
+) -> str | None:
+    """Return a conflict key if ``new_channels`` is not laminar with ``existing``.
+
+    A laminar family admits only disjoint or strictly nested sets. Returns
+    ``"duplicate_channels"`` on an equal set, ``"overlapping_channels"`` on a
+    partial overlap (intersecting but neither strict subset nor superset), or
+    ``None`` when the addition keeps the family laminar.
+    """
+    new_set = frozenset(new_channels)
+    for other in existing:
+        other_set = frozenset(other)
+        if new_set == other_set:
+            return "duplicate_channels"
+        if new_set & other_set and not (new_set < other_set or other_set < new_set):
+            return "overlapping_channels"
+    return None
+
+
+def derive_role(cover: CoverConfig, siblings: Iterable[CoverConfig]) -> Role:
+    """Return AGGREGATE iff a sibling's channels strictly subset ``cover``'s."""
+    own = frozenset(cover.channels)
+    for sibling in siblings:
+        if frozenset(sibling.channels) < own:
+            return Role.AGGREGATE
+    return Role.LEAF
+
+
+def member_covers(
+    cover: CoverConfig,
+    siblings: Iterable[CoverConfig],
+) -> tuple[CoverConfig, ...]:
+    """Return the leaf covers strictly inside ``cover``, sorted by channel key.
+
+    A sibling is a leaf when no other sibling strictly subsets it; only leaves
+    are members, so each physical channel is represented at most once and
+    nested aggregates are never traversed.
+    """
+    covers = list(siblings)
+    own = frozenset(cover.channels)
+    members = [
+        candidate
+        for candidate in covers
+        if frozenset(candidate.channels) < own and derive_role(candidate, covers) is Role.LEAF
+    ]
+    return tuple(sorted(members, key=lambda candidate: candidate.channel_key))
+
+
+@dataclass(frozen=True, slots=True)
 class BlindConfig:
     """Persisted configuration for exactly one blind or group device."""
 

@@ -39,6 +39,8 @@ from tests.synthetic import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from custom_components.zemismart_blinds.models import CoverConfig
+
 # A second synthetic remote used to prove that remote identity partitions
 # coalescing batches and command targets.
 _name, OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES, _payload = SYNTHETIC_REMOTES[1]
@@ -136,6 +138,148 @@ def test_cover_config_roundtrips_through_mapping() -> None:
     restored_aggregate = CoverConfig.from_subentry(aggregate.as_dict())
     assert restored_aggregate == aggregate
     assert restored_aggregate.travel_up is None
+
+
+def _remote_identity() -> RemoteIdentity:
+    from custom_components.zemismart_blinds.models import RemoteIdentity
+
+    return RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+
+
+def test_remote_config_key_and_defaults() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    remote = RemoteConfig(
+        name=" Kitchen remote ",
+        remote=_remote_identity(),
+        area_id=" kitchen ",
+        repeats=5,
+    )
+    assert remote.name == "Kitchen remote"
+    assert remote.area_id == "kitchen"
+    assert remote.key == f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    assert remote.coalesce_window_ms == 150
+
+
+def test_remote_config_validates_bounds_and_calibration() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig, RemoteIdentity
+
+    with pytest.raises(ValueError, match="calibration"):
+        RemoteConfig(
+            name="x",
+            remote=RemoteIdentity(0x000001, 0x02),  # no bases, none pre-seeded
+            area_id="a",
+            repeats=5,
+        )
+    with pytest.raises(ValueError, match="repeats"):
+        RemoteConfig(name="x", remote=_remote_identity(), area_id="a", repeats=0)
+    with pytest.raises(ValueError, match="coalesce"):
+        RemoteConfig(
+            name="x",
+            remote=_remote_identity(),
+            area_id="a",
+            repeats=5,
+            coalesce_window_ms=99_999,
+        )
+    with pytest.raises(ValueError, match="area"):
+        RemoteConfig(name="x", remote=_remote_identity(), area_id="  ", repeats=5)
+
+
+def test_remote_config_roundtrips_through_mapping() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=7,
+        coalesce_window_ms=200,
+    )
+    restored = RemoteConfig.from_entry(remote.as_dict())
+    assert restored == remote
+    assert restored.remote.bases == TEST_BASES
+
+
+def test_laminar_conflict_accepts_disjoint_and_nested() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    existing = [(1, 2, 3), (4,), (5,)]
+    assert laminar_conflict((6,), existing) is None  # disjoint
+    assert laminar_conflict((1, 2, 3, 4, 5, 6), existing) is None  # strict superset of all
+    assert laminar_conflict((1,), existing) is None  # strict subset of (1,2,3)
+
+
+def test_laminar_conflict_rejects_partial_overlap() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    existing = [(1, 2, 3)]
+    assert laminar_conflict((2, 3, 4), existing) == "overlapping_channels"
+    assert laminar_conflict((3, 4), existing) == "overlapping_channels"
+
+
+def test_laminar_conflict_rejects_duplicate() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    assert laminar_conflict((1, 2), [(2, 1)]) == "duplicate_channels"
+
+
+def test_laminar_conflict_normalizes_before_comparing() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    # order/dupes must not matter; nested still passes
+    assert laminar_conflict((3, 1), [(1, 2, 3), (1, 3)]) == "duplicate_channels"
+
+
+def _kitchen_covers() -> list[CoverConfig]:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    slider = CoverConfig(name="Slider", channels=(1, 2, 3), travel_up=12.0, travel_down=12.0)
+    counter = CoverConfig(name="Counter", channels=(4,), travel_up=8.0, travel_down=8.0)
+    sink = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
+    allshades = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    return [slider, counter, sink, allshades]
+
+
+def test_derive_role_leaf_and_aggregate() -> None:
+    from custom_components.zemismart_blinds.models import Role, derive_role
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    assert derive_role(by_key["1-2-3"], covers) == Role.LEAF
+    assert derive_role(by_key["4"], covers) == Role.LEAF
+    assert derive_role(by_key["1-2-3-4-5-6"], covers) == Role.AGGREGATE
+
+
+def test_member_covers_are_leaves_only() -> None:
+    from custom_components.zemismart_blinds.models import member_covers
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    members = member_covers(by_key["1-2-3-4-5-6"], covers)
+    keys = [m.channel_key for m in members]
+    # slider (1-2-3), counter (4), sink (5) are leaves inside; nested aggregates excluded.
+    assert keys == ["1-2-3", "4", "5"]
+
+
+def test_member_covers_excludes_nested_aggregates() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig, member_covers
+
+    leaf1 = CoverConfig(name="1", channels=(1,), travel_up=5.0, travel_down=5.0)
+    inner = CoverConfig(name="inner", channels=(1, 2))  # aggregate over leaf1
+    leaf2 = CoverConfig(name="2", channels=(2,), travel_up=5.0, travel_down=5.0)
+    outer = CoverConfig(name="outer", channels=(1, 2, 3))  # aggregate
+    leaf3 = CoverConfig(name="3", channels=(3,), travel_up=5.0, travel_down=5.0)
+    covers = [leaf1, inner, leaf2, outer, leaf3]
+    members = member_covers(outer, covers)
+    assert [m.channel_key for m in members] == ["1", "2", "3"]  # inner (1-2) excluded
+
+
+def test_member_covers_empty_for_leaf() -> None:
+    from custom_components.zemismart_blinds.models import member_covers
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    assert member_covers(by_key["4"], covers) == ()
 
 
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
