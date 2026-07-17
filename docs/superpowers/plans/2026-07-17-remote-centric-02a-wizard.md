@@ -606,15 +606,12 @@ def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
             CONF_CHANNELS,
             default=str(values.get(CONF_CHANNELS, "")),
         ): selector.TextSelector(),
+        # Travel fields carry NO defaults, ever: a default harvested from a
+        # previous (failed) submission would silently backfill an omitted
+        # field on the next attempt and defeat the travel_required check.
+        vol.Optional(CONF_TRAVEL_UP): travel_selector,
+        vol.Optional(CONF_TRAVEL_DOWN): travel_selector,
     }
-    for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
-        raw = values.get(key)
-        marker = (
-            vol.Optional(key, default=float(cast("float", raw)))
-            if isinstance(raw, int | float) and not isinstance(raw, bool)
-            else vol.Optional(key)
-        )
-        fields[marker] = travel_selector
     return vol.Schema(fields)
 
 
@@ -648,8 +645,6 @@ def _validate_cover_input(
         return None, {"base": "invalid_config"}
     return cover, {}
 ```
-
-(`cast` is imported from `typing` — add it to the existing `typing` import.)
 
 Flow steps:
 
@@ -1024,7 +1019,10 @@ def _known_remote_pairs(hass: HomeAssistant) -> set[tuple[int, int]]:
   Mechanical rules:
   - Any assertion `result["menu_options"] == ["learn_details", "learn_retry", "advanced"]` → `["remote_settings", "learn_retry", "advanced"]`.
   - Any `{"next_step_id": "learn_details"}` navigation → `{"next_step_id": "remote_settings"}` followed by the remote_settings/cover submissions from the wizard test if the test needs to reach CREATE_ENTRY; tests that only exercise capture/timeout/retry/cleanup stop before that and need no more changes.
-  - `test_learn_allows_explicit_online_bridge_override` walks to entry creation: after its capture confirm, replace the old details submission with the remote_settings + one-leaf-cover + finish sequence (copy from the wizard test, adjusting names).
+  - `test_learn_allows_explicit_online_bridge_override` aborts during
+    sniffing and never reaches confirmation or entry creation — it needs NO
+    entry-creation migration; leave it unchanged unless a step-name assertion
+    fails, in which case apply only the mechanical menu/step renames above.
   - The timeout/retry/session/subscription/abort/serialization/no-bridge/no-mqtt tests (`test_learn_timeout_retry_ignores_stale_session`, `test_learn_subscription_readiness_uses_the_same_timeout_budget`, `test_learn_abort_cleans_capture_and_ignores_late_frame`, `test_learn_serializes_concurrent_sniffs_on_one_bridge`, `test_learn_without_online_bridges_offers_advanced`, `test_learn_without_mqtt_offers_advanced`, `test_user_starts_with_learn_and_advanced_menu`) exercise machinery that did not move; update only step-name/menu assertions that changed (`user` menu still `["learn", "advanced"]` — unchanged).
 
 - [ ] **Step 3:** `uv run pytest tests/test_config_flow.py -v` → ALL PASS.
