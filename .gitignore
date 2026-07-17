@@ -10,3 +10,7 @@ esphome/secrets.yaml
 
 # Working documents (design briefs, review logs, plans) — not published
 .working/
+
+# Session/tool artifacts
+.pytest-tmp/
+.worktrees/

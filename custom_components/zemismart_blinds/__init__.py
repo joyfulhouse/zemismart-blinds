@@ -25,6 +25,7 @@ from .const import (
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
     MQTT_ROOT,
+    MQTT_RX_TOPIC,
     MQTT_STATUS_TOPIC,
     SERVICE_NEW_VIRTUAL_REMOTE,
     SERVICE_SEND_RAW,
@@ -66,7 +67,7 @@ def _payload_text(payload: str | bytes | bytearray) -> str:
     return payload.decode() if isinstance(payload, bytes | bytearray) else payload
 
 
-# The three MQTT handlers are @callback functions subscribed via
+# The four MQTT handlers are @callback functions subscribed via
 # functools.partial: HA's MQTT client infers the job type from the callable
 # (unwrapping partials), and a plain lambda would be classified as an
 # executor job — mutating the hub's asyncio futures from a worker thread.
@@ -122,6 +123,24 @@ def _handle_status(runtime: DomainRuntime, message: ReceiveMessage) -> None:
         runtime.hub.handle_status(bridge_id, message.payload)
 
 
+@callback
+def _handle_rx(runtime: DomainRuntime, message: ReceiveMessage) -> None:
+    """Forward one live, well-formed bridge capture to the RX consumer."""
+    if message.retain:
+        return
+    bridge_id = _bridge_id(message.topic, "rx")
+    if bridge_id is None:
+        return
+    try:
+        decoded: object = json.loads(_payload_text(message.payload))
+    except UnicodeDecodeError, json.JSONDecodeError:
+        return
+    if not isinstance(decoded, Mapping):
+        return
+    payload = {str(key): value for key, value in decoded.items()}
+    runtime.hub.handle_rx(bridge_id, payload)
+
+
 def _create_domain_runtime(hass: HomeAssistant) -> DomainRuntime:
     """Construct the shared runtime synchronously before any setup await."""
     from homeassistant.components import mqtt
@@ -139,7 +158,7 @@ async def _async_initialize_domain_runtime(
     hass: HomeAssistant,
     runtime: DomainRuntime,
 ) -> None:
-    """Install the three shared subscriptions and services exactly once."""
+    """Install the four shared subscriptions and services exactly once."""
     from homeassistant.components import mqtt
     from homeassistant.exceptions import ConfigEntryNotReady
 
@@ -154,6 +173,7 @@ async def _async_initialize_domain_runtime(
         (MQTT_AVAILABILITY_TOPIC, functools.partial(_handle_availability, runtime)),
         (MQTT_INFO_TOPIC, functools.partial(_handle_info, runtime)),
         (MQTT_STATUS_TOPIC, functools.partial(_handle_status, runtime)),
+        (MQTT_RX_TOPIC, functools.partial(_handle_rx, runtime)),
     )
     try:
         for topic, handler in subscriptions:

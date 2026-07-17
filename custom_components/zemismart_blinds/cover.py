@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import time
 import weakref
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.components.cover import (
     ATTR_CURRENT_POSITION,
@@ -14,6 +15,7 @@ from homeassistant.components.cover import (
     CoverEntity,
     CoverEntityFeature,
 )
+from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -30,13 +32,18 @@ from .models import (
     CommandAckTimeoutError,
     CommandStartedTimeoutError,
     EntryRuntime,
+    TakeoverCoverState,
     ZemismartHub,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+    from .state_sync import HeardEvent
 
 _ATTR_DEGRADED = "degraded_bridge"
 _ATTR_LAST_BRIDGE = "last_bridge"
@@ -50,11 +57,24 @@ _ATTR_MOTION_START_POSITION = "motion_start_position"
 _ATTR_MOTION_TARGET = "motion_target"
 _ATTR_MOTION_TIMED = "motion_timed"
 _ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
+_ATTR_UNVERIFIED_ANCHOR_COMMAND_ID = "unverified_anchor_command_id"
 _ATTR_UNVERIFIED_ANCHOR_OFFLINE = "unverified_anchor_offline"
 WALL_CLOCK = time.time
+_UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
 _COVERS: weakref.WeakKeyDictionary[ZemismartHub, weakref.WeakSet[ZemismartCover]] = (
     weakref.WeakKeyDictionary()
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _MotionStart:
+    """Carry model timing and provenance independently of a transport ack."""
+
+    source: str
+    started_at: float
+    deadline: float | None
+    bridge_id: str | None
+    command_id: str | None
 
 
 async def async_setup_entry(
@@ -107,11 +127,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_timed = False
         self._motion_absolute_anchor = False
         self._unverified_anchor_bridge: str | None = None
+        self._unverified_anchor_command_id: str | None = None
         self._unverified_anchor_offline = False
         self._motion_token: object | None = None
         self._motion_task: asyncio.Task[None] | None = None
         self._last_bridge: str | None = None
         self._degraded = False
+        self._intent_generation = 0
+        self._restore_epoch = 0
+        self._unsubscribe_rx_listener: Callable[[], None] | None = None
+        self._stopped_by_heard = False
         # Serializes this entity's own commands: without it, a set_position
         # racing an unstarted open/close computes travel from a stale
         # estimate and physically overshoots.
@@ -171,6 +196,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_TIMED: self._motion_timed,
             _ATTR_MOTION_ABSOLUTE_ANCHOR: self._motion_absolute_anchor,
             _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
+            _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID: self._unverified_anchor_command_id,
             _ATTR_UNVERIFIED_ANCHOR_OFFLINE: self._unverified_anchor_offline,
         }
 
@@ -178,10 +204,23 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Restore a stopped estimate or reconstruct complete started motion."""
         await super().async_added_to_hass()
         _COVERS.setdefault(self._hub, weakref.WeakSet()).add(self)
+        self._unsubscribe_rx_listener = self._hub.register_rx_listener(
+            self._config.remote.key,
+            frozenset(self._config.channels),
+            self._on_heard_press,
+            takeover_state=self._takeover_state,
+            invalidate_takeover=self._invalidate_for_takeover,
+        )
         self._hub.displaced_listeners.append(self._on_displaced)
+        self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
+        restore_guard = (self._intent_generation, self._restore_epoch)
+        await self._async_restore_state(restore_guard)
+
+    async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
+        """Restore one stopped estimate or complete started motion."""
         state = await self.async_get_last_state()
-        if state is None:
+        if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
             return
         if state.attributes.get("remote") != self._config.remote_key or state.attributes.get(
             "channels"
@@ -202,10 +241,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._unverified_anchor_bridge = self._optional_text(
             state.attributes.get(_ATTR_UNVERIFIED_ANCHOR)
         )
+        self._unverified_anchor_command_id = (
+            self._optional_text(state.attributes.get(_ATTR_UNVERIFIED_ANCHOR_COMMAND_ID))
+            if self._unverified_anchor_bridge is not None
+            else None
+        )
         self._unverified_anchor_offline = (
             self._unverified_anchor_bridge is not None
             and state.attributes.get(_ATTR_UNVERIFIED_ANCHOR_OFFLINE) is True
         )
+        self._replay_emission_proof()
 
         raw_direction = state.attributes.get(_ATTR_MOTION_DIRECTION, 0)
         direction = (
@@ -269,16 +314,18 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             if absolute_anchor:
                 # A full travel that finished during downtime reached its hard
                 # limit just like one completed by _async_track_motion.
-                self._unverified_anchor_bridge = None
-                self._unverified_anchor_offline = False
-            elif timed and not self._bridge_seen_online(bridge):
+                self._clear_unverified_anchor()
+            elif (
+                timed
+                and not self._bridge_seen_online(bridge)
+                and self._unverified_anchor_bridge is None
+            ):
                 # The anchored target assumed the bridge's armed STOP fired
                 # while HA was down, but retained availability has not
                 # arrived yet on this cold start. Remember the bridge: if it
                 # later reports offline, the STOP may never have fired and
                 # the anchor is invalidated.
-                if self._unverified_anchor_bridge is None:
-                    self._unverified_anchor_bridge = bridge
+                self._set_unverified_anchor(bridge, command_id)
             self._reconcile_unverified_anchor()
             return
         # Prefer the persisted motion origin: interpolating from the original
@@ -309,15 +356,49 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel the local timer and unregister direct group notifications."""
+        if self._unsubscribe_rx_listener is not None:
+            self._unsubscribe_rx_listener()
+            self._unsubscribe_rx_listener = None
         covers = _COVERS.get(self._hub)
         if covers is not None:
             covers.discard(self)
         if self._on_displaced in self._hub.displaced_listeners:
             self._hub.displaced_listeners.remove(self._on_displaced)
+        if self._on_emission_proof in self._hub.emission_proof_listeners:
+            self._hub.emission_proof_listeners.remove(self._on_emission_proof)
         if self._on_bridge_change in self._hub.bridge_listeners:
             self._hub.bridge_listeners.remove(self._on_bridge_change)
         self._cancel_motion_task()
         await super().async_will_remove_from_hass()
+
+    @callback
+    def _on_heard_press(self, event: HeardEvent) -> None:
+        """Mirror one intersecting physical press without transmitting."""
+        channels = frozenset(self._config.channels)
+        if channels.isdisjoint(event.chans):
+            return
+        if not channels <= event.chans:
+            self._intent_generation += 1
+            self._mark_unknown()
+            self.async_write_ha_state()
+            return
+        if self._heard_press_owned_by_group(event):
+            self._intent_generation += 1
+            return
+        self._intent_generation += 1
+        self._start_heard_motion(event)
+
+    def _heard_press_owned_by_group(self, event: HeardEvent) -> bool:
+        """Return whether a contained group will model this member in the batch."""
+        if len(self._config.channels) != 1:
+            return False
+        covers = tuple(_COVERS.get(self._hub, ()))
+        return any(
+            cover is not self
+            and frozenset(cover._config.channels) <= event.chans
+            and self in cover._member_covers()
+            for cover in covers
+        )
 
     def _on_displaced(self, bridge_id: str, command_id: str) -> None:
         """React when the bridge displaced this cover's active command.
@@ -335,6 +416,33 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if self._motion_timed:
             self._interrupt_motion(WALL_CLOCK())
             self.async_write_ha_state()
+
+    @callback
+    def _on_emission_proof(self, command_id: str) -> None:
+        """Verify only the restored anchor derived from this exact command."""
+        if not command_id or command_id != self._unverified_anchor_command_id:
+            return
+        self._clear_unverified_anchor()
+        self.async_write_ha_state()
+
+    def _replay_emission_proof(self) -> None:
+        """Apply proof that raced ahead of restoring or creating its marker."""
+        command_id = self._unverified_anchor_command_id
+        if command_id is not None and self._hub.was_emission_proven(command_id):
+            self._on_emission_proof(command_id)
+
+    def _set_unverified_anchor(self, bridge_id: str, command_id: str) -> None:
+        """Question one restore target under its exact scheduler command."""
+        self._unverified_anchor_bridge = bridge_id
+        self._unverified_anchor_command_id = command_id
+        self._unverified_anchor_offline = False
+        self._replay_emission_proof()
+
+    def _clear_unverified_anchor(self) -> None:
+        """Clear all bridge- and command-scoped anchor evidence together."""
+        self._unverified_anchor_bridge = None
+        self._unverified_anchor_command_id = None
+        self._unverified_anchor_offline = False
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
         """Return whether this bridge has explicitly announced itself online."""
@@ -364,6 +472,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         anchor_bridge = self._unverified_anchor_bridge
         if anchor_bridge is None:
             self._unverified_anchor_offline = False
+            self._unverified_anchor_command_id = None
             return
         if self._hub.registry.is_known_offline(anchor_bridge):
             # A relative motion still derives from the questioned origin and
@@ -380,8 +489,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             if self._direction == 0 or not self._motion_absolute_anchor:
                 self._mark_unknown()
         elif self._bridge_seen_online(anchor_bridge):
-            self._unverified_anchor_bridge = None
-            self._unverified_anchor_offline = False
+            self._clear_unverified_anchor()
 
     @staticmethod
     def _optional_text(value: object) -> str | None:
@@ -428,6 +536,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     def _clear_motion(self) -> None:
         """Clear completed or interrupted motion metadata."""
+        self._stopped_by_heard = False
         self._direction = 0
         self._motion_started = 0.0
         self._motion_start_position = self._position
@@ -450,8 +559,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._cancel_motion_task()
         self._position = None
         self._clear_motion()
-        self._unverified_anchor_bridge = None
-        self._unverified_anchor_offline = False
+        self._clear_unverified_anchor()
         self._degraded = True
 
     def _mark_unknown_and_notify_members(self) -> None:
@@ -531,19 +639,130 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         absolute_anchor: bool = False,
     ) -> None:
         """Commit a fresh local model from correlated first RF dispatch."""
-        self._interrupt_motion(ack.started_at)
+        motion = _MotionStart(
+            source="commanded",
+            started_at=ack.started_at,
+            deadline=ack.deadline,
+            bridge_id=ack.bridge.bridge_id,
+            command_id=ack.command_id,
+        )
         self._record_ack(ack)
-        if ack.deadline is not None and self._hub.registry.is_known_offline(ack.bridge.bridge_id):
+        self._commit_motion(
+            motion,
+            direction=direction,
+            target=target,
+            duration=duration,
+            absolute_anchor=absolute_anchor,
+        )
+        if not notify_members:
+            return
+        if self._timed_motion_bridge_offline(motion):
+            for member in self._member_covers():
+                member._record_ack(ack)
+                member._mark_unknown()
+                member.async_write_ha_state()
+            self._reconcile_overlaps(moving=True)
+            return
+        for member in self._member_covers():
+            member._start_member_motion(
+                motion,
+                ack=ack,
+                direction=direction,
+                duration=duration,
+                group_target=target,
+            )
+        self._reconcile_overlaps(moving=True)
+
+    def _start_heard_motion(self, event: HeardEvent) -> None:
+        """Mirror one fully addressed physical movement event."""
+        if event.button == "STOP":
+            self._apply_stop(event.heard_at, provenance="heard")
+            return
+        if event.button == "UP":
+            direction = 1
+            target = 100.0
+            configured = self._config.travel_up
+        elif event.button == "DOWN":
+            direction = -1
+            target = 0.0
+            configured = self._config.travel_down
+        else:
+            return
+        motion = _MotionStart(
+            source="heard",
+            started_at=event.heard_at,
+            deadline=None,
+            bridge_id=None,
+            command_id=None,
+        )
+        duration = configured + FULL_TRAVEL_MARGIN_SECONDS
+        self._commit_motion(
+            motion,
+            direction=direction,
+            target=target,
+            duration=duration,
+            absolute_anchor=True,
+        )
+        for member in self._member_covers():
+            member._start_member_motion(
+                motion,
+                ack=None,
+                direction=direction,
+                duration=duration,
+                group_target=target,
+            )
+        # Heard dispatch is one batch: every intersecting cover receives its
+        # own callback, so owner-side reconciliation would invalidate another
+        # fully contained cover before or after it commits the same press.
+        self.async_write_ha_state()
+
+    def _takeover_state(self) -> TakeoverCoverState:
+        """Return current modeled-command and heard-STOP takeover state."""
+        button: Button | None = None
+        if self._direction > 0:
+            button = "UP"
+        elif self._direction < 0:
+            button = "DOWN"
+        disarm_deadline: float | None = None
+        if self._motion_bridge is not None and self._motion_command_id is not None:
+            disarm_deadline = (
+                self._motion_deadline
+                if self._motion_timed
+                else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+            )
+        return TakeoverCoverState(
+            bridge_id=self._motion_bridge,
+            command_id=self._motion_command_id,
+            button=button,
+            disarm_deadline=disarm_deadline,
+            stopped_by_heard=self._stopped_by_heard,
+        )
+
+    @callback
+    def _invalidate_for_takeover(self) -> None:
+        """Apply one hub-classified takeover invalidation to this cover."""
+        if self._unsubscribe_rx_listener is None:
+            return
+        self._restore_epoch += 1
+        self._mark_unknown()
+        self.async_write_ha_state()
+
+    def _commit_motion(
+        self,
+        motion: _MotionStart,
+        *,
+        direction: int,
+        target: float,
+        duration: float,
+        absolute_anchor: bool,
+    ) -> None:
+        """Commit travel fields from either a command ack or a heard press."""
+        self._interrupt_motion(motion.started_at)
+        if self._timed_motion_bridge_offline(motion):
             # The started status and retained offline LWT can be delivered in
             # one broker batch. The bridge's RAM-only armed STOP may already
             # be gone, so committing the partial target would be false trust.
             self._mark_unknown()
-            if notify_members:
-                for member in self._member_covers():
-                    member._record_ack(ack)
-                    member._mark_unknown()
-                    member.async_write_ha_state()
-                self._reconcile_overlaps(moving=True)
             return
         if not absolute_anchor:
             # Interrupting an exempt full travel can expose a questioned
@@ -552,15 +771,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # another position derived from that origin.
             self._reconcile_unverified_anchor()
             if self._position is None:
-                if notify_members:
-                    for member in self._member_covers():
-                        member._start_member_motion(
-                            ack,
-                            direction=direction,
-                            duration=duration,
-                            group_target=target,
-                        )
-                    self._reconcile_overlaps(moving=True)
                 return
         # An absolute anchor settles an unverified restore-time anchor only
         # when the full travel COMPLETES at the motor's own limit switch (in
@@ -573,20 +783,25 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_start_position = self._position
         self._motion_target = target
         self._motion_duration = duration
-        self._motion_started = ack.started_at
+        self._motion_started = motion.started_at
         # The model ends at whichever comes first: this cover's own travel
         # (a clamped member reaches its limit switch before the group frame
         # ends) or the bridge-armed STOP deadline. For the cover that owns
         # the command the two coincide.
-        deadline = ack.started_at + duration
-        if ack.deadline is not None:
-            deadline = min(deadline, ack.deadline)
+        deadline = motion.started_at + duration
+        if motion.deadline is not None:
+            deadline = min(deadline, motion.deadline)
         self._motion_deadline = deadline
         self._direction = direction
-        self._motion_bridge = ack.bridge.bridge_id
-        self._motion_command_id = ack.command_id
-        self._motion_timed = ack.deadline is not None
-        displaced = self._motion_timed and self._hub.was_displaced(ack.command_id)
+        self._motion_bridge = motion.bridge_id
+        self._motion_command_id = motion.command_id
+        self._motion_timed = motion.deadline is not None
+        displaced = (
+            motion.source == "commanded"
+            and self._motion_timed
+            and motion.command_id is not None
+            and self._hub.was_displaced(motion.command_id)
+        )
         if displaced:
             # The displaced status raced ahead of this model commit: the
             # bridge already flushed this timed motion's fail-safe STOP, so
@@ -595,21 +810,22 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # motor's own limit switch, so its model proceeds normally.)
             self._interrupt_motion(WALL_CLOCK())
         else:
-            self._create_motion_task("travel")
-        if notify_members:
-            for member in self._member_covers():
-                member._start_member_motion(
-                    ack,
-                    direction=direction,
-                    duration=duration,
-                    group_target=target,
-                )
-            self._reconcile_overlaps(moving=True)
+            label = "heard travel" if motion.source == "heard" else "travel"
+            self._create_motion_task(label)
+
+    def _timed_motion_bridge_offline(self, motion: _MotionStart) -> bool:
+        """Return whether a timed start depends on a bridge already offline."""
+        return (
+            motion.deadline is not None
+            and motion.bridge_id is not None
+            and self._hub.registry.is_known_offline(motion.bridge_id)
+        )
 
     def _start_member_motion(
         self,
-        ack: CommandAck,
+        motion: _MotionStart,
         *,
+        ack: CommandAck | None,
         direction: int,
         duration: float,
         group_target: float,
@@ -623,9 +839,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
         # Compute from the member's estimate AT RF start: if this member was
         # itself still moving, its stored position is up to one update
-        # interval stale, and _start_motion will sync the model origin to
-        # ack.started_at — the target must come from the same instant.
-        origin = self._estimated_position(ack.started_at)
+        # interval stale, and _commit_motion will sync the model origin to
+        # motion.started_at — the target must come from the same instant.
+        origin = self._estimated_position(motion.started_at)
         if group_target in (0.0, 100.0):
             # A full travel runs each motor to its own limit switch: model it
             # over this member's OWN calibration, not the group's duration (a
@@ -649,12 +865,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             duration = abs(target - origin) / 100.0 * full_travel
             if target in (0.0, 100.0):
                 duration += FULL_TRAVEL_MARGIN_SECONDS
-        self._start_motion(
-            ack,
+        if ack is not None:
+            self._record_ack(ack)
+        self._commit_motion(
+            motion,
             direction=direction,
             target=target,
             duration=duration,
-            notify_members=False,
             absolute_anchor=group_target in (0.0, 100.0),
         )
         self.async_write_ha_state()
@@ -686,8 +903,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # A commanded full travel ran its whole configured duration plus
             # margin and is now at the hard limit: the questioned restore
             # anchor is settled by a genuine physical reference.
-            self._unverified_anchor_bridge = None
-            self._unverified_anchor_offline = False
+            self._clear_unverified_anchor()
         self._motion_token = None
         self._motion_task = None
         self._clear_motion()
@@ -726,8 +942,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         target: float,
     ) -> None:
         """Run a full configured calibration regardless of the prior estimate."""
+        intent_generation = self._intent_generation
         ack = await self._async_transmit(button)
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return
         configured = self._config.travel_up if direction > 0 else self._config.travel_down
         self._start_motion(
@@ -751,6 +968,29 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         async with self._command_lock:
             await self._async_move_full("DOWN", -1, 0.0)
 
+    def _apply_stop(self, at: float, *, provenance: str) -> None:
+        """Freeze this cover and its members at one commanded or heard STOP."""
+        if provenance not in {"commanded", "heard"}:
+            msg = f"unsupported STOP provenance: {provenance}"
+            raise ValueError(msg)
+        self._interrupt_motion(at)
+        self._reconcile_unverified_anchor()
+        for member in self._member_covers():
+            # Freeze each member at its OWN integrated estimate; the group's
+            # aggregate says nothing about where an individual blind stopped.
+            member._interrupt_motion(at)
+            member._reconcile_unverified_anchor()
+            if provenance == "heard":
+                member._stopped_by_heard = True
+            member.async_write_ha_state()
+        if provenance == "commanded":
+            # A heard STOP is already reconciled by every intersecting cover's
+            # callback in the same batch; owner-side invalidation is harmful.
+            self._reconcile_overlaps(moving=False)
+        self.async_write_ha_state()
+        if provenance == "heard":
+            self._stopped_by_heard = True
+
     async def _async_stop(self) -> bool:
         """Stop and freeze tracking only when STOP first dispatches.
 
@@ -758,8 +998,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         command: the caller's multi-frame operation must abort rather than
         publish an older intent over the newer command.
         """
+        intent_generation = self._intent_generation
         ack = await self._async_transmit("STOP")
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return False
         # A displaced STOP still STARTED — its frame went on air and halted the
         # motors — before a newer command replaced it. Freeze self + members at
@@ -769,18 +1010,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         # RETURN VALUE reports the displacement, so a chained set-position caller
         # still aborts rather than publishing an older intent over the newer one.
         displaced = self._hub.was_displaced(ack.command_id)
-        self._interrupt_motion(ack.started_at)
         self._record_ack(ack)
-        self._reconcile_unverified_anchor()
         for member in self._member_covers():
-            # Freeze each member at its OWN integrated estimate; the group's
-            # aggregate says nothing about where an individual blind stopped.
-            member._interrupt_motion(ack.started_at)
             member._record_ack(ack)
-            member._reconcile_unverified_anchor()
-            member.async_write_ha_state()
-        self._reconcile_overlaps(moving=False)
-        self.async_write_ha_state()
+        self._apply_stop(ack.started_at, provenance="commanded")
         return not displaced
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
@@ -827,12 +1060,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
         duration = abs(target - current) / 100 * full_travel
         stop_after_ms = max(1, round(duration * 1_000))
+        intent_generation = self._intent_generation
         ack = await self._async_transmit(
             "UP" if direction > 0 else "DOWN",
             stop_after_ms=stop_after_ms,
             overlap_token=overlap_token,
         )
-        if ack is None:
+        if ack is None or intent_generation != self._intent_generation:
             return
         acknowledged_duration = (
             max(0.001, ack.deadline - ack.started_at) if ack.deadline is not None else duration

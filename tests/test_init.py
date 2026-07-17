@@ -25,14 +25,27 @@ from custom_components.zemismart_blinds.const import (
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
+    MQTT_RX_TOPIC,
     MQTT_STATUS_TOPIC,
     SERVICE_NEW_VIRTUAL_REMOTE,
     SERVICE_SEND_RAW,
 )
-from custom_components.zemismart_blinds.models import CommandAck, DomainRuntime, EntryRuntime
+from custom_components.zemismart_blinds.models import (
+    BridgeRegistry,
+    CommandAck,
+    DomainRuntime,
+    EntryRuntime,
+    ZemismartHub,
+)
+from custom_components.zemismart_blinds.state_sync import (
+    HeardEvent,
+    LedgerFrameSpec,
+    frame_signature,
+)
+from tests.synthetic import TEST_CH12_UP_B0
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from homeassistant.core import HomeAssistant
 
@@ -66,7 +79,13 @@ def config_entry(entry_id: str) -> ConfigEntry[EntryRuntime]:
     )
 
 
-def message(topic: str, payload: str, *, retain: bool) -> ReceiveMessage:
+def message(
+    topic: str,
+    payload: str,
+    *,
+    retain: bool,
+    timestamp: float = 1.0,
+) -> ReceiveMessage:
     """Build one actual MQTT ReceiveMessage for a wildcard subscription."""
     return ReceiveMessage(
         topic=topic,
@@ -74,8 +93,89 @@ def message(topic: str, payload: str, *, retain: bool) -> ReceiveMessage:
         qos=1,
         retain=retain,
         subscribed_topic=topic,
-        timestamp=1.0,
+        timestamp=timestamp,
     )
+
+
+def test_rx_handler_drops_retained_and_malformed_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a live JSON-object RX message reaches the synchronous hub callback."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publish)
+    runtime = DomainRuntime(hub=hub, unsubscribers=[])
+    handled: list[tuple[str, Mapping[str, object]]] = []
+
+    def handle_rx(
+        bridge_id: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        handled.append((bridge_id, payload))
+
+    monkeypatch.setattr(hub, "handle_rx", handle_rx)
+    payload = json.dumps({"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1})
+
+    integration_module._handle_rx(
+        runtime,
+        message("rf433/bridge-a/rx", payload, retain=True),
+    )
+    integration_module._handle_rx(
+        runtime,
+        message("rf433/bridge-a/rx", "{malformed", retain=False),
+    )
+    integration_module._handle_rx(
+        runtime,
+        message("rf433/bridge-a/rx", payload, retain=False),
+    )
+
+    assert handled == [
+        (
+            "bridge-a",
+            {"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1},
+        )
+    ]
+
+
+def test_rx_handler_uses_hub_clock_for_confirmed_echo() -> None:
+    """HA's monotonic-domain MQTT timestamp cannot classify RF ledger time."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    wall_time = 1_700_000_000.0
+    mqtt_timestamp = 12_345.67
+    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: wall_time)
+    runtime = DomainRuntime(hub=hub, unsubscribers=[])
+    signature = frame_signature(TEST_CH12_UP_B0)
+    assert signature is not None
+    remote_key, channels, button = signature
+    hub._ledger.register_pending(
+        "command-1",
+        "bridge-a",
+        tuple(channels),
+        button,
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    hub._ledger.confirm("command-1", wall_time)
+    events: list[HeardEvent] = []
+    hub.register_rx_listener(remote_key, channels, events.append)
+    payload = json.dumps({"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1})
+
+    integration_module._handle_rx(
+        runtime,
+        message(
+            "rf433/bridge-b/rx",
+            payload,
+            retain=False,
+            timestamp=mqtt_timestamp,
+        ),
+    )
+
+    assert events == []
+    assert hub.was_emission_proven("command-1")
 
 
 @pytest.mark.asyncio
@@ -83,7 +183,7 @@ async def test_concurrent_setup_and_unload_share_one_runtime(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Concurrent entries install exactly three subscriptions/services and release them once."""
+    """Concurrent entries install exactly four subscriptions/services and release them once."""
     callbacks: dict[str, Callable[[ReceiveMessage], None]] = {}
     unsubscribed: list[str] = []
     runtime_visible_before_subscribe: list[bool] = []
@@ -147,9 +247,10 @@ async def test_concurrent_setup_and_unload_share_one_runtime(
     assert set(callbacks) == {
         MQTT_AVAILABILITY_TOPIC,
         MQTT_INFO_TOPIC,
+        MQTT_RX_TOPIC,
         MQTT_STATUS_TOPIC,
     }
-    assert runtime_visible_before_subscribe == [True, True, True]
+    assert runtime_visible_before_subscribe == [True, True, True, True]
     assert hass.services.has_service(DOMAIN, SERVICE_SEND_RAW)
     assert hass.services.has_service(DOMAIN, SERVICE_NEW_VIRTUAL_REMOTE)
 
@@ -232,12 +333,12 @@ async def test_setup_waiter_survives_final_unload_generation(
 
     assert hass.data[DOMAIN] is runtime
     assert runtime.loaded_entries == {"two"}
-    assert subscribe_count == 3
+    assert subscribe_count == 4
     assert unsubscribed == 0
 
     assert await async_unload_entry(hass, second)
     assert DOMAIN not in hass.data
-    assert unsubscribed == 3
+    assert unsubscribed == 4
 
 
 @pytest.mark.asyncio
