@@ -206,12 +206,20 @@ def new_virtual_remote_identity(hass: HomeAssistant) -> tuple[int, int, CommandB
 
 def _known_remote_pairs(hass: HomeAssistant) -> set[tuple[int, int]]:
     """Return remote identities already stored in config entries."""
-    from .config_flow import known_remotes
+    from .models import parse_hex
 
-    return {
-        (remote.prefix, remote.remote_id)
-        for remote, _ in known_remotes(hass.config_entries.async_entries(DOMAIN)).values()
-    }
+    pairs: set[tuple[int, int]] = set()
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        try:
+            pairs.add(
+                (
+                    parse_hex(entry.data.get(CONF_PREFIX), CONF_PREFIX, 24),
+                    parse_hex(entry.data.get(CONF_REMOTE_ID), CONF_REMOTE_ID, 8),
+                )
+            )
+        except ValueError:
+            continue
+    return pairs
 
 
 def _whole_repeats(value: object) -> int:
