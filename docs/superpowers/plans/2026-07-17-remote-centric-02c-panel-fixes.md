@@ -2,6 +2,7 @@
 
 > Fix round from the phase-gate adversarial review of Plans 01+02a+02b
 > (panel: Fable 5, Codex GPT-5.6-sol ultra, Gemini 3.1 Pro, Grok 4.5).
+> Amended for spec rev 4: FIX-2 dropped (legacy entries become inert).
 > Implementer: Codex GPT-5.6-sol xhigh. Controller commits.
 > Files in scope: `custom_components/zemismart_blinds/{config_flow.py,strings.json,translations/en.json}`,
 > `tests/test_config_flow.py`. `tests/test_state_sync.py` untouched.
@@ -15,35 +16,13 @@ Each fix lands with its test (TDD where practical). Baseline: 627 green.
 - strings: add `config.abort.legacy_not_supported`: "This entry uses the old per-blind format. Delete it and add its remote again instead of reconfiguring." (both files).
 - Tests: legacy-format entry (build `ConfigEntry` with `BlindConfig(...).as_dict()` data as existing tests do) — (a) reconfigure init returns ABORT `legacy_not_supported`; (b) `ZemismartBlindsConfigFlow.async_get_supported_subentry_types(entry)` == `{}` for it and == `{"cover": CoverSubentryFlow}` for a remote entry.
 
-## FIX-2 (High): Identity uniqueness must see legacy entries
+## FIX-2: DROPPED (spec rev 4)
 
-Add module helper:
-
-```python
-def _identity_taken(
-    hass: HomeAssistant,
-    key: str,
-    *,
-    exclude_entry_id: str | None = None,
-) -> bool:
-    """Return whether any entry (either format) already owns this RF identity."""
-    for entry in hass.config_entries.async_entries(DOMAIN):
-        if entry.entry_id == exclude_entry_id:
-            continue
-        try:
-            prefix = parse_hex(entry.data.get(CONF_PREFIX), CONF_PREFIX, 24)
-            remote_id = parse_hex(entry.data.get(CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
-        except ValueError:
-            continue
-        if f"{prefix:06x}:{remote_id:02x}" == key:
-            return True
-    return False
-```
-
-- `async_step_remote_settings`: after the existing `_abort_if_unique_id_configured()`, also `if _identity_taken(self.hass, remote.key): return self.async_abort(reason="already_configured")`.
-- `async_step_finish`: same addition next to its unique-id guard.
-- `async_step_reconfigure_apply`: replace the `other.unique_id == updated.key` scan with `_identity_taken(self.hass, updated.key, exclude_entry_id=entry.entry_id)`.
-- Tests: with a LEGACY entry for `a1b2c3:42:1-2` present (data contains prefix `a1b2c3`, remote_id `42`), (a) the manual wizard for `a1b2c3`/`42` aborts `already_configured` at remote_settings; (b) relearn of a remote entry onto that identity aborts `already_configured`.
+Rev 4 makes legacy entries inert (`ConfigEntryError` at setup, Plan 03), so a
+legacy entry holding the same RF identity is harmless — and blocking it would
+break the migration order (onboard the replacement remote FIRST, delete the
+legacy entries after). Uniqueness stays remote-format-only via the existing
+unique_id guards. Do not implement any cross-format identity scan.
 
 ## FIX-3 (High): Source-aware learn-failure menus
 
