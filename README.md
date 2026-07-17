@@ -185,8 +185,16 @@ logger:
 
 ## Known Limitations
 
-- **No live RX/state sync yet**: sniffing is time-boxed and used only by the Learn wizard. Physical
-  remote presses are not observed after setup; live state sync is planned as a follow-up.
+- **Live state sync requires the paired bridge firmware**: when the bridges run the state-sync
+  firmware contract (continuous idle-listen `/rx`, boot id, enriched `/status`, `/cmd disarm`),
+  physical remote presses are observed and mirrored into each cover's assumed state. Without that
+  firmware the integration is transmit-only and RF reception is limited to the time-boxed Learn wizard.
+- **Physical takeover of a restored or clamped timed move (deferred)**: after a Home Assistant
+  restart, or once a group member reaches its own limit before the group's RF frame ends, HA may no
+  longer model the command's still-armed bridge fail-safe STOP. A physical remote press that reverses
+  such a move is not guaranteed to disarm that STOP — the bridge STOP can still halt the reversed
+  motion — and a displaced restored-timed command may keep a position that should read `unknown`.
+  Re-issue the movement if a blind stops unexpectedly after a takeover.
 - **Assumed position**: there is no motor feedback; position is modeled from travel time.
 - **Bridge isolated from MQTT mid-command**: a bridge that loses its network link (but not power)
   keeps executing its already-armed fail-safe STOP locally. With multiple bridges, commands fail
