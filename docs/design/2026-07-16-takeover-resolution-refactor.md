@@ -51,3 +51,19 @@ The `displaced_flushed` bit is `CommandLedger.displace()`'s return (did the disp
 ## Out of scope (unchanged)
 
 The publish barrier / `_finalize_and_publish`, the `CommandLedger` windows / `match()` echo suppression / displaced drain, emission proof, `BridgeClock` correlation, `record_commanded_start`, hold/resume, debounce, dedup, and the firmware-contract handling.
+
+## Round-13 convergence — deferred restart-recovery hazards
+
+Post-refactor validation (round 12) surfaced four findings: two refactor regressions — **#1** the restore-ordering guard reusing `_intent_generation` (so a co-channel takeover invalidation dropped a cover's own in-flight command) and **#2** a live disarm request never re-widened to a cover-owned safety deadline — and two **latent, pre-existing** restart-recovery edges — **#3** a restored timed command's displaced-flush inferred only from the in-memory ledger (empty after restart), and **#4** a restored/clamped group member forgetting its command's true bridge fail-safe STOP horizon at local completion. Cluster N (`e9ddaa4`) fixed all four; #3/#4 required a persisted "takeover tombstone" carrying each timed command's true STOP horizon across local completion and restart.
+
+Round 13 then found **seven** MEDIUM edges, all inside that new tombstone lifecycle (record-before-displaced-check, restore-before-displaced-check, offline-LWT-clears-STOP-ownership, legacy-local-clamp promoted to horizon, cross-restart disarm-retirement not remembered, evaluator channel-scope excludes late-restored members) — the same divergence the refactor had just resolved, relocated to the persistence domain, with the count rising (1→2→4→7). Several coincide with hazards the README already accepts (*bridge isolated from MQTT mid-command*; *bridge reboot during an HA restart*).
+
+**Decision:** keep the two regression fixes (#1 restore-epoch split, #2 owned-deadline widen — both attested clean) and **revert the #3/#4 tombstone machinery**. The residual behaviour is an accepted limitation:
+
+> **Deferred — physical takeover of a restored or clamped timed move.** After an HA restart, or once a group member reaches its own limit before the group's RF frame ends, Home Assistant may no longer model the command's still-armed bridge fail-safe STOP. A physical remote press that reverses such a move is then not guaranteed to disarm that STOP — the bridge STOP can still halt the reversed motion — and a displaced restored-timed command may keep a mirrored position that should read `unknown`. Re-issue the movement if a blind stops unexpectedly after a takeover.
+
+Closing this needs persisted per-command safety-horizon state whose own lifecycle (retirement across displace / disarm / offline / bridge-reboot, and cross-member restore) must be proven not to reintroduce the divergence above. It is deferred to a dedicated restart-recovery-safety work item rather than bundled into the takeover-resolution refactor.
+
+Round 13 also surfaced two **pre-existing** restore-ordering edges in the same bucket — independent of the tombstone and present since before the refactor: a concurrent group `_start_member_motion` during a member's restore await is not caught by the `(intent_generation, restore_epoch)` guard, so a stale cached position can overwrite the live motion; and the disarm evaluator's accumulated channel set can exclude a same-command member that restores after the request formed. Both join the deferred restart-recovery-safety work item.
+
+When the state-sync consumer merges, the user-facing README "Known Limitations" gains the corresponding bullet (alongside the existing bridge-isolation / bridge-reboot STOP-hazard entries).

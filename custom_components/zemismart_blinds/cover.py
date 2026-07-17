@@ -37,7 +37,7 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable
 
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
@@ -56,11 +56,6 @@ _ATTR_MOTION_STARTED = "motion_started"
 _ATTR_MOTION_START_POSITION = "motion_start_position"
 _ATTR_MOTION_TARGET = "motion_target"
 _ATTR_MOTION_TIMED = "motion_timed"
-_ATTR_TAKEOVER_BRIDGE = "takeover_bridge"
-_ATTR_TAKEOVER_BUTTON = "takeover_button"
-_ATTR_TAKEOVER_COMMAND_ID = "takeover_command_id"
-_ATTR_TAKEOVER_SAFETY_DEADLINE = "takeover_safety_deadline"
-_ATTR_TAKEOVER_TIMED = "takeover_timed"
 _ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
 _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID = "unverified_anchor_command_id"
 _ATTR_UNVERIFIED_ANCHOR_OFFLINE = "unverified_anchor_offline"
@@ -80,17 +75,6 @@ class _MotionStart:
     deadline: float | None
     bridge_id: str | None
     command_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _TakeoverTombstone:
-    """Retain one bridge command's true fail-safe STOP horizon."""
-
-    bridge_id: str
-    command_id: str
-    button: Button
-    safety_deadline: float
-    timed: bool
 
 
 async def async_setup_entry(
@@ -142,7 +126,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_command_id: str | None = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
-        self._takeover_tombstone: _TakeoverTombstone | None = None
         self._unverified_anchor_bridge: str | None = None
         self._unverified_anchor_command_id: str | None = None
         self._unverified_anchor_offline = False
@@ -198,7 +181,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose routing plus restart-safe started motion metadata."""
-        takeover = self._live_takeover_tombstone()
         return {
             "channels": list(self._config.channels),
             "remote": self._config.remote_key,
@@ -213,13 +195,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_MOTION_COMMAND_ID: self._motion_command_id,
             _ATTR_MOTION_TIMED: self._motion_timed,
             _ATTR_MOTION_ABSOLUTE_ANCHOR: self._motion_absolute_anchor,
-            _ATTR_TAKEOVER_BRIDGE: takeover.bridge_id if takeover is not None else None,
-            _ATTR_TAKEOVER_COMMAND_ID: (takeover.command_id if takeover is not None else None),
-            _ATTR_TAKEOVER_BUTTON: takeover.button if takeover is not None else None,
-            _ATTR_TAKEOVER_SAFETY_DEADLINE: (
-                takeover.safety_deadline if takeover is not None else None
-            ),
-            _ATTR_TAKEOVER_TIMED: takeover.timed if takeover is not None else False,
             _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
             _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID: self._unverified_anchor_command_id,
             _ATTR_UNVERIFIED_ANCHOR_OFFLINE: self._unverified_anchor_offline,
@@ -235,7 +210,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._on_heard_press,
             takeover_state=self._takeover_state,
             invalidate_takeover=self._invalidate_for_takeover,
-            retire_takeover=self._retire_takeover,
         )
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
@@ -256,8 +230,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # motion describe the OLD physical target and must not be
             # assigned to the new one.
             return
-        now = WALL_CLOCK()
-        self._restore_takeover_tombstone(state.attributes, now)
         restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
         if restored is not None and 0 <= restored <= 100:
             self._position = restored
@@ -310,19 +282,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
         self._last_bridge = bridge
         timed = bool(state.attributes.get(_ATTR_MOTION_TIMED, False))
-        if timed:
-            self._ensure_restored_takeover_tombstone(
-                bridge,
-                command_id,
-                direction,
-                deadline,
-                now,
-            )
         if timed and self._hub.was_displaced(command_id):
             # The status listener was installed before awaiting last state, so
             # a displaced report can arrive while the command id is not yet
             # restored. The hub's bounded recent-id memory closes that gap.
-            self._clear_takeover_tombstone(bridge, command_id)
             self._mark_unknown()
             return
         absolute_anchor = (
@@ -342,9 +305,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # the deadline has passed or not. A bridge merely not discovered
             # yet is NOT treated as offline — later drops are caught by
             # _on_bridge_change via the restored _motion_timed flag.
-            self._clear_takeover_tombstone(bridge, command_id)
             self._mark_unknown()
             return
+        now = WALL_CLOCK()
         if now >= deadline:
             self._position = target
             self._clear_motion()
@@ -447,15 +410,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         target, and channels re-driven by the displacing command get a fresh
         model from that command's own cover.
         """
-        cleared_tombstone = self._clear_takeover_tombstone(bridge_id, command_id)
+        del bridge_id
         if not command_id or command_id != self._motion_command_id:
-            if cleared_tombstone:
-                self.async_write_ha_state()
             return
         if self._motion_timed:
             self._interrupt_motion(WALL_CLOCK())
-            self.async_write_ha_state()
-        elif cleared_tombstone:
             self.async_write_ha_state()
 
     @callback
@@ -494,12 +453,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     def _on_bridge_change(self) -> None:
         """Re-evaluate availability and timed-motion safety on bridge changes."""
         self._reconcile_unverified_anchor()
-        tombstone = self._live_takeover_tombstone()
-        if tombstone is not None and self._hub.registry.is_known_offline(tombstone.bridge_id):
-            self._clear_takeover_tombstone(
-                tombstone.bridge_id,
-                tombstone.command_id,
-            )
         if (
             self._direction != 0
             and self._motion_timed
@@ -545,104 +498,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return None
         normalized = value.strip()
         return normalized or None
-
-    def _restore_takeover_tombstone(
-        self,
-        attributes: Mapping[str, Any],
-        now: float,
-    ) -> None:
-        """Restore complete, still-live fail-safe STOP metadata."""
-        self._takeover_tombstone = None
-        bridge_id = self._optional_text(attributes.get(_ATTR_TAKEOVER_BRIDGE))
-        command_id = self._optional_text(attributes.get(_ATTR_TAKEOVER_COMMAND_ID))
-        raw_button = attributes.get(_ATTR_TAKEOVER_BUTTON)
-        button: Button | None = None
-        if raw_button == "UP":
-            button = "UP"
-        elif raw_button == "DOWN":
-            button = "DOWN"
-        safety_deadline = _number(attributes.get(_ATTR_TAKEOVER_SAFETY_DEADLINE))
-        timed = attributes.get(_ATTR_TAKEOVER_TIMED) is True
-        if (
-            bridge_id is None
-            or command_id is None
-            or button is None
-            or safety_deadline is None
-            or not safety_deadline > now
-            or not timed
-        ):
-            return
-        self._takeover_tombstone = _TakeoverTombstone(
-            bridge_id=bridge_id,
-            command_id=command_id,
-            button=button,
-            safety_deadline=safety_deadline,
-            timed=timed,
-        )
-
-    def _ensure_restored_takeover_tombstone(
-        self,
-        bridge_id: str,
-        command_id: str,
-        direction: int,
-        safety_deadline: float,
-        now: float,
-    ) -> None:
-        """Upgrade legacy live timed motion into the tombstone representation."""
-        button: Button = "UP" if direction > 0 else "DOWN"
-        existing = self._live_takeover_tombstone(now)
-        if (
-            existing is not None
-            and existing.bridge_id == bridge_id
-            and existing.command_id == command_id
-            and existing.button == button
-        ):
-            return
-        if safety_deadline > now:
-            self._takeover_tombstone = _TakeoverTombstone(
-                bridge_id=bridge_id,
-                command_id=command_id,
-                button=button,
-                safety_deadline=safety_deadline,
-                timed=True,
-            )
-
-    def _record_takeover_tombstone(self, motion: _MotionStart, direction: int) -> None:
-        """Record a timed command's bridge-owned safety horizon."""
-        if motion.deadline is None or motion.bridge_id is None or motion.command_id is None:
-            return
-        self._takeover_tombstone = _TakeoverTombstone(
-            bridge_id=motion.bridge_id,
-            command_id=motion.command_id,
-            button="UP" if direction > 0 else "DOWN",
-            safety_deadline=motion.deadline,
-            timed=True,
-        )
-
-    def _live_takeover_tombstone(
-        self,
-        now: float | None = None,
-    ) -> _TakeoverTombstone | None:
-        """Return the tombstone while its bridge STOP can still fire."""
-        tombstone = self._takeover_tombstone
-        if tombstone is None:
-            return None
-        if not tombstone.safety_deadline > (WALL_CLOCK() if now is None else now):
-            self._takeover_tombstone = None
-            return None
-        return tombstone
-
-    def _clear_takeover_tombstone(self, bridge_id: str, command_id: str) -> bool:
-        """Clear safety metadata only for the command known to be retired."""
-        tombstone = self._takeover_tombstone
-        if (
-            tombstone is None
-            or tombstone.bridge_id != bridge_id
-            or tombstone.command_id != command_id
-        ):
-            return False
-        self._takeover_tombstone = None
-        return True
 
     def _estimated_position(self, now: float) -> float | None:
         """Calculate motion progress without changing entity state."""
@@ -863,41 +718,24 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     def _takeover_state(self) -> TakeoverCoverState:
         """Return current modeled-command and heard-STOP takeover state."""
-        now = WALL_CLOCK()
-        tombstone = self._live_takeover_tombstone(now)
         button: Button | None = None
         if self._direction > 0:
             button = "UP"
         elif self._direction < 0:
             button = "DOWN"
-        bridge_id = self._motion_bridge
-        command_id = self._motion_command_id
         disarm_deadline: float | None = None
-        has_fail_safe_stop = False
-        if bridge_id is not None and command_id is not None:
-            if self._motion_timed:
-                if (
-                    tombstone is not None
-                    and tombstone.bridge_id == bridge_id
-                    and tombstone.command_id == command_id
-                ):
-                    disarm_deadline = tombstone.safety_deadline
-                    has_fail_safe_stop = tombstone.timed
-            else:
-                disarm_deadline = now + _UNTIMED_DISARM_DRAIN_SECONDS
-        elif self._direction == 0 and tombstone is not None:
-            bridge_id = tombstone.bridge_id
-            command_id = tombstone.command_id
-            button = tombstone.button
-            disarm_deadline = tombstone.safety_deadline
-            has_fail_safe_stop = tombstone.timed
+        if self._motion_bridge is not None and self._motion_command_id is not None:
+            disarm_deadline = (
+                self._motion_deadline
+                if self._motion_timed
+                else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+            )
         return TakeoverCoverState(
-            bridge_id=bridge_id,
-            command_id=command_id,
+            bridge_id=self._motion_bridge,
+            command_id=self._motion_command_id,
             button=button,
             disarm_deadline=disarm_deadline,
             stopped_by_heard=self._stopped_by_heard,
-            has_fail_safe_stop=has_fail_safe_stop,
         )
 
     @callback
@@ -908,12 +746,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._restore_epoch += 1
         self._mark_unknown()
         self.async_write_ha_state()
-
-    @callback
-    def _retire_takeover(self, bridge_id: str, command_id: str) -> None:
-        """Forget a fail-safe STOP definitively removed by a disarm ack."""
-        if self._clear_takeover_tombstone(bridge_id, command_id):
-            self.async_write_ha_state()
 
     def _commit_motion(
         self,
@@ -932,7 +764,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # be gone, so committing the partial target would be false trust.
             self._mark_unknown()
             return
-        self._record_takeover_tombstone(motion, direction)
         if not absolute_anchor:
             # Interrupting an exempt full travel can expose a questioned
             # origin that went offline while the hard-limit motion was live.
