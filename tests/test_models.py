@@ -79,6 +79,65 @@ _REPLAY_STATUS_T: Final = 610_000
 _REPLAY_DELIVERY_TIME: Final = 700.0
 
 
+def test_role_is_str_enum() -> None:
+    from custom_components.zemismart_blinds.models import Role
+
+    assert Role.LEAF == "leaf"
+    assert Role.AGGREGATE == "aggregate"
+
+
+def test_cover_config_normalizes_and_exposes_channel_key() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(
+        name="  Kitchen sink  ", channels=(3, 1, 2), travel_up=12.0, travel_down=10.0
+    )
+    assert cover.name == "Kitchen sink"
+    assert cover.channels == (1, 2, 3)
+    assert cover.channel_key == "1-2-3"
+    assert cover.has_travel is True
+
+
+def test_cover_config_allows_missing_travel_times() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(name="All shades", channels=(1, 2, 3, 4, 5, 6))
+    assert cover.travel_up is None
+    assert cover.travel_down is None
+    assert cover.has_travel is False
+
+
+def test_cover_config_rejects_partial_travel_times() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    with pytest.raises(ValueError, match="together"):
+        CoverConfig(name="x", channels=(1,), travel_up=12.0)
+
+
+def test_cover_config_rejects_empty_name_and_bad_travel() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    with pytest.raises(ValueError, match="name"):
+        CoverConfig(name="   ", channels=(1,), travel_up=5.0, travel_down=5.0)
+    with pytest.raises(ValueError):
+        CoverConfig(name="x", channels=(1,), travel_up=0.0, travel_down=5.0)
+    with pytest.raises(ValueError):
+        CoverConfig(name="x", channels=(1,), travel_up=5.0, travel_down=999_999.0)
+
+
+def test_cover_config_roundtrips_through_mapping() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(name="Counter", channels=(4,), travel_up=8.5, travel_down=9.5)
+    restored = CoverConfig.from_subentry(cover.as_dict())
+    assert restored == cover
+
+    aggregate = CoverConfig(name="All", channels=(1, 2, 3))
+    restored_aggregate = CoverConfig.from_subentry(aggregate.as_dict())
+    assert restored_aggregate == aggregate
+    assert restored_aggregate.travel_up is None
+
+
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
     """Return a representative two-channel group configuration."""
     return BlindConfig(

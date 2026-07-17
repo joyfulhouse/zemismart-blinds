@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from typing import Final, Literal, cast
 
 from .calibrations import KNOWN_CALIBRATIONS
@@ -246,6 +247,79 @@ class RemoteIdentity:
         normalized = tuple(sorted(validate_channels(channels)))
         channel_key = ",".join(str(channel) for channel in normalized)
         return f"{self.key}:{channel_key}"
+
+
+class Role(StrEnum):
+    """Whether a cover addresses its channels directly or aggregates others."""
+
+    LEAF = "leaf"
+    AGGREGATE = "aggregate"
+
+
+def _optional_travel(value: object, field: str) -> float | None:
+    """Coerce an optional stored travel value; empty/None means unset."""
+    if value is None or value == "":
+        return None
+    return _as_float(value, field)
+
+
+@dataclass(frozen=True, slots=True)
+class CoverConfig:
+    """One cover subentry: a named channel set with optional travel timing."""
+
+    name: str
+    channels: tuple[int, ...]
+    travel_up: float | None = None
+    travel_down: float | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize and validate at the subentry-storage boundary."""
+        name = self.name.strip()
+        channels = tuple(sorted(validate_channels(self.channels)))
+        if not name:
+            msg = "cover name must not be empty"
+            raise ValueError(msg)
+        if (self.travel_up is None) != (self.travel_down is None):
+            msg = "travel_up and travel_down must be set together"
+            raise ValueError(msg)
+        for value in (self.travel_up, self.travel_down):
+            if value is not None and not (math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS):
+                msg = f"travel times must be finite, >0, at most {MAX_TRAVEL_SECONDS}"
+                raise ValueError(msg)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "channels", channels)
+
+    @property
+    def channel_key(self) -> str:
+        """Return the subentry-identity key, e.g. ``1-2-3``."""
+        return "-".join(str(channel) for channel in self.channels)
+
+    @property
+    def has_travel(self) -> bool:
+        """Return whether this cover carries a full position model."""
+        return self.travel_up is not None
+
+    @classmethod
+    def from_subentry(cls, data: Mapping[str, object]) -> CoverConfig:
+        """Build one cover from HA subentry data."""
+        return cls(
+            name=str(_required(data, CONF_NAME)),
+            channels=parse_channels(_required(data, CONF_CHANNELS)),
+            travel_up=_optional_travel(data.get(CONF_TRAVEL_UP), CONF_TRAVEL_UP),
+            travel_down=_optional_travel(data.get(CONF_TRAVEL_DOWN), CONF_TRAVEL_DOWN),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return JSON-safe subentry storage values."""
+        values: dict[str, object] = {
+            CONF_NAME: self.name,
+            CONF_CHANNELS: list(self.channels),
+        }
+        # Always emitted, empty when absent: an omitted key on reconfigure must
+        # clear a previously stored travel time rather than let it persist.
+        values[CONF_TRAVEL_UP] = self.travel_up if self.travel_up is not None else ""
+        values[CONF_TRAVEL_DOWN] = self.travel_down if self.travel_down is not None else ""
+        return values
 
 
 @dataclass(frozen=True, slots=True)
