@@ -1,10 +1,22 @@
 # Remote-Centric Redesign — Design Spec
 
-Date: 2026-07-17 (rev 3 — after two Codex GPT-5.6-sol adversarial review rounds)
-Status: Approved pending user review
+Date: 2026-07-17 (rev 4 — legacy-compat simplification, user-directed)
+Status: Approved
 Branch: `feat/remote-centric-model` (worktree `.worktrees/remote-centric`), rebased
 onto `main@d03ce0f` so the state-sync baseline (`state_sync.py`,
 `test_state_sync.py`) is present and the test guardrail is runnable.
+
+> **Rev 4 (user directive):** no thorough backwards compatibility. Legacy
+> per-blind entries do NOT keep working: `async_setup_entry` detects the old
+> shape (`channels` in entry data) and raises `ConfigEntryError` with a
+> migration message. The entry and its full data are KEPT (disabled device,
+> preserved values) purely as the migration reference; Claude performs the
+> manual migration (read values → onboard remote via wizard → delete legacy
+> entries). The dual-format runtime shim is removed in Plan 03. Because
+> legacy entries are inert, RF-identity uniqueness is enforced only among
+> remote-format entries — a dead legacy entry holding the same identity must
+> NOT block onboarding its replacement (migration order: onboard first, then
+> delete legacy).
 
 ## Problem
 
@@ -29,7 +41,7 @@ aggregate *Kitchen shades* (ch1-6).
 | Decision | Choice |
 |---|---|
 | Architecture | Config subentries: remote = config entry, each cover = subentry |
-| Migration | No migration code; manual swap on the live HA at rollout (runbook below), entity IDs and registry customizations repaired at the registry level |
+| Migration | No migration code; manual swap on the live HA at rollout (runbook below), entity IDs and registry customizations repaired at the registry level. Legacy entries fail setup with `ConfigEntryError` (data kept as migration reference); no dual-format runtime support (rev 4) |
 | Device topology | Remote = parent device; each cover = child device via `via_device` |
 | Area | Per remote; device areas set at creation only (parent and children); user device-area overrides always respected; RF routing always uses the remote's configured `area_id` |
 | Channel sets | Partial overlaps banned within a remote: every pair of covers must be disjoint or strictly nested (laminar family) |
