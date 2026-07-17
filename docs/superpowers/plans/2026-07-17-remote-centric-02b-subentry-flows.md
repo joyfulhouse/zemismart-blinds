@@ -381,9 +381,13 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(hass, monke
     assert result["type"] is FlowResultType.SHOW_PROGRESS
     await fake.wait_for_publications(1)
     rx = fake.rx_subscriptions()[0]
+    # Emit on the subscription's own topic: the entry's area ("kitchen")
+    # matches no fake bridge, so automatic selection routes to the default
+    # bridge — hardcoding a bridge id here would miss the capture handler's
+    # exact-topic check.
     await fake.emit(
         rx,
-        "rf433/bridge-a/rx",
+        rx.topic,
         json.dumps({"frame": b0_to_b1(SECOND_REMOTE_UP_B0), "t": 3}),
     )
     await fake.wait_for_publications(2)
