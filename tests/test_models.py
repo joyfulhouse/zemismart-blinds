@@ -28,7 +28,11 @@ from custom_components.zemismart_blinds.models import (
     ZemismartHub,
     parse_channels,
 )
-from custom_components.zemismart_blinds.state_sync import HeardEvent
+from custom_components.zemismart_blinds.state_sync import (
+    HeardEvent,
+    LedgerFrameSpec,
+    frame_signature,
+)
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_BASES,
@@ -3973,3 +3977,98 @@ def test_blindconfig_from_mapping_stays_leaf() -> None:
     restored = BlindConfig.from_mapping(config.as_dict())
     assert restored.role is Role.LEAF
     assert restored.travel_up == 9.0
+
+
+@pytest.mark.asyncio
+async def test_drain_owner_supersedes_only_that_entrys_queued_commands() -> None:
+    """Unloading an entry drains its queued commands; others stay queued."""
+    release = asyncio.Event()
+    first_published = asyncio.Event()
+    published: list[str] = []
+
+    async def publisher(topic: str, payload: str) -> None:
+        del topic
+        published.append(payload)
+        first_published.set()
+        await release.wait()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_availability("bridge-a", "online")
+    config = BlindConfig(
+        name="Blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    other_remote = RemoteIdentity(OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES)
+    other_config = BlindConfig(
+        name="Other",
+        remote=other_remote,
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    # First command occupies the worker inside the (blocked) publisher.
+    first = asyncio.create_task(hub.async_transmit(config, "UP", owner="entry-a"))
+    await asyncio.wait_for(first_published.wait(), timeout=1.0)
+    # Two queued commands with different owners.
+    drained = asyncio.create_task(hub.async_transmit(config, "DOWN", owner="entry-a"))
+    kept = asyncio.create_task(hub.async_transmit(other_config, "UP", owner="entry-b"))
+    await asyncio.sleep(0)
+
+    hub.drain_owner("entry-a")
+    assert await asyncio.wait_for(drained, timeout=1.0) == "superseded"
+    assert not kept.done()
+
+    release.set()
+    first.cancel()
+    kept.cancel()
+    for task in (first, kept):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_disarm_remote_awaits_acknowledged_bridge_disarms() -> None:
+    """Relearn disarms every live ledger command of the remote, bounded."""
+    control: list[dict[str, Any]] = []
+    disarm_seen = asyncio.Event()
+
+    async def publisher(topic: str, payload: str) -> None:
+        if topic.endswith("/cmd"):
+            body: dict[str, Any] = json.loads(payload)
+            control.append(body)
+            disarm_seen.set()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    signature = frame_signature(frame)
+    assert signature is not None
+    hub._ledger.register_pending(
+        "cmd-live",
+        "bridge-a",
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature=signature, offset_ms=0, airtime_ms=100)],
+    )
+
+    # No live commands for a different remote: returns without publishing.
+    await hub.async_disarm_remote("ffffff:01", deadline_seconds=0.2)
+    assert control == []
+
+    disarm_task = asyncio.create_task(hub.async_disarm_remote(remote.key, deadline_seconds=1.0))
+    await asyncio.wait_for(disarm_seen.wait(), timeout=1.0)
+    assert control[0] == {"action": "disarm", "command_id": "cmd-live"}
+    hub.on_disarmed("bridge-a", "cmd-live")
+    await asyncio.wait_for(disarm_task, timeout=1.0)
+    hub.close()

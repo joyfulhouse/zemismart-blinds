@@ -931,6 +931,9 @@ class _QueuedCommand:
     # Snapshot of the physical-press-only generation for every addressed
     # channel. Unlike overlap_token, ordinary sibling publishes never change it.
     press_token: int = 0
+    # Which config entry issued this command; None for ownerless surfaces
+    # (debug raw frames). Unloading an entry drains its queued commands.
+    owner: str | None = None
     # Set only after the final under-lock frame is registered immediately
     # before enqueue; execute cleanup uses it to confirm or retire the entry.
     ledger_registered: bool = False
@@ -2404,6 +2407,7 @@ class ZemismartHub:
         *,
         stop_after_ms: int | None = None,
         overlap_token: int | None = None,
+        owner: str | None = None,
     ) -> CommandResult:
         """Queue one validated cover command and await its result."""
         if stop_after_ms is not None and stop_after_ms <= 0:
@@ -2459,6 +2463,7 @@ class ZemismartHub:
                 ),
                 overlap_token=overlap_token,
                 press_token=press_token,
+                owner=owner,
             )
         )
 
@@ -2500,6 +2505,60 @@ class ZemismartHub:
             msg = "raw command was displaced by a newer overlapping command"
             raise CommandRejectedError(msg)
         return result
+
+    def drain_owner(self, owner: str) -> None:
+        """Resolve every queued-unpublished command of one owner as superseded.
+
+        Unload-time safety: a pending service-call future is NOT proof its
+        command should transmit — the worker skips commands whose futures
+        are all resolved, so draining here guarantees no post-unload publish
+        for the departing entry while other entries' commands stay queued.
+        """
+        retained: deque[_QueuedCommand] = deque()
+        while self._queue:
+            queued = self._queue.popleft()
+            if queued.owner == owner:
+                for future in queued.futures:
+                    if not future.done():
+                        future.set_result("superseded")
+                if queued.published is not None:
+                    queued.published.set()
+            else:
+                retained.append(queued)
+        self._queue = retained
+
+    async def async_disarm_remote(
+        self,
+        remote_key: str,
+        *,
+        deadline_seconds: float = 10.0,
+    ) -> None:
+        """Issue and await bridge disarms for every live command of one remote.
+
+        Relearn-time safety: a published timed command's fail-safe STOP lives
+        on the BRIDGE; cancelling queue state cannot retract it. Each live
+        command gets an acknowledged disarm request, awaited (bounded) so no
+        old-identity frame can transmit after an identity swap completes.
+        """
+        now = self._now()
+        waiters: list[asyncio.Future[None]] = []
+        for command in self._ledger.live_overlapping(
+            remote_key,
+            frozenset(range(1, 17)),
+            now,
+        ):
+            request = self._start_disarm_request(
+                command.bridge_id,
+                command.command_id,
+                now + deadline_seconds,
+            )
+            if not request.waiter.done():
+                waiters.append(asyncio.shield(request.waiter))
+        if not waiters:
+            return
+        with suppress(TimeoutError):
+            async with asyncio.timeout(deadline_seconds):
+                await asyncio.gather(*waiters, return_exceptions=True)
 
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""

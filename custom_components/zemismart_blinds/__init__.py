@@ -285,6 +285,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+async def _async_entry_updated(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
+    """Reload once for any entry or subentry mutation.
+
+    The sole reload scheduler: every flow terminator uses non-reloading
+    update helpers, and native subentry add/update/delete notifies this
+    listener, so each mutation produces exactly one reload.
+    """
+    hass.config_entries.async_schedule_reload(entry.entry_id)
+
+
 def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
     """Create the parent remote device before its cover children.
 
@@ -358,6 +368,7 @@ async def async_setup_entry(
                 if entry.entry_id in runtime.loaded_entries:
                     failed = False
                     return True
+                entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
                 _ensure_remote_device(hass, entry)
                 await hass.config_entries.async_forward_entry_setups(entry, [Platform.COVER])
                 runtime.loaded_entries.add(entry.entry_id)
@@ -377,6 +388,11 @@ async def async_unload_entry(
     from homeassistant.const import Platform
 
     runtime = cast("DomainRuntime | None", hass.data.get(DOMAIN))
+    if runtime is not None:
+        # Entry-scoped drain BEFORE platform unload: this entry's
+        # queued-unpublished commands must never transmit after it is gone,
+        # while other entries' queued commands stay untouched.
+        runtime.hub.drain_owner(entry.entry_id)
     if runtime is None:
         return bool(await hass.config_entries.async_unload_platforms(entry, [Platform.COVER]))
     async with runtime.lifecycle_lock:

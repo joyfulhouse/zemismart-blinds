@@ -776,3 +776,63 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
     assert parent_after.area_id == "pantry"
 
     await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_update_listener_schedules_one_reload_per_mutation(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry updates and native subentry mutations each reload exactly once."""
+    from types import MappingProxyType as _MPT
+
+    from homeassistant.config_entries import ConfigSubentry
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        return
+
+    reloads: list[str] = []
+
+    def schedule_reload(entry_id: str) -> None:
+        reloads.append(entry_id)
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    monkeypatch.setattr(hass.config_entries, "async_schedule_reload", schedule_reload)
+    entry = config_entry("one")
+    add_to_manager(hass, entry)
+    await async_setup_entry(hass, entry)
+
+    # Entry data mutation -> exactly one scheduled reload.
+    hass.config_entries.async_update_entry(entry, data={**entry.data, "repeats": 9})
+    await hass.async_block_till_done()
+    assert reloads == ["one"]
+
+    # Native subentry addition -> exactly one more.
+    hass.config_entries.async_add_subentry(
+        entry,
+        ConfigSubentry(
+            data=_MPT({"name": "Sink", "channels": [5], "travel_up": 9.0, "travel_down": 9.0}),
+            subentry_type="cover",
+            title="Sink",
+            unique_id="5",
+        ),
+    )
+    await hass.async_block_till_done()
+    assert reloads == ["one", "one"]
+
+    # A no-op update fires nothing.
+    hass.config_entries.async_update_entry(entry, data=dict(entry.data))
+    await hass.async_block_till_done()
+    assert reloads == ["one", "one"]
+
+    await async_unload_entry(hass, entry)

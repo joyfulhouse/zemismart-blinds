@@ -893,6 +893,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 button,
                 stop_after_ms=stop_after_ms,
                 overlap_token=overlap_token,
+                owner=self._via_entry_id,
             )
         except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
             # The frame MAY have reached RF; only unknown is honest. Aggregates
@@ -1210,7 +1211,11 @@ class ZemismartAggregateCover(CoverEntity):
     async def _async_transmit(self, button: Button) -> CommandAck | None:
         """Send one untimed full-channel-set frame and record its identity."""
         try:
-            result = await self._hub.async_transmit(self._config, button)
+            result = await self._hub.async_transmit(
+                self._config,
+                button,
+                owner=self._via_entry_id,
+            )
         except Exception as exc:
             raise HomeAssistantError(str(exc)) from exc
         if result == "superseded":

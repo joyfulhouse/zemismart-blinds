@@ -64,6 +64,7 @@ from .models import (
     NoOnlineBridgeError,
     RemoteConfig,
     RemoteIdentity,
+    RemoteRuntime,
     laminar_conflict,
     parse_channels,
     parse_hex,
@@ -758,12 +759,18 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for other in self.hass.config_entries.async_entries(DOMAIN)
         ):
             return self.async_abort(reason="already_configured")
-        return self.async_update_reload_and_abort(
+        runtime = getattr(entry, "runtime_data", None)
+        if isinstance(runtime, RemoteRuntime):
+            # A published timed command's fail-safe STOP lives on the bridge;
+            # disarm (acknowledged, bounded) before the old identity vanishes.
+            await runtime.hub.async_disarm_remote(current.key)
+        self.hass.config_entries.async_update_entry(
             entry,
             title=updated.name,
             unique_id=updated.key,
             data=updated.as_dict(),
         )
+        return self.async_abort(reason="reconfigure_successful")
 
     async def async_step_reconfigure_edit(
         self,
@@ -807,11 +814,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except TypeError, ValueError:
                 errors["base"] = "invalid_config"
             else:
-                return self.async_update_reload_and_abort(
+                self.hass.config_entries.async_update_entry(
                     entry,
                     title=updated.name,
                     data=updated.as_dict(),
                 )
+                return self.async_abort(reason="reconfigure_successful")
         return self.async_show_form(
             step_id="reconfigure_edit",
             data_schema=_reconfigure_edit_schema(suggested),
