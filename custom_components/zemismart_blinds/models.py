@@ -12,7 +12,8 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from typing import Final, Literal, cast
+from enum import StrEnum
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from .calibrations import KNOWN_CALIBRATIONS
 from .codec import (
@@ -48,6 +49,9 @@ from .state_sync import (
     StateSyncConsumer,
     frame_signature,
 )
+
+if TYPE_CHECKING:
+    from .coordinator import RemoteCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -248,6 +252,225 @@ class RemoteIdentity:
         return f"{self.key}:{channel_key}"
 
 
+class Role(StrEnum):
+    """Whether a cover addresses its channels directly or aggregates others."""
+
+    LEAF = "leaf"
+    AGGREGATE = "aggregate"
+
+
+def _optional_travel(value: object, field: str) -> float | None:
+    """Coerce an optional stored travel value; empty/None means unset."""
+    if value is None or value == "":
+        return None
+    return _as_float(value, field)
+
+
+@dataclass(frozen=True, slots=True)
+class CoverConfig:
+    """One cover subentry: a named channel set with optional travel timing."""
+
+    name: str
+    channels: tuple[int, ...]
+    travel_up: float | None = None
+    travel_down: float | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize and validate at the subentry-storage boundary."""
+        name = self.name.strip()
+        channels = tuple(sorted(validate_channels(self.channels)))
+        if not name:
+            msg = "cover name must not be empty"
+            raise ValueError(msg)
+        if (self.travel_up is None) != (self.travel_down is None):
+            msg = "travel_up and travel_down must be set together"
+            raise ValueError(msg)
+        for value in (self.travel_up, self.travel_down):
+            if value is not None and not (math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS):
+                msg = f"travel times must be finite, >0, at most {MAX_TRAVEL_SECONDS}"
+                raise ValueError(msg)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "channels", channels)
+
+    @property
+    def channel_key(self) -> str:
+        """Return the subentry-identity key, e.g. ``1-2-3``."""
+        return "-".join(str(channel) for channel in self.channels)
+
+    @property
+    def has_travel(self) -> bool:
+        """Return whether this cover carries a full position model."""
+        return self.travel_up is not None
+
+    @classmethod
+    def from_subentry(cls, data: Mapping[str, object]) -> CoverConfig:
+        """Build one cover from HA subentry data."""
+        return cls(
+            name=str(_required(data, CONF_NAME)),
+            channels=parse_channels(_required(data, CONF_CHANNELS)),
+            travel_up=_optional_travel(data.get(CONF_TRAVEL_UP), CONF_TRAVEL_UP),
+            travel_down=_optional_travel(data.get(CONF_TRAVEL_DOWN), CONF_TRAVEL_DOWN),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return JSON-safe subentry storage values."""
+        values: dict[str, object] = {
+            CONF_NAME: self.name,
+            CONF_CHANNELS: list(self.channels),
+        }
+        # Always emitted, empty when absent: an omitted key on reconfigure must
+        # clear a previously stored travel time rather than let it persist.
+        values[CONF_TRAVEL_UP] = self.travel_up if self.travel_up is not None else ""
+        values[CONF_TRAVEL_DOWN] = self.travel_down if self.travel_down is not None else ""
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteConfig:
+    """One remote config entry: identity, calibration, routing, transport."""
+
+    name: str
+    remote: RemoteIdentity
+    area_id: str
+    repeats: int
+    coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
+
+    def __post_init__(self) -> None:
+        """Normalize and validate at the entry-storage boundary."""
+        name = self.name.strip()
+        area_id = self.area_id.strip()
+        if not name:
+            msg = "remote name must not be empty"
+            raise ValueError(msg)
+        if not area_id:
+            msg = "area_id must not be empty"
+            raise ValueError(msg)
+        if self.remote.bases is None:
+            msg = "remote calibration is required"
+            raise ValueError(msg)
+        if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
+            msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
+            raise ValueError(msg)
+        if (
+            isinstance(self.coalesce_window_ms, bool)
+            or not isinstance(self.coalesce_window_ms, int)
+            or not 0 <= self.coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
+        ):
+            msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
+            raise ValueError(msg)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "area_id", area_id)
+
+    @property
+    def key(self) -> str:
+        """Return the remote-identity key used as the entry unique_id."""
+        return self.remote.key
+
+    @classmethod
+    def from_entry(cls, data: Mapping[str, object]) -> RemoteConfig:
+        """Build one remote from HA config-entry data."""
+        prefix = parse_hex(_required(data, CONF_PREFIX), CONF_PREFIX, 24)
+        remote_id = parse_hex(_required(data, CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
+        configured = [key in data for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
+        if any(configured) and not all(configured):
+            msg = "base_up, base_down, and base_stop must be configured together"
+            raise ValueError(msg)
+        bases = (
+            CommandBases(
+                up=parse_hex(_required(data, CONF_BASE_UP), CONF_BASE_UP, 16),
+                down=parse_hex(_required(data, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
+                stop=parse_hex(_required(data, CONF_BASE_STOP), CONF_BASE_STOP, 16),
+                trailer=(
+                    parse_hex(data[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
+                    if data.get(CONF_BASE_TRAILER) not in (None, "")
+                    else None
+                ),
+            )
+            if all(configured)
+            else None
+        )
+        remote = RemoteIdentity(prefix=prefix, remote_id=remote_id, bases=bases)
+        return cls(
+            name=str(_required(data, CONF_NAME)),
+            remote=remote,
+            area_id=str(_required(data, CONF_AREA_ID)),
+            repeats=whole_number(_required(data, CONF_REPEATS), CONF_REPEATS),
+            coalesce_window_ms=whole_number(
+                data.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
+                CONF_COALESCE_WINDOW_MS,
+            ),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        """Return JSON-safe config-entry storage values."""
+        assert self.remote.bases is not None
+        values: dict[str, object] = {
+            CONF_NAME: self.name,
+            CONF_PREFIX: f"{self.remote.prefix:06x}",
+            CONF_REMOTE_ID: f"{self.remote.remote_id:02x}",
+            CONF_AREA_ID: self.area_id,
+            CONF_REPEATS: self.repeats,
+            CONF_COALESCE_WINDOW_MS: self.coalesce_window_ms,
+            CONF_BASE_UP: f"{self.remote.bases.up:04x}",
+            CONF_BASE_DOWN: f"{self.remote.bases.down:04x}",
+            CONF_BASE_STOP: f"{self.remote.bases.stop:04x}",
+        }
+        values[CONF_BASE_TRAILER] = (
+            f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
+        )
+        return values
+
+
+def laminar_conflict(
+    new_channels: Iterable[int],
+    existing: Iterable[Iterable[int]],
+) -> str | None:
+    """Return a conflict key if ``new_channels`` is not laminar with ``existing``.
+
+    A laminar family admits only disjoint or strictly nested sets. Returns
+    ``"duplicate_channels"`` on an equal set, ``"overlapping_channels"`` on a
+    partial overlap (intersecting but neither strict subset nor superset), or
+    ``None`` when the addition keeps the family laminar.
+    """
+    new_set = frozenset(new_channels)
+    for other in existing:
+        other_set = frozenset(other)
+        if new_set == other_set:
+            return "duplicate_channels"
+        if new_set & other_set and not (new_set < other_set or other_set < new_set):
+            return "overlapping_channels"
+    return None
+
+
+def derive_role(cover: CoverConfig, siblings: Iterable[CoverConfig]) -> Role:
+    """Return AGGREGATE iff a sibling's channels strictly subset ``cover``'s."""
+    own = frozenset(cover.channels)
+    for sibling in siblings:
+        if frozenset(sibling.channels) < own:
+            return Role.AGGREGATE
+    return Role.LEAF
+
+
+def member_covers(
+    cover: CoverConfig,
+    siblings: Iterable[CoverConfig],
+) -> tuple[CoverConfig, ...]:
+    """Return the leaf covers strictly inside ``cover``, sorted by channel key.
+
+    A sibling is a leaf when no other sibling strictly subsets it; only leaves
+    are members, so each physical channel is represented at most once and
+    nested aggregates are never traversed.
+    """
+    covers = list(siblings)
+    own = frozenset(cover.channels)
+    members = [
+        candidate
+        for candidate in covers
+        if frozenset(candidate.channels) < own and derive_role(candidate, covers) is Role.LEAF
+    ]
+    return tuple(sorted(members, key=lambda candidate: candidate.channel_key))
+
+
 @dataclass(frozen=True, slots=True)
 class BlindConfig:
     """Persisted configuration for exactly one blind or group device."""
@@ -255,11 +478,12 @@ class BlindConfig:
     name: str
     remote: RemoteIdentity
     channels: tuple[int, ...]
-    travel_up: float
-    travel_down: float
+    travel_up: float | None
+    travel_down: float | None
     area_id: str
     repeats: int
     coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
+    role: Role = Role.LEAF
 
     def __post_init__(self) -> None:
         """Normalize and validate values at the config-entry boundary."""
@@ -275,9 +499,13 @@ class BlindConfig:
         if self.remote.bases is None:
             msg = "remote calibration is required"
             raise ValueError(msg)
+        if self.role is Role.LEAF and (self.travel_up is None or self.travel_down is None):
+            msg = "leaf covers require travel_up and travel_down"
+            raise ValueError(msg)
         if not all(
             math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
             for value in (self.travel_up, self.travel_down)
+            if value is not None
         ):
             # NaN slips through plain comparisons (nan <= 0 is False) and
             # would leave the position model "moving" forever. The upper
@@ -381,6 +609,31 @@ class BlindConfig:
     def is_group(self) -> bool:
         """Return whether this device addresses more than one motor channel."""
         return len(self.channels) > 1
+
+    @property
+    def is_aggregate(self) -> bool:
+        """Return whether this cover aggregates member covers' state."""
+        return self.role is Role.AGGREGATE
+
+    @classmethod
+    def derive(
+        cls,
+        remote: RemoteConfig,
+        cover: CoverConfig,
+        role: Role,
+    ) -> BlindConfig:
+        """Build the runtime config for one cover from its remote and subentry."""
+        return cls(
+            name=cover.name,
+            remote=remote.remote,
+            channels=cover.channels,
+            travel_up=cover.travel_up,
+            travel_down=cover.travel_down,
+            area_id=remote.area_id,
+            repeats=remote.repeats,
+            coalesce_window_ms=remote.coalesce_window_ms,
+            role=role,
+        )
 
     @property
     def remote_key(self) -> str:
@@ -678,6 +931,9 @@ class _QueuedCommand:
     # Snapshot of the physical-press-only generation for every addressed
     # channel. Unlike overlap_token, ordinary sibling publishes never change it.
     press_token: int = 0
+    # Which config entry issued this command; None for ownerless surfaces
+    # (debug raw frames). Unloading an entry drains its queued commands.
+    owner: str | None = None
     # Set only after the final under-lock frame is registered immediately
     # before enqueue; execute cleanup uses it to confirm or retire the entry.
     ledger_registered: bool = False
@@ -2151,6 +2407,7 @@ class ZemismartHub:
         *,
         stop_after_ms: int | None = None,
         overlap_token: int | None = None,
+        owner: str | None = None,
     ) -> CommandResult:
         """Queue one validated cover command and await its result."""
         if stop_after_ms is not None and stop_after_ms <= 0:
@@ -2206,6 +2463,7 @@ class ZemismartHub:
                 ),
                 overlap_token=overlap_token,
                 press_token=press_token,
+                owner=owner,
             )
         )
 
@@ -2247,6 +2505,78 @@ class ZemismartHub:
             msg = "raw command was displaced by a newer overlapping command"
             raise CommandRejectedError(msg)
         return result
+
+    def drain_owner(self, owner: str) -> None:
+        """Resolve every queued-unpublished command of one owner as superseded.
+
+        Unload-time safety: a pending service-call future is NOT proof its
+        command should transmit — the worker skips commands whose futures
+        are all resolved, so draining here guarantees no post-unload publish
+        for the departing entry while other entries' commands stay queued.
+        """
+        retained: deque[_QueuedCommand] = deque()
+        while self._queue:
+            queued = self._queue.popleft()
+            if queued.owner == owner:
+                for future in queued.futures:
+                    if not future.done():
+                        future.set_result("superseded")
+                if queued.published is not None:
+                    queued.published.set()
+            else:
+                retained.append(queued)
+        self._queue = retained
+        # Fast-lane STOPs never enter the queue; one still waiting on its
+        # publish barriers must not transmit for a departed owner either.
+        # _async_run_direct re-checks resolved futures after the barriers,
+        # so resolving here is enough — an already-publishing command is
+        # in-flight and out of drain scope by design.
+        for fast in tuple(self._fast_inflight):
+            if fast.owner == owner and fast.published is not None and not fast.published.is_set():
+                for future in fast.futures:
+                    if not future.done():
+                        future.set_result("superseded")
+
+    async def async_disarm_remote(
+        self,
+        remote_key: str,
+        *,
+        deadline_seconds: float = 10.0,
+    ) -> None:
+        """Issue and await bridge disarms for every live command of one remote.
+
+        Relearn-time safety: a published timed command's fail-safe STOP lives
+        on the BRIDGE; cancelling queue state cannot retract it. Each live
+        command gets an acknowledged disarm request, awaited (bounded) so no
+        old-identity frame can transmit after an identity swap completes.
+        """
+        now = self._now()
+        waiters: list[asyncio.Future[None]] = []
+        for command in self._ledger.live_overlapping(
+            remote_key,
+            frozenset(range(1, 17)),
+            now,
+        ):
+            # Retry each disarm until the command's REAL bridge-side STOP
+            # window ends (hours for a long timed move), not a flat bound;
+            # the flow only awaits the short bound below — the background
+            # request keeps retrying past the reload because the hub is
+            # shared and survives it.
+            request = self._start_disarm_request(
+                command.bridge_id,
+                command.command_id,
+                self._ledger.disarm_deadline(
+                    command.command_id,
+                    fallback=now + deadline_seconds,
+                ),
+            )
+            if not request.waiter.done():
+                waiters.append(asyncio.shield(request.waiter))
+        if not waiters:
+            return
+        with suppress(TimeoutError):
+            async with asyncio.timeout(deadline_seconds):
+                await asyncio.gather(*waiters, return_exceptions=True)
 
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
@@ -2296,11 +2626,13 @@ class ZemismartHub:
 
 
 @dataclass(slots=True)
-class EntryRuntime:
-    """Runtime data owned by one blind/group config entry."""
+class RemoteRuntime:
+    """Runtime data owned by one remote-centric config entry."""
 
-    config: BlindConfig
+    remote: RemoteConfig
     hub: ZemismartHub
+    # Built during cover-platform setup; None only before the platform loads.
+    coordinator: RemoteCoordinator | None = None
 
 
 @dataclass(slots=True)

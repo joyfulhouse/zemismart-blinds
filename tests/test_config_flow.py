@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -13,18 +14,14 @@ import pytest
 from homeassistant import config_entries, loader
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt.models import ReceiveMessage
-from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.data_entry_flow import FlowResultType
 
-import custom_components.zemismart_blinds as integration_module
 import custom_components.zemismart_blinds.config_flow as config_flow_module
 from custom_components.zemismart_blinds.codec import (
-    CommandBases,
     derive_bases_from_base,
     encode_b0,
     make_payload,
 )
-from custom_components.zemismart_blinds.config_flow import _config_from_input
 from custom_components.zemismart_blinds.const import (
     CONF_AREA_ID,
     CONF_BASE_DOWN,
@@ -37,7 +34,6 @@ from custom_components.zemismart_blinds.const import (
     CONF_CALIBRATION_FRAME,
     CONF_CHANNELS,
     CONF_COALESCE_WINDOW_MS,
-    CONF_KNOWN_REMOTE,
     CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
@@ -45,12 +41,16 @@ from custom_components.zemismart_blinds.const import (
     CONF_TRAVEL_DOWN,
     CONF_TRAVEL_UP,
     DOMAIN,
-    MANUAL_REMOTE,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
     MQTT_ROOT,
 )
-from custom_components.zemismart_blinds.models import BlindConfig, RemoteIdentity
+from custom_components.zemismart_blinds.models import (
+    BlindConfig,
+    CoverConfig,
+    RemoteConfig,
+    RemoteIdentity,
+)
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_ACTION_BASES,
@@ -64,6 +64,7 @@ from tests.synthetic import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
+    from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
     from homeassistant.core import HomeAssistant
 
     type MessageCallback = Callable[
@@ -76,6 +77,9 @@ if TYPE_CHECKING:
 # flow's decode/derive path is exercised without any real capture material.
 _name, REF_PREFIX, REF_REMOTE_ID, REF_BASES, _payload = SYNTHETIC_REMOTES[1]
 REFERENCE_FRAME = encode_b0(make_payload(REF_PREFIX, REF_REMOTE_ID, (1,), "UP", bases=REF_BASES))
+SECOND_REMOTE_UP_B0 = encode_b0(
+    make_payload(REF_PREFIX, REF_REMOTE_ID, (1, 2), "UP", bases=REF_BASES)
+)
 ADVANCED_SECTION = "advanced"
 
 
@@ -307,54 +311,6 @@ def install_mqtt(monkeypatch: pytest.MonkeyPatch, fake: FakeMqtt) -> None:
     monkeypatch.setattr(config_flow_module, "_BRIDGE_DISCOVERY_SECONDS", 0.001, raising=False)
 
 
-def details_input(
-    *,
-    name: str | None = "Test Shade",
-    channels: str = "1,2",
-    area_id: str = "living_room",
-    travel_up: float = 15,
-    travel_down: float = 16,
-    repeats: int = 5,
-    coalesce_window_ms: int = 150,
-) -> dict[str, Any]:
-    """Return the shared details form shape, including its collapsed section."""
-    values: dict[str, Any] = {
-        CONF_CHANNELS: channels,
-        CONF_TRAVEL_UP: travel_up,
-        CONF_TRAVEL_DOWN: travel_down,
-        CONF_AREA_ID: area_id,
-        ADVANCED_SECTION: {
-            CONF_REPEATS: repeats,
-            CONF_COALESCE_WINDOW_MS: coalesce_window_ms,
-        },
-    }
-    if name is not None:
-        values[CONF_NAME] = name
-    return values
-
-
-def real_entry(
-    entry_id: str,
-    config: BlindConfig,
-    *,
-    options: dict[str, object] | None = None,
-) -> ConfigEntry[Any]:
-    """Build one real config entry around backward-compatible stored data."""
-    return ConfigEntry(
-        data=config.as_dict(),
-        discovery_keys=MappingProxyType({}),
-        domain=DOMAIN,
-        entry_id=entry_id,
-        minor_version=1,
-        options=options or {},
-        source=config_entries.SOURCE_USER,
-        subentries_data=None,
-        title=config.name,
-        unique_id=f"{config.remote_key}:{'-'.join(map(str, config.channels))}",
-        version=1,
-    )
-
-
 async def start_user_flow(hass: HomeAssistant) -> ConfigFlowResult:
     """Start a real user flow and return its menu result."""
     return await hass.config_entries.flow.async_init(
@@ -371,23 +327,78 @@ async def advance_to_learn_setup(hass: HomeAssistant, flow_id: str) -> ConfigFlo
     )
 
 
+async def create_remote_entry(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    covers: list[dict[str, Any]],
+    *,
+    prefix: str = "a1b2c3",
+    remote_id: str = "42",
+    base: str = "f42a",
+    name: str = "Kitchen remote",
+) -> ConfigEntry:
+    """Drive the manual wizard to a real remote entry with the given covers."""
+    prepare_config_flow(hass, monkeypatch)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "advanced"})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "manual"})
+    await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_PREFIX: prefix,
+            CONF_REMOTE_ID: remote_id,
+            CONF_CALIBRATION_BUTTON: "UP",
+            CONF_CALIBRATION_BASE: base,
+            CONF_CALIBRATION_FRAME: "",
+            CONF_BASE_TRAILER: "",
+        },
+    )
+    await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: name,
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+    for index, cover in enumerate(covers):
+        await hass.config_entries.flow.async_configure(flow_id, cover)
+        if index < len(covers) - 1:
+            await hass.config_entries.flow.async_configure(
+                flow_id,
+                {"next_step_id": "cover"},
+            )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "finish"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    return result["result"]
+
+
 def current_flow(hass: HomeAssistant, flow_id: str) -> ConfigFlowResult:
     """Return the current public flow result."""
     return hass.config_entries.flow.async_get(flow_id)
 
 
+def schema_suggested_values(schema: Any) -> dict[str, object]:
+    """Serialize suggested values from a Home Assistant form schema."""
+    return {
+        str(marker.schema): marker.description["suggested_value"]
+        for marker in schema.schema
+        if marker.description and "suggested_value" in marker.description
+    }
+
+
 def manual_input(**overrides: object) -> dict[str, Any]:
-    """Return representative manual flow input with one explicit UP base."""
+    """Return representative manual identity input with one explicit UP base."""
     values: dict[str, Any] = {
-        CONF_NAME: "Test Shade",
-        CONF_KNOWN_REMOTE: MANUAL_REMOTE,
         CONF_PREFIX: "a1b2c3",
         CONF_REMOTE_ID: "42",
-        CONF_CHANNELS: "1",
-        CONF_TRAVEL_UP: 15,
-        CONF_TRAVEL_DOWN: 15,
-        CONF_AREA_ID: "living_room",
-        CONF_REPEATS: 5,
         CONF_CALIBRATION_BUTTON: "UP",
         CONF_CALIBRATION_BASE: "f42a",
         CONF_CALIBRATION_FRAME: "",
@@ -396,94 +407,149 @@ def manual_input(**overrides: object) -> dict[str, Any]:
     return values
 
 
-def test_manual_flow_derives_action_bases_from_one_direct_base() -> None:
-    """A labeled per-remote base is enough to persist all three action bases."""
-    config = _config_from_input(manual_input(), {})
-
-    assert config.remote.bases == CommandBases(0xF42A, 0xBCF2, 0xDC12)
-
-
-def test_manual_flow_accepts_direct_base_with_opcode_carry() -> None:
-    """A base that generates a channel-1 f5 command still completes correctly."""
-    config = _config_from_input(
-        manual_input(
-            **{
-                CONF_PREFIX: "0ff1ce",
-                CONF_REMOTE_ID: "10",
-                CONF_CALIBRATION_BASE: "f52f",
-            }
-        ),
-        {},
+def stored_config_entry(
+    data: dict[str, object],
+    *,
+    entry_id: str,
+    title: str,
+    unique_id: str,
+) -> ConfigEntry:
+    """Build a real stored entry without driving the config flow."""
+    return config_entries.ConfigEntry(
+        data=data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=1,
+        options={},
+        source=config_entries.SOURCE_USER,
+        subentries_data=None,
+        title=title,
+        unique_id=unique_id,
+        version=1,
     )
 
-    assert config.remote.bases == CommandBases(0xF52F, 0xBCF7, 0xDD17)
+
+def test_manual_identity_derives_action_bases_from_one_direct_base() -> None:
+    """A labeled per-remote base is enough to derive all three action bases."""
+    identity = config_flow_module._remote_identity_from_manual(manual_input())
+    assert identity.prefix == TEST_PREFIX
+    assert identity.remote_id == TEST_REMOTE_ID
+    assert identity.bases == derive_bases_from_base("UP", 0xF42A, TEST_REMOTE_ID)
 
 
-def test_manual_unknown_remote_requires_a_calibration_source() -> None:
-    """New arbitrary identities cannot enter without a calibration source."""
+def test_manual_identity_requires_a_calibration_source() -> None:
+    """An unknown remote with neither base nor reference is rejected."""
     with pytest.raises(ValueError, match="calibration"):
-        _config_from_input(
-            manual_input(
-                **{
-                    CONF_CALIBRATION_BASE: "",
-                    CONF_CALIBRATION_FRAME: "",
-                }
-            ),
-            {},
+        config_flow_module._remote_identity_from_manual(
+            manual_input(calibration_base="", prefix="000001", remote_id="02")
         )
 
 
-def test_manual_flow_derives_bases_from_captured_reference() -> None:
-    """A labeled B0 reference supplies identity, channels, and command calibration."""
-    config = _config_from_input(
+def test_manual_identity_derives_bases_from_captured_reference() -> None:
+    """A captured reference frame for the same identity calibrates the remote."""
+    identity = config_flow_module._remote_identity_from_manual(
         manual_input(
-            **{
-                CONF_PREFIX: f"{REF_PREFIX:06x}",
-                CONF_REMOTE_ID: f"{REF_REMOTE_ID:02x}",
-                CONF_CALIBRATION_BASE: "",
-                CONF_CALIBRATION_FRAME: REFERENCE_FRAME,
-            }
-        ),
-        {},
-    )
-
-    assert config.remote.bases == CommandBases(REF_BASES.up, REF_BASES.down, REF_BASES.stop)
-
-
-def test_manual_flow_rejects_ambiguous_or_wrong_identity_reference() -> None:
-    """A calibration source must be singular and belong to the entered remote."""
-    with pytest.raises(ValueError, match="either"):
-        _config_from_input(
-            manual_input(**{CONF_CALIBRATION_FRAME: REFERENCE_FRAME}),
-            {},
+            prefix=f"{REF_PREFIX:06x}",
+            remote_id=f"{REF_REMOTE_ID:02x}",
+            calibration_base="",
+            calibration_frame=REFERENCE_FRAME,
         )
+    )
+    assert identity.bases is not None
+    assert identity.bases.up == REF_BASES.up
+
+
+def test_manual_identity_rejects_wrong_identity_reference() -> None:
+    """A reference captured from a different remote must not calibrate this one."""
     with pytest.raises(ValueError, match="identity"):
-        _config_from_input(
-            manual_input(
-                **{
-                    CONF_CALIBRATION_BASE: "",
-                    CONF_CALIBRATION_FRAME: REFERENCE_FRAME,
-                }
-            ),
-            {},
+        config_flow_module._remote_identity_from_manual(
+            manual_input(calibration_base="", calibration_frame=REFERENCE_FRAME)
+        )
+    with pytest.raises(ValueError, match="not both"):
+        config_flow_module._remote_identity_from_manual(
+            manual_input(calibration_frame=REFERENCE_FRAME)
         )
 
 
-def test_known_remote_reuse_keeps_its_calibration() -> None:
-    """Selecting an existing remote reuses its bases without manual calibration fields."""
-    remote = RemoteIdentity(0x7E55AA, 0xE5, CommandBases(0xF38F, 0xBC57, 0xDB77))
-    config = _config_from_input(
-        manual_input(
-            **{
-                CONF_KNOWN_REMOTE: remote.key,
-                CONF_CALIBRATION_BASE: "",
-                CONF_CALIBRATION_FRAME: "",
-            }
-        ),
-        {remote.key: (remote, "Bedroom")},
+def test_validate_cover_input_travel_required_for_born_leaf() -> None:
+    """A cover that contains no collected cover must supply both travel times."""
+    cover, errors = config_flow_module._validate_cover_input(
+        {CONF_NAME: "Sink", CONF_CHANNELS: "5"},
+        [],
     )
+    assert cover is None
+    assert errors == {"base": "travel_required"}
 
-    assert config.remote == remote
+
+def test_validate_cover_input_laminar_errors() -> None:
+    """Duplicates and partial overlaps map to channel-field form errors."""
+    collected: list[tuple[int, ...]] = [(1, 2, 3)]
+    _cover, errors = config_flow_module._validate_cover_input(
+        {
+            CONF_NAME: "X",
+            CONF_CHANNELS: "2,3,4",
+            CONF_TRAVEL_UP: 5,
+            CONF_TRAVEL_DOWN: 5,
+        },
+        collected,
+    )
+    assert errors == {CONF_CHANNELS: "overlapping_channels"}
+    _cover, errors = config_flow_module._validate_cover_input(
+        {
+            CONF_NAME: "X",
+            CONF_CHANNELS: "3,2,1",
+            CONF_TRAVEL_UP: 5,
+            CONF_TRAVEL_DOWN: 5,
+        },
+        collected,
+    )
+    assert errors == {CONF_CHANNELS: "duplicate_channels"}
+
+
+def test_validate_cover_input_born_aggregate_travel_optional() -> None:
+    """Strictly containing a collected cover lifts the travel requirement."""
+    collected: list[tuple[int, ...]] = [(1, 2, 3), (4,)]
+    cover, errors = config_flow_module._validate_cover_input(
+        {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3,4,5,6"},
+        collected,
+    )
+    assert errors == {}
+    assert cover is not None
+    assert cover.channel_key == "1-2-3-4-5-6"
+    assert cover.travel_up is None
+
+
+def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
+    """Remote and subentry copy stays exact in both English JSON files."""
+    integration_dir = Path(__file__).parents[1] / "custom_components" / DOMAIN
+    strings_bytes = (integration_dir / "strings.json").read_bytes()
+    translations_bytes = (integration_dir / "translations" / "en.json").read_bytes()
+    assert strings_bytes == translations_bytes
+    strings = json.loads(strings_bytes)
+
+    assert strings["config"]["step"]["user"] == {
+        "title": "Add a Zemismart remote",
+        "description": (
+            "Learn the remote automatically, or use an Advanced setup method. "
+            "You will add its covers (blinds and groups) next."
+        ),
+        "menu_options": {
+            "learn": "Learn from remote",
+            "advanced": "Advanced",
+        },
+    }
+    assert strings["config"]["error"]["already_configured"] == (
+        "This remote is already configured by another entry."
+    )
+    assert strings["config"]["abort"]["legacy_not_supported"] == (
+        "This entry uses the old per-blind format. Delete it and add its remote "
+        "again instead of reconfiguring."
+    )
+    assert strings["config_subentries"]["cover"]["abort"] == {
+        "reconfigure_successful": "The cover was reconfigured successfully.",
+        "already_configured": ("Another cover of this remote already uses exactly these channels."),
+    }
 
 
 @pytest.mark.asyncio
@@ -502,11 +568,67 @@ async def test_user_starts_with_learn_and_advanced_menu(hass: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_learn_happy_path_creates_backward_compatible_entry(
+async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
+    hass: HomeAssistant,
+) -> None:
+    """Legacy per-blind entries stay outside remote-only management flows."""
+    prepare_config_flow(hass)
+    legacy = BlindConfig(
+        name="Legacy blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
+        channels=(1, 2),
+        travel_up=12.0,
+        travel_down=12.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    legacy_entry = stored_config_entry(
+        legacy.as_dict(),
+        entry_id="legacy-entry",
+        title=legacy.name,
+        unique_id=f"{legacy.remote.key}:1-2",
+    )
+    remote = RemoteConfig(
+        name="Remote",
+        remote=legacy.remote,
+        area_id="kitchen",
+        repeats=5,
+    )
+    remote_entry = stored_config_entry(
+        remote.as_dict(),
+        entry_id="remote-entry",
+        title=remote.name,
+        unique_id=remote.key,
+    )
+
+    assert (
+        config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
+            legacy_entry
+        )
+        == {}
+    )
+    assert config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
+        remote_entry
+    ) == {"cover": config_flow_module.CoverSubentryFlow}
+
+    await hass.config_entries.async_add(legacy_entry)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": legacy_entry.entry_id,
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "legacy_not_supported"
+
+
+@pytest.mark.asyncio
+async def test_learn_wizard_creates_remote_entry_with_cover_subentries(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid B1 press drives the wizard through confirmation and persistence."""
+    """The wizard captures a remote, then collects covers into subentries."""
     prepare_config_flow(hass, monkeypatch)
     fake = FakeMqtt()
     install_mqtt(monkeypatch, fake)
@@ -577,7 +699,11 @@ async def test_learn_happy_path_creates_backward_compatible_entry(
     result = await hass.config_entries.flow.async_configure(flow_id)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "learn_confirm"
-    assert result["menu_options"] == ["learn_details", "learn_retry", "advanced"]
+    assert result["menu_options"] == [
+        "remote_settings",
+        "learn_retry",
+        "advanced",
+    ]
     placeholders = result["description_placeholders"]
     assert placeholders == {
         "prefix": "0xa1b2c3",
@@ -596,49 +722,102 @@ async def test_learn_happy_path_creates_backward_compatible_entry(
 
     result = await hass.config_entries.flow.async_configure(
         flow_id,
-        {"next_step_id": "learn_details"},
+        {"next_step_id": "remote_settings"},
     )
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "learn_details"
+    assert result["step_id"] == "remote_settings"
     result = await hass.config_entries.flow.async_configure(
         flow_id,
-        details_input(name=None, travel_up=17, travel_down=18),
+        {
+            CONF_NAME: "Kitchen remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "cover"
+    schema = result["data_schema"]
+    assert schema is not None
+    assert (
+        schema({CONF_NAME: "Slider", CONF_TRAVEL_UP: 12, CONF_TRAVEL_DOWN: 12})[CONF_CHANNELS]
+        == "1,2"
     )
 
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Slider",
+            CONF_CHANNELS: "1,2",
+            CONF_TRAVEL_UP: 12,
+            CONF_TRAVEL_DOWN: 12,
+        },
+    )
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "cover_menu"
+    assert result["menu_options"] == ["cover", "finish"]
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "cover"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Bad",
+            CONF_CHANNELS: "2,3",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+    error_schema = result["data_schema"]
+    assert error_schema is not None
+    error_suggestions = schema_suggested_values(error_schema)
+    assert error_suggestions[CONF_TRAVEL_UP] == 9
+    assert error_suggestions[CONF_TRAVEL_DOWN] == 9
+    assert CONF_TRAVEL_UP not in error_schema({})
+    assert CONF_TRAVEL_DOWN not in error_schema({})
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {CONF_NAME: "Sink", CONF_CHANNELS: "5"},
+    )
+    assert result["errors"] == {"base": "travel_required"}
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3"},
+    )
+    assert result["type"] is FlowResultType.MENU
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "finish"},
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "Living room shade"
-    expected = BlindConfig(
-        name="Living room shade",
+    assert result["title"] == "Kitchen remote"
+    expected_remote = RemoteConfig(
+        name="Kitchen remote",
         remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
-        channels=(1, 2),
-        travel_up=17,
-        travel_down=18,
-        area_id="living_room",
+        area_id="kitchen",
         repeats=5,
         coalesce_window_ms=150,
     )
-    assert result["data"] == expected.as_dict()
-    assert result["result"].unique_id == "a1b2c3:42:1-2"
-    assert CONF_BRIDGE not in result["data"]
-    assert CONF_CALIBRATION_FRAME not in result["data"]
-
-    flow_type, reuse_flow_id = result["next_flow"]
-    assert flow_type is config_entries.FlowType.CONFIG_FLOW
-    assert current_flow(hass, reuse_flow_id)["step_id"] == "reuse"
-    reuse = await hass.config_entries.flow.async_configure(reuse_flow_id)
-    assert reuse["type"] is FlowResultType.FORM
-    assert reuse["step_id"] == "reuse"
-    reuse_schema = reuse["data_schema"]
-    assert reuse_schema is not None
-    assert reuse_schema({})[CONF_KNOWN_REMOTE] == expected.remote_key
-
-    continuation = await hass.config_entries.flow.async_configure(
-        reuse_flow_id,
-        {CONF_KNOWN_REMOTE: expected.remote_key},
-    )
-    assert continuation["type"] is FlowResultType.FORM
-    assert continuation["step_id"] == "advanced_details"
-    hass.config_entries.flow.async_abort(reuse_flow_id)
+    assert result["data"] == expected_remote.as_dict()
+    entry = result["result"]
+    assert entry.unique_id == "a1b2c3:42"
+    subentries = list(entry.subentries.values())
+    assert [(s.subentry_type, s.title, s.unique_id) for s in subentries] == [
+        ("cover", "Slider", "1-2"),
+        ("cover", "Kitchen shades", "1-2-3"),
+    ]
+    slider = CoverConfig.from_subentry(subentries[0].data)
+    assert slider.channels == (1, 2)
+    assert slider.travel_up == 12.0
+    aggregate = CoverConfig.from_subentry(subentries[1].data)
+    assert aggregate.travel_up is None
 
 
 @pytest.mark.asyncio
@@ -671,6 +850,80 @@ async def test_learn_allows_explicit_online_bridge_override(
     )
     hass.config_entries.flow.async_abort(flow_id)
     await fake.wait_for_publications(2)
+
+
+@pytest.mark.asyncio
+async def test_advanced_setup_clears_learned_cover_channel_prefill(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leaving Learn for Advanced cannot leak captured channels into Manual."""
+    prepare_config_flow(hass, monkeypatch)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Learned shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: "bridge-a",
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    rx = fake.rx_subscriptions()[0]
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 3}),
+    )
+    await fake.wait_for_publications(2)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_confirm"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "advanced"},
+    )
+    assert result["step_id"] == "advanced"
+    await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "manual"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        manual_input(base_trailer=""),
+    )
+    assert result["step_id"] == "remote_settings"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Manual remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+
+    assert result["step_id"] == "cover"
+    schema = result["data_schema"]
+    assert schema is not None
+    assert (
+        schema(
+            {
+                CONF_NAME: "Manual cover",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        )[CONF_CHANNELS]
+        == ""
+    )
 
 
 @pytest.mark.asyncio
@@ -917,6 +1170,44 @@ async def test_learn_without_online_bridges_offers_advanced(
 
 
 @pytest.mark.asyncio
+async def test_reconfigure_learn_without_online_bridges_hides_advanced(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relearn failures cannot escape into new-entry Advanced setup paths."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    fake = FakeMqtt(bridges={})
+    install_mqtt(monkeypatch, fake)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "reconfigure_learn"},
+    )
+
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_unavailable"
+    assert result["menu_options"] == ["learn_setup"]
+
+
+@pytest.mark.asyncio
 async def test_learn_without_mqtt_offers_advanced(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -937,116 +1228,409 @@ async def test_learn_without_mqtt_offers_advanced(
     assert result["menu_options"] == ["learn_setup", "advanced"]
 
 
-@pytest.mark.parametrize("path", ("reuse", "manual", "virtual"))
 @pytest.mark.asyncio
-async def test_advanced_paths_create_backward_compatible_entries(
+async def test_manual_wizard_and_duplicate_remote_abort(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
-    path: str,
 ) -> None:
-    """Known, manual, and virtual identities all retain the existing data contract."""
+    """Manual identity enters the same wizard; a second identical remote aborts."""
     prepare_config_flow(hass, monkeypatch)
-    seed = BlindConfig(
-        name="Existing shade",
-        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
-        channels=(1,),
-        travel_up=10,
-        travel_down=11,
-        area_id="living_room",
-        repeats=5,
-        coalesce_window_ms=150,
-    )
-    await hass.config_entries.async_add(real_entry("seed", seed))
-    virtual_bases = derive_bases_from_base("UP", 0xF42A, 0x56)
-    monkeypatch.setattr(
-        integration_module,
-        "new_virtual_remote_identity",
-        lambda _hass: (0x5C1234, 0x56, virtual_bases),
-    )
-    result = await start_user_flow(hass)
-    flow_id = result["flow_id"]
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        {"next_step_id": "advanced"},
-    )
-    assert result["type"] is FlowResultType.MENU
-    assert result["menu_options"] == ["reuse", "manual", "virtual"]
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        {"next_step_id": path},
-    )
 
-    if path == "reuse":
-        assert result["step_id"] == "reuse"
+    async def run_manual_to_settings() -> tuple[str, ConfigFlowResult]:
+        result = await start_user_flow(hass)
+        flow_id = result["flow_id"]
         result = await hass.config_entries.flow.async_configure(
             flow_id,
-            {CONF_KNOWN_REMOTE: seed.remote_key},
+            {"next_step_id": "advanced"},
         )
-        expected_remote = seed.remote
-    elif path == "manual":
-        assert result["step_id"] == "manual"
+        assert result["menu_options"] == ["manual", "virtual"]
+        result = await hass.config_entries.flow.async_configure(
+            flow_id,
+            {"next_step_id": "manual"},
+        )
         result = await hass.config_entries.flow.async_configure(
             flow_id,
             {
-                CONF_PREFIX: "123456",
-                CONF_REMOTE_ID: "0d",
+                CONF_PREFIX: "a1b2c3",
+                CONF_REMOTE_ID: "42",
                 CONF_CALIBRATION_BUTTON: "UP",
-                CONF_CALIBRATION_BASE: "f449",
+                CONF_CALIBRATION_BASE: "f42a",
                 CONF_CALIBRATION_FRAME: "",
                 CONF_BASE_TRAILER: "",
             },
         )
-        expected_remote = RemoteIdentity(0x123456, 0x0D, CommandBases(0xF449, 0xBD11, 0xDD31))
-    else:
-        expected_remote = RemoteIdentity(0x5C1234, 0x56, virtual_bases)
+        assert result["step_id"] == "remote_settings"
+        return flow_id, result
 
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "advanced_details"
+    flow_id, _ = await run_manual_to_settings()
     result = await hass.config_entries.flow.async_configure(
         flow_id,
-        details_input(name=f"{path.title()} shade", channels="3"),
+        {
+            CONF_NAME: "Kitchen remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
     )
-
+    assert result["step_id"] == "cover"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Sink",
+            CONF_CHANNELS: "5",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "finish"},
+    )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    configured = BlindConfig.from_mapping(result["data"])
-    assert configured.remote == expected_remote
-    assert configured.channels == (3,)
-    assert set(result["data"]) == set(configured.as_dict())
+    assert result["result"].unique_id == "a1b2c3:42"
+
+    flow_id, _ = await run_manual_to_settings()
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Duplicate remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
 
 
 @pytest.mark.asyncio
-async def test_reconfigure_relearn_reloads_and_clears_stale_options(
+async def test_subentry_add_creates_cover(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Relearning replaces data, clears option precedence, and reloads the same entry."""
-    prepare_config_flow(hass, monkeypatch)
-    fake = FakeMqtt()
-    install_mqtt(monkeypatch, fake)
-    old = BlindConfig(
-        name="Old shade",
-        remote=RemoteIdentity(0x123456, 0x0D, CommandBases(0xF449, 0xBD11, 0xDD31)),
-        channels=(1,),
-        travel_up=10,
-        travel_down=11,
-        area_id="living_room",
-        repeats=4,
-        coalesce_window_ms=100,
+    """A remote entry exposes a flow that adds one cover subentry."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
     )
-    stale_options = {
-        CONF_BASE_UP: "1111",
-        CONF_BASE_DOWN: "2222",
-        CONF_BASE_STOP: "3333",
-        CONF_BASE_TRAILER: "4444",
-        CONF_TRAVEL_UP: 99,
-    }
-    entry = real_entry("reconfigure-me", old, options=stale_options)
-    await hass.config_entries.async_add(entry)
-    reloads: list[str] = []
-    monkeypatch.setattr(
-        hass.config_entries,
-        "async_schedule_reload",
-        lambda entry_id: reloads.append(entry_id),
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Sink",
+            CONF_CHANNELS: "5",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    subentries = {subentry.unique_id: subentry for subentry in entry.subentries.values()}
+    assert "5" in subentries
+    assert subentries["5"].title == "Sink"
+
+
+@pytest.mark.asyncio
+async def test_subentry_add_rejects_partial_overlap_and_duplicate(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new cover must remain laminar with existing sibling covers."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Bad",
+            CONF_CHANNELS: "3,4",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Dup",
+            CONF_CHANNELS: "1,2,3",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    assert result["errors"] == {CONF_CHANNELS: "duplicate_channels"}
+
+
+@pytest.mark.asyncio
+async def test_subentry_add_fails_closed_for_unparseable_sibling_channels(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable sibling blocks cover mutations instead of disappearing."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    sibling = next(iter(entry.subentries.values()))
+    hass.config_entries.async_update_subentry(
+        entry,
+        sibling,
+        data={CONF_NAME: "x", CONF_CHANNELS: "not-a-channel"},
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Sink",
+            CONF_CHANNELS: "5",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "invalid_config"}
+
+
+@pytest.mark.asyncio
+async def test_subentry_add_validates_channels_from_malformed_travel_sibling(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parseable sibling channels still participate when its travel is corrupt."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    sibling = next(iter(entry.subentries.values()))
+    hass.config_entries.async_update_subentry(
+        entry,
+        sibling,
+        data={
+            CONF_NAME: "x",
+            CONF_CHANNELS: "1,2",
+            CONF_TRAVEL_UP: "garbage",
+            CONF_TRAVEL_DOWN: "garbage",
+        },
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={"source": config_entries.SOURCE_USER},
+    )
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Overlap",
+            CONF_CHANNELS: "2,3",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+
+
+@pytest.mark.asyncio
+async def test_subentry_reconfigure_prefills_display_values(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconfigure suggestions display storage values in form-friendly shapes."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 13,
+            }
+        ],
+    )
+    slider = next(iter(entry.subentries.values()))
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "subentry_id": slider.subentry_id,
+        },
+    )
+    schema = result["data_schema"]
+    assert schema is not None
+    suggested = schema_suggested_values(schema)
+    assert suggested[CONF_CHANNELS] == "1,2,3"
+    assert suggested[CONF_TRAVEL_UP] == 12.0
+    assert suggested[CONF_TRAVEL_DOWN] == 13.0
+
+    suggested[CONF_NAME] = "Renamed slider"
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        schema(suggested),
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    updated = next(iter(entry.subentries.values()))
+    restored = CoverConfig.from_subentry(updated.data)
+    assert updated.title == "Renamed slider"
+    assert restored.channels == (1, 2, 3)
+    assert restored.travel_up == 12.0
+    assert restored.travel_down == 13.0
+
+
+@pytest.mark.asyncio
+async def test_subentry_reconfigure_carries_hidden_travel_forward(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconfiguring into an aggregate retains stored travel calibration."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            },
+            {
+                CONF_NAME: "Sink",
+                CONF_CHANNELS: "5",
+                CONF_TRAVEL_UP: 9,
+                CONF_TRAVEL_DOWN: 9,
+            },
+        ],
+    )
+    sink = next(subentry for subentry in entry.subentries.values() if subentry.unique_id == "5")
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "subentry_id": sink.subentry_id,
+        },
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3,5"},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    updated = next(
+        subentry
+        for subentry in entry.subentries.values()
+        if subentry.subentry_id == sink.subentry_id
+    )
+    assert updated.unique_id == "1-2-3-5"
+    assert updated.title == "Kitchen shades"
+    restored = CoverConfig.from_subentry(updated.data)
+    assert restored.travel_up == 9.0
+
+
+@pytest.mark.asyncio
+async def test_subentry_reconfigure_to_leaf_requires_travel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconfigured leaf needs submitted or previously stored travel times."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            },
+            {CONF_NAME: "All", CONF_CHANNELS: "1,2,3,4"},
+        ],
+    )
+    aggregate = next(
+        subentry for subentry in entry.subentries.values() if subentry.unique_id == "1-2-3-4"
+    )
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, "cover"),
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "subentry_id": aggregate.subentry_id,
+        },
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "Solo", CONF_CHANNELS: "6"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "travel_required"}
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_edit_updates_settings_and_keeps_identity(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editing settings updates mutable fields without replacing identity or covers."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2,3",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
     )
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -1055,36 +1639,169 @@ async def test_reconfigure_relearn_reloads_and_clears_stale_options(
             "entry_id": entry.entry_id,
         },
     )
-    flow_id = result["flow_id"]
     assert result["type"] is FlowResultType.MENU
-    assert result["step_id"] == "reconfigure"
-    assert result["menu_options"] == ["reconfigure_learn", "reconfigure_edit"]
-
     result = await hass.config_entries.flow.async_configure(
-        flow_id,
+        result["flow_id"],
+        {"next_step_id": "reconfigure_edit"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Kitchen remote",
+            CONF_AREA_ID: "pantry",
+            CONF_BASE_UP: "f42a",
+            CONF_BASE_DOWN: "bcf2",
+            CONF_BASE_STOP: "dc12",
+            CONF_BASE_TRAILER: "dd05",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 8,
+                CONF_COALESCE_WINDOW_MS: 0,
+            },
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    updated = RemoteConfig.from_entry(entry.data)
+    assert updated.area_id == "pantry"
+    assert updated.repeats == 8
+    assert updated.key == "a1b2c3:42"
+    assert updated.remote.bases is not None
+    assert updated.remote.bases.trailer == 0xDD05
+    assert [subentry.unique_id for subentry in entry.subentries.values()] == ["1-2-3"]
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_relearn_applies_new_identity_and_collides(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relearning applies a captured identity while preserving entry metadata."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
         {"next_step_id": "reconfigure_learn"},
     )
     assert result["step_id"] == "learn_setup"
-    setup_schema = result["data_schema"]
-    assert setup_schema is not None
-    setup_values = setup_schema(
-        {
-            CONF_NAME: "Relearned shade",
-            CONF_AREA_ID: "living_room",
-        }
-    )
-    assert setup_values[CONF_BRIDGE] == config_flow_module._AUTOMATIC_BRIDGE
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        setup_values,
-    )
+    flow_id = result["flow_id"]
+    schema = result["data_schema"]
+    assert schema is not None
+    setup_values = schema({})
+    assert setup_values[CONF_NAME] == "Kitchen remote"
+    setup_values[CONF_NAME] = "Renamed remote"
+    setup_values[CONF_AREA_ID] = "pantry"
+    result = await hass.config_entries.flow.async_configure(flow_id, setup_values)
     assert result["type"] is FlowResultType.SHOW_PROGRESS
     await fake.wait_for_publications(1)
-    assert fake.published[0][0] == "rf433/bridge-a/cmd"
+    rx = fake.rx_subscriptions()[0]
+    # Emit on the subscription's own topic: the edited area ("pantry")
+    # matches no fake bridge, so automatic selection routes to the default
+    # bridge — hardcoding a bridge id here would miss the capture handler's
+    # exact-topic check.
     await fake.emit(
-        fake.rx_subscriptions()[0],
-        "rf433/bridge-a/rx",
-        json.dumps({"frame": REFERENCE_UP_B1, "t": 7}),
+        rx,
+        rx.topic,
+        json.dumps({"frame": b0_to_b1(SECOND_REMOTE_UP_B0), "t": 3}),
+    )
+    await fake.wait_for_publications(2)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_confirm"
+    assert result["menu_options"] == ["reconfigure_apply", "learn_retry"]
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "reconfigure_apply"},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    updated = RemoteConfig.from_entry(entry.data)
+    assert updated.key == f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x}"
+    assert entry.unique_id == updated.key
+    assert updated.name == "Renamed remote"
+    assert updated.area_id == "pantry"
+    assert entry.title == "Renamed remote"
+    assert [subentry.unique_id for subentry in entry.subentries.values()] == ["1-2"]
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_relearn_collision_aborts(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relearning an identity another entry already owns aborts unchanged."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        ],
+    )
+    await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Other blind",
+                CONF_CHANNELS: "1",
+                CONF_TRAVEL_UP: 10,
+                CONF_TRAVEL_DOWN: 10,
+            }
+        ],
+        prefix=f"{REF_PREFIX:06x}",
+        remote_id=f"{REF_REMOTE_ID:02x}",
+        base=f"{REF_BASES.up:04x}",
+        name="Bedroom remote",
+    )
+    original_data = dict(entry.data)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "reconfigure_learn"},
+    )
+    flow_id = result["flow_id"]
+    schema = result["data_schema"]
+    assert schema is not None
+    result = await hass.config_entries.flow.async_configure(flow_id, schema({}))
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    rx = fake.rx_subscriptions()[0]
+    await fake.emit(
+        rx,
+        rx.topic,
+        json.dumps({"frame": b0_to_b1(SECOND_REMOTE_UP_B0), "t": 3}),
     )
     await fake.wait_for_publications(2)
     await hass.async_block_till_done()
@@ -1092,172 +1809,9 @@ async def test_reconfigure_relearn_reloads_and_clears_stale_options(
     assert result["step_id"] == "learn_confirm"
     result = await hass.config_entries.flow.async_configure(
         flow_id,
-        {"next_step_id": "learn_details"},
+        {"next_step_id": "reconfigure_apply"},
     )
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "learn_details"
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        details_input(name=None, travel_up=20, travel_down=21, repeats=6),
-    )
-
     assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reconfigure_successful"
-    assert entry.title == "Relearned shade"
-    assert entry.unique_id == "a1b2c3:42:1-2"
-    expected = BlindConfig(
-        name="Relearned shade",
-        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
-        channels=(1, 2),
-        travel_up=20,
-        travel_down=21,
-        area_id="living_room",
-        repeats=6,
-        coalesce_window_ms=150,
-    )
-    assert entry.data == expected.as_dict()
-    assert entry.options == {}
-    assert reloads == [entry.entry_id]
-
-
-@pytest.mark.asyncio
-async def test_reconfigure_edit_keeps_remote_and_clears_options(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Settings-only reconfigure retains calibration while removing option shadowing."""
-    prepare_config_flow(hass, monkeypatch)
-    original = BlindConfig(
-        name="Original shade",
-        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
-        channels=(1,),
-        travel_up=10,
-        travel_down=11,
-        area_id="living_room",
-        repeats=5,
-        coalesce_window_ms=150,
-    )
-    sibling = real_entry(
-        "edit-sibling",
-        BlindConfig(
-            name="Sibling shade",
-            remote=original.remote,
-            channels=(3,),
-            travel_up=10,
-            travel_down=11,
-            area_id="living_room",
-            repeats=5,
-            coalesce_window_ms=150,
-        ),
-    )
-    await hass.config_entries.async_add(sibling)
-    effective_bases = derive_bases_from_base("UP", 0xF43A, TEST_REMOTE_ID)
-    entry = real_entry(
-        "edit-me",
-        original,
-        options={
-            CONF_BASE_UP: f"{effective_bases.up:04x}",
-            CONF_BASE_DOWN: f"{effective_bases.down:04x}",
-            CONF_BASE_STOP: f"{effective_bases.stop:04x}",
-            CONF_TRAVEL_UP: 99,
-            CONF_COALESCE_WINDOW_MS: 600,
-        },
-    )
-    await hass.config_entries.async_add(entry)
-    reloads: list[str] = []
-    monkeypatch.setattr(
-        hass.config_entries,
-        "async_schedule_reload",
-        lambda entry_id: reloads.append(entry_id),
-    )
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={
-            "source": config_entries.SOURCE_RECONFIGURE,
-            "entry_id": entry.entry_id,
-        },
-    )
-    flow_id = result["flow_id"]
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        {"next_step_id": "reconfigure_edit"},
-    )
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "reconfigure_edit"
-
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        details_input(
-            name="Edited shade",
-            channels="1,2",
-            area_id="bedroom",
-            travel_up=22,
-            travel_down=23,
-            repeats=7,
-            coalesce_window_ms=250,
-        ),
-    )
-
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reconfigure_successful"
-    edited = BlindConfig.from_mapping(entry.data)
-    assert edited.remote == RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, effective_bases)
-    assert edited.name == "Edited shade"
-    assert edited.channels == (1, 2)
-    assert edited.area_id == "bedroom"
-    assert edited.travel_up == 22
-    assert edited.coalesce_window_ms == 250
-    assert entry.options == {}
-    assert BlindConfig.from_mapping(sibling.data).remote == edited.remote
-    assert reloads == [sibling.entry_id, entry.entry_id]
-
-
-@pytest.mark.asyncio
-async def test_options_flow_still_edits_travel_and_area(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The legacy options entry point remains usable for timing and area edits."""
-    prepare_config_flow(hass, monkeypatch)
-    original = BlindConfig(
-        name="Options shade",
-        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
-        channels=(1,),
-        travel_up=10,
-        travel_down=11,
-        area_id="living_room",
-        repeats=5,
-        coalesce_window_ms=150,
-    )
-    entry = real_entry("options-me", original)
-    await hass.config_entries.async_add(entry)
-    reloads: list[str] = []
-    monkeypatch.setattr(
-        hass.config_entries,
-        "async_schedule_reload",
-        lambda entry_id: reloads.append(entry_id),
-    )
-
-    result = await hass.config_entries.options.async_init(entry.entry_id)
-    assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == "init"
-    result = await hass.config_entries.options.async_configure(
-        result["flow_id"],
-        details_input(
-            name="Options shade",
-            channels="1",
-            area_id="bedroom",
-            travel_up=30,
-            travel_down=31,
-            repeats=5,
-            coalesce_window_ms=150,
-        ),
-    )
-
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    effective = BlindConfig.from_mapping({**entry.data, **entry.options})
-    assert effective.remote == original.remote
-    assert effective.area_id == "bedroom"
-    assert effective.travel_up == 30
-    assert effective.travel_down == 31
-    assert reloads == [entry.entry_id]
+    assert result["reason"] == "already_configured"
+    assert dict(entry.data) == original_data
+    assert entry.unique_id == "a1b2c3:42"

@@ -28,7 +28,11 @@ from custom_components.zemismart_blinds.models import (
     ZemismartHub,
     parse_channels,
 )
-from custom_components.zemismart_blinds.state_sync import HeardEvent
+from custom_components.zemismart_blinds.state_sync import (
+    HeardEvent,
+    LedgerFrameSpec,
+    frame_signature,
+)
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_BASES,
@@ -38,6 +42,8 @@ from tests.synthetic import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from custom_components.zemismart_blinds.models import CoverConfig
 
 # A second synthetic remote used to prove that remote identity partitions
 # coalescing batches and command targets.
@@ -77,6 +83,207 @@ _CLAMPED_STATUS_T: Final = 70_000
 _REPLAY_AGE_MS: Final = 600_000
 _REPLAY_STATUS_T: Final = 610_000
 _REPLAY_DELIVERY_TIME: Final = 700.0
+
+
+def test_role_is_str_enum() -> None:
+    from custom_components.zemismart_blinds.models import Role
+
+    assert Role.LEAF.value == "leaf"
+    assert Role.AGGREGATE.value == "aggregate"
+
+
+def test_cover_config_normalizes_and_exposes_channel_key() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(
+        name="  Kitchen sink  ", channels=(3, 1, 2), travel_up=12.0, travel_down=10.0
+    )
+    assert cover.name == "Kitchen sink"
+    assert cover.channels == (1, 2, 3)
+    assert cover.channel_key == "1-2-3"
+    assert cover.has_travel is True
+
+
+def test_cover_config_allows_missing_travel_times() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(name="All shades", channels=(1, 2, 3, 4, 5, 6))
+    assert cover.travel_up is None
+    assert cover.travel_down is None
+    assert cover.has_travel is False
+
+
+def test_cover_config_rejects_partial_travel_times() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    with pytest.raises(ValueError, match="together"):
+        CoverConfig(name="x", channels=(1,), travel_up=12.0)
+
+
+def test_cover_config_rejects_empty_name_and_bad_travel() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    with pytest.raises(ValueError, match="name"):
+        CoverConfig(name="   ", channels=(1,), travel_up=5.0, travel_down=5.0)
+    with pytest.raises(ValueError):
+        CoverConfig(name="x", channels=(1,), travel_up=0.0, travel_down=5.0)
+    with pytest.raises(ValueError):
+        CoverConfig(name="x", channels=(1,), travel_up=5.0, travel_down=999_999.0)
+
+
+def test_cover_config_roundtrips_through_mapping() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    cover = CoverConfig(name="Counter", channels=(4,), travel_up=8.5, travel_down=9.5)
+    restored = CoverConfig.from_subentry(cover.as_dict())
+    assert restored == cover
+
+    aggregate = CoverConfig(name="All", channels=(1, 2, 3))
+    restored_aggregate = CoverConfig.from_subentry(aggregate.as_dict())
+    assert restored_aggregate == aggregate
+    assert restored_aggregate.travel_up is None
+
+
+def _remote_identity() -> RemoteIdentity:
+    from custom_components.zemismart_blinds.models import RemoteIdentity
+
+    return RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+
+
+def test_remote_config_key_and_defaults() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    remote = RemoteConfig(
+        name=" Kitchen remote ",
+        remote=_remote_identity(),
+        area_id=" kitchen ",
+        repeats=5,
+    )
+    assert remote.name == "Kitchen remote"
+    assert remote.area_id == "kitchen"
+    assert remote.key == f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    assert remote.coalesce_window_ms == 150
+
+
+def test_remote_config_validates_bounds_and_calibration() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig, RemoteIdentity
+
+    with pytest.raises(ValueError, match="calibration"):
+        RemoteConfig(
+            name="x",
+            remote=RemoteIdentity(0x000001, 0x02),  # no bases, none pre-seeded
+            area_id="a",
+            repeats=5,
+        )
+    with pytest.raises(ValueError, match="repeats"):
+        RemoteConfig(name="x", remote=_remote_identity(), area_id="a", repeats=0)
+    with pytest.raises(ValueError, match="coalesce"):
+        RemoteConfig(
+            name="x",
+            remote=_remote_identity(),
+            area_id="a",
+            repeats=5,
+            coalesce_window_ms=99_999,
+        )
+    with pytest.raises(ValueError, match="area"):
+        RemoteConfig(name="x", remote=_remote_identity(), area_id="  ", repeats=5)
+
+
+def test_remote_config_roundtrips_through_mapping() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=7,
+        coalesce_window_ms=200,
+    )
+    restored = RemoteConfig.from_entry(remote.as_dict())
+    assert restored == remote
+    assert restored.remote.bases == TEST_BASES
+
+
+def test_laminar_conflict_accepts_disjoint_and_nested() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    existing = [(1, 2, 3), (4,), (5,)]
+    assert laminar_conflict((6,), existing) is None  # disjoint
+    assert laminar_conflict((1, 2, 3, 4, 5, 6), existing) is None  # strict superset of all
+    assert laminar_conflict((1,), existing) is None  # strict subset of (1,2,3)
+
+
+def test_laminar_conflict_rejects_partial_overlap() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    existing = [(1, 2, 3)]
+    assert laminar_conflict((2, 3, 4), existing) == "overlapping_channels"
+    assert laminar_conflict((3, 4), existing) == "overlapping_channels"
+
+
+def test_laminar_conflict_rejects_duplicate() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    assert laminar_conflict((1, 2), [(2, 1)]) == "duplicate_channels"
+
+
+def test_laminar_conflict_normalizes_before_comparing() -> None:
+    from custom_components.zemismart_blinds.models import laminar_conflict
+
+    # order/dupes must not matter; nested still passes
+    assert laminar_conflict((3, 1), [(1, 2, 3), (1, 3)]) == "duplicate_channels"
+
+
+def _kitchen_covers() -> list[CoverConfig]:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    slider = CoverConfig(name="Slider", channels=(1, 2, 3), travel_up=12.0, travel_down=12.0)
+    counter = CoverConfig(name="Counter", channels=(4,), travel_up=8.0, travel_down=8.0)
+    sink = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
+    allshades = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    return [slider, counter, sink, allshades]
+
+
+def test_derive_role_leaf_and_aggregate() -> None:
+    from custom_components.zemismart_blinds.models import Role, derive_role
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    assert derive_role(by_key["1-2-3"], covers) == Role.LEAF
+    assert derive_role(by_key["4"], covers) == Role.LEAF
+    assert derive_role(by_key["1-2-3-4-5-6"], covers) == Role.AGGREGATE
+
+
+def test_member_covers_are_leaves_only() -> None:
+    from custom_components.zemismart_blinds.models import member_covers
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    members = member_covers(by_key["1-2-3-4-5-6"], covers)
+    keys = [m.channel_key for m in members]
+    # slider (1-2-3), counter (4), sink (5) are leaves inside; nested aggregates excluded.
+    assert keys == ["1-2-3", "4", "5"]
+
+
+def test_member_covers_excludes_nested_aggregates() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig, member_covers
+
+    leaf1 = CoverConfig(name="1", channels=(1,), travel_up=5.0, travel_down=5.0)
+    inner = CoverConfig(name="inner", channels=(1, 2))  # aggregate over leaf1
+    leaf2 = CoverConfig(name="2", channels=(2,), travel_up=5.0, travel_down=5.0)
+    outer = CoverConfig(name="outer", channels=(1, 2, 3))  # aggregate
+    leaf3 = CoverConfig(name="3", channels=(3,), travel_up=5.0, travel_down=5.0)
+    covers = [leaf1, inner, leaf2, outer, leaf3]
+    members = member_covers(outer, covers)
+    assert [m.channel_key for m in members] == ["1", "2", "3"]  # inner (1-2) excluded
+
+
+def test_member_covers_empty_for_leaf() -> None:
+    from custom_components.zemismart_blinds.models import member_covers
+
+    covers = _kitchen_covers()
+    by_key = {c.channel_key: c for c in covers}
+    assert member_covers(by_key["4"], covers) == ()
 
 
 def blind_config(*, area_id: str = "living_room") -> BlindConfig:
@@ -3649,3 +3856,289 @@ async def test_close_cancels_background_publish_tasks() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     release.set()
+
+
+def test_remote_runtime_carries_remote_and_hub() -> None:
+    from custom_components.zemismart_blinds.models import (
+        BridgeRegistry,
+        RemoteConfig,
+        RemoteRuntime,
+        ZemismartHub,
+    )
+
+    async def publisher(_topic: str, _payload: str) -> None:
+        return None
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=5,
+    )
+    runtime = RemoteRuntime(remote=remote, hub=hub)
+    assert runtime.remote is remote
+    assert runtime.hub is hub
+
+
+def test_blindconfig_defaults_to_leaf_role() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="Sink",
+        remote=_remote_identity(),
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    assert config.role is Role.LEAF
+    assert config.is_aggregate is False
+
+
+def test_blindconfig_leaf_still_requires_travel() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    with pytest.raises(ValueError, match="travel"):
+        BlindConfig(
+            name="Sink",
+            remote=_remote_identity(),
+            channels=(5,),
+            travel_up=None,
+            travel_down=None,
+            area_id="kitchen",
+            repeats=5,
+            role=Role.LEAF,
+        )
+
+
+def test_blindconfig_aggregate_allows_no_travel() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="All",
+        remote=_remote_identity(),
+        channels=(1, 2, 3, 4, 5, 6),
+        travel_up=None,
+        travel_down=None,
+        area_id="kitchen",
+        repeats=5,
+        role=Role.AGGREGATE,
+    )
+    assert config.is_aggregate is True
+    assert config.travel_up is None
+
+
+def test_blindconfig_derive_from_remote_and_cover() -> None:
+    from custom_components.zemismart_blinds.models import (
+        BlindConfig,
+        CoverConfig,
+        RemoteConfig,
+        Role,
+    )
+
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=7,
+        coalesce_window_ms=200,
+    )
+    leaf = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
+    derived = BlindConfig.derive(remote, leaf, Role.LEAF)
+    assert derived.name == "Sink"
+    assert derived.channels == (5,)
+    assert derived.area_id == "kitchen"
+    assert derived.repeats == 7
+    assert derived.coalesce_window_ms == 200
+    assert derived.travel_up == 9.0
+    assert derived.role is Role.LEAF
+    assert derived.remote.key == remote.key
+
+    aggregate_cover = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    aggregate = BlindConfig.derive(remote, aggregate_cover, Role.AGGREGATE)
+    assert aggregate.is_aggregate is True
+    assert aggregate.travel_up is None
+
+
+def test_blindconfig_from_mapping_stays_leaf() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="Sink",
+        remote=_remote_identity(),
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    restored = BlindConfig.from_mapping(config.as_dict())
+    assert restored.role is Role.LEAF
+    assert restored.travel_up == 9.0
+
+
+@pytest.mark.asyncio
+async def test_drain_owner_supersedes_only_that_entrys_queued_commands() -> None:
+    """Unloading an entry drains its queued commands; others stay queued."""
+    release = asyncio.Event()
+    first_published = asyncio.Event()
+    published: list[str] = []
+
+    async def publisher(topic: str, payload: str) -> None:
+        del topic
+        published.append(payload)
+        first_published.set()
+        await release.wait()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_availability("bridge-a", "online")
+    config = BlindConfig(
+        name="Blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    other_remote = RemoteIdentity(OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES)
+    other_config = BlindConfig(
+        name="Other",
+        remote=other_remote,
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    # First command occupies the worker inside the (blocked) publisher.
+    first = asyncio.create_task(hub.async_transmit(config, "UP", owner="entry-a"))
+    await asyncio.wait_for(first_published.wait(), timeout=1.0)
+    # Two queued commands with different owners.
+    drained = asyncio.create_task(hub.async_transmit(config, "DOWN", owner="entry-a"))
+    kept = asyncio.create_task(hub.async_transmit(other_config, "UP", owner="entry-b"))
+    await asyncio.sleep(0)
+
+    hub.drain_owner("entry-a")
+    assert await asyncio.wait_for(drained, timeout=1.0) == "superseded"
+    assert not kept.done()
+
+    release.set()
+    first.cancel()
+    kept.cancel()
+    for task in (first, kept):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_disarm_remote_awaits_acknowledged_bridge_disarms() -> None:
+    """Relearn disarms every live ledger command of the remote, bounded."""
+    control: list[dict[str, Any]] = []
+    disarm_seen = asyncio.Event()
+
+    async def publisher(topic: str, payload: str) -> None:
+        if topic.endswith("/cmd"):
+            body: dict[str, Any] = json.loads(payload)
+            control.append(body)
+            disarm_seen.set()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    signature = frame_signature(frame)
+    assert signature is not None
+    hub._ledger.register_pending(
+        "cmd-live",
+        "bridge-a",
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature=signature, offset_ms=0, airtime_ms=100)],
+    )
+
+    # No live commands for a different remote: returns without publishing.
+    await hub.async_disarm_remote("ffffff:01", deadline_seconds=0.2)
+    assert control == []
+
+    disarm_task = asyncio.create_task(hub.async_disarm_remote(remote.key, deadline_seconds=1.0))
+    await asyncio.wait_for(disarm_seen.wait(), timeout=1.0)
+    assert control[0] == {"action": "disarm", "command_id": "cmd-live"}
+    hub.on_disarmed("bridge-a", "cmd-live")
+    await asyncio.wait_for(disarm_task, timeout=1.0)
+    hub.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
+    """A fast-lane STOP still waiting on publish barriers drains too."""
+    release = asyncio.Event()
+    first_published = asyncio.Event()
+
+    async def publisher(topic: str, payload: str) -> None:
+        del topic, payload
+        first_published.set()
+        await release.wait()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_availability("bridge-a", "online")
+    config = BlindConfig(
+        name="Blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    # Movement occupies the worker with its publish incomplete (blocked
+    # publisher), so the following STOP's fast lane waits on its barrier.
+    movement = asyncio.create_task(hub.async_transmit(config, "UP", owner="entry-a"))
+    await asyncio.wait_for(first_published.wait(), timeout=1.0)
+    stop = asyncio.create_task(hub.async_transmit(config, "STOP", owner="entry-a"))
+    await asyncio.sleep(0)
+    assert not stop.done()
+
+    hub.drain_owner("entry-a")
+    assert await asyncio.wait_for(stop, timeout=1.0) == "superseded"
+
+    release.set()
+    movement.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await movement
+    hub.close()
+
+
+def test_ledger_disarm_deadline_extends_to_window_end() -> None:
+    """A confirmed command's disarm retries until its last window closes."""
+    from custom_components.zemismart_blinds.state_sync import CommandLedger
+
+    ledger = CommandLedger()
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    signature = frame_signature(frame)
+    assert signature is not None
+    ledger.register_pending(
+        "cmd-timed",
+        "bridge-a",
+        (1,),
+        "UP",
+        [
+            LedgerFrameSpec(signature=signature, offset_ms=0, airtime_ms=100),
+            LedgerFrameSpec(signature=signature, offset_ms=45_000, airtime_ms=100),
+        ],
+    )
+    # Pending: only the fallback applies.
+    assert ledger.disarm_deadline("cmd-timed", fallback=50.0) == 50.0
+    ledger.confirm("cmd-timed", 100.0)
+    # Confirmed: the far STOP frame's window end wins over the fallback.
+    deadline = ledger.disarm_deadline("cmd-timed", fallback=110.0)
+    assert deadline > 140.0
+    # Unknown commands keep the fallback.
+    assert ledger.disarm_deadline("cmd-unknown", fallback=7.0) == 7.0

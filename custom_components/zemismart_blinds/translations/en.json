@@ -6,8 +6,8 @@
     },
     "step": {
       "user": {
-        "title": "Add one blind or group",
-        "description": "Learn the remote automatically, or use an Advanced setup method.",
+        "title": "Add a Zemismart remote",
+        "description": "Learn the remote automatically, or use an Advanced setup method. You will add its covers (blinds and groups) next.",
         "menu_options": {
           "learn": "Learn from remote",
           "advanced": "Advanced"
@@ -48,51 +48,18 @@
         "title": "Confirm the detected remote",
         "description": "Detected prefix {prefix}, remote ID {remote_id}, channels {channels}, and {button} for {name} through {bridge}.",
         "menu_options": {
-          "learn_details": "Looks good",
+          "remote_settings": "Continue",
           "learn_retry": "Try again",
-          "advanced": "Advanced"
-        }
-      },
-      "learn_details": {
-        "title": "Configure the blind or group",
-        "description": "The captured channels are prefilled. Edit them to target one channel or a group.",
-        "data": {
-          "channels": "Channel or channel set",
-          "travel_up": "Up travel time",
-          "travel_down": "Down travel time",
-          "area_id": "Home Assistant area"
-        },
-        "data_description": {
-          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3."
-        },
-        "sections": {
-          "advanced": {
-            "name": "Advanced",
-            "data": {
-              "repeats": "RF repeats",
-              "coalesce_window_ms": "Group coalescing window"
-            },
-            "data_description": {
-              "repeats": "How many times each RF frame is sent.",
-              "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
-            }
-          }
+          "advanced": "Advanced",
+          "reconfigure_apply": "Apply new identity"
         }
       },
       "advanced": {
         "title": "Advanced setup",
         "description": "Choose how to provide a calibrated remote identity.",
         "menu_options": {
-          "reuse": "Reuse a known remote",
           "manual": "Enter a remote manually",
           "virtual": "Allocate a virtual remote"
-        }
-      },
-      "reuse": {
-        "title": "Reuse a known remote",
-        "description": "Choose an existing calibrated remote, then configure another channel or group.",
-        "data": {
-          "known_remote": "Remote"
         }
       },
       "manual": {
@@ -111,17 +78,11 @@
           "calibration_frame": "The captured identity must match the entered prefix and remote ID."
         }
       },
-      "advanced_details": {
-        "title": "Configure the blind or group",
+      "remote_settings": {
+        "title": "Name the remote",
         "data": {
-          "name": "Device name",
-          "channels": "Channel or channel set",
-          "travel_up": "Up travel time",
-          "travel_down": "Down travel time",
+          "name": "Remote name",
           "area_id": "Home Assistant area"
-        },
-        "data_description": {
-          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3."
         },
         "sections": {
           "advanced": {
@@ -137,26 +98,45 @@
           }
         }
       },
+      "cover": {
+        "title": "Add a cover",
+        "description": "Cover {count} so far. Name this blind or group and enter its channels.",
+        "data": {
+          "name": "Device name",
+          "channels": "Channel or channel set",
+          "travel_up": "Up travel time",
+          "travel_down": "Down travel time"
+        },
+        "data_description": {
+          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
+          "travel_up": "Required for a blind; leave empty only for a group that contains covers you already added.",
+          "travel_down": "Required for a blind; leave empty only for a group that contains covers you already added."
+        }
+      },
+      "cover_menu": {
+        "title": "Cover added",
+        "description": "{count} cover(s) configured.",
+        "menu_options": {
+          "cover": "Add another cover",
+          "finish": "Finish"
+        }
+      },
       "reconfigure": {
-        "title": "Reconfigure blind or group",
-        "description": "Relearn the physical remote calibration, or edit settings without capturing a remote.",
+        "title": "Reconfigure remote",
         "menu_options": {
           "reconfigure_learn": "Relearn from remote",
           "reconfigure_edit": "Edit settings"
         }
       },
       "reconfigure_edit": {
-        "title": "Edit blind or group",
-        "description": "The existing remote identity and calibration will be kept.",
+        "title": "Edit remote settings",
         "data": {
-          "name": "Device name",
-          "channels": "Channel or channel set",
-          "travel_up": "Up travel time",
-          "travel_down": "Down travel time",
-          "area_id": "Home Assistant area"
-        },
-        "data_description": {
-          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3."
+          "name": "Remote name",
+          "area_id": "Home Assistant area",
+          "base_up": "UP base (16-bit hex)",
+          "base_down": "DOWN base (16-bit hex)",
+          "base_stop": "STOP base (16-bit hex)",
+          "base_trailer": "TRAILER base (optional)"
         },
         "sections": {
           "advanced": {
@@ -176,13 +156,65 @@
     "error": {
       "invalid_config": "Check the remote identity, calibration, channel set, travel times, area, and Advanced settings.",
       "bridge_unavailable": "Choose a bridge that was discovered as online.",
-      "no_known_remotes": "No calibrated remotes are available to reuse.",
-      "already_configured": "Another device already uses this remote channel set.",
-      "cross_area_overlap": "These channels of this remote already exist in a different area. A blind lives in one room; keep all of its entries (and groups) in that room's area."
+      "already_configured": "This remote is already configured by another entry.",
+      "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
+      "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
+      "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
     },
     "abort": {
-      "already_configured": "This remote channel or channel set is already configured.",
-      "reconfigure_successful": "The blind or group was reconfigured successfully."
+      "already_configured": "This remote is already configured.",
+      "reconfigure_successful": "The remote was reconfigured successfully.",
+      "legacy_not_supported": "This entry uses the old per-blind format. Delete it and add its remote again instead of reconfiguring.",
+      "channel_conflict": "The collected covers conflict; start over."
+    }
+  },
+  "config_subentries": {
+    "cover": {
+      "entry_type": "Cover",
+      "initiate_flow": {
+        "user": "Add cover",
+        "reconfigure": "Reconfigure cover"
+      },
+      "step": {
+        "user": {
+          "title": "Add a cover",
+          "data": {
+            "name": "Device name",
+            "channels": "Channel or channel set",
+            "travel_up": "Up travel time",
+            "travel_down": "Down travel time"
+          },
+          "data_description": {
+            "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
+            "travel_up": "Required for a blind; leave empty only for a group that contains covers you already added.",
+            "travel_down": "Required for a blind; leave empty only for a group that contains covers you already added."
+          }
+        },
+        "reconfigure": {
+          "title": "Reconfigure cover",
+          "data": {
+            "name": "Device name",
+            "channels": "Channel or channel set",
+            "travel_up": "Up travel time",
+            "travel_down": "Down travel time"
+          },
+          "data_description": {
+            "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
+            "travel_up": "Required for a blind; leave empty only for a group that contains covers you already added.",
+            "travel_down": "Required for a blind; leave empty only for a group that contains covers you already added."
+          }
+        }
+      },
+      "error": {
+        "invalid_config": "Check the cover name, channel set, and travel times.",
+        "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
+        "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
+        "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
+      },
+      "abort": {
+        "reconfigure_successful": "The cover was reconfigured successfully.",
+        "already_configured": "Another cover of this remote already uses exactly these channels."
+      }
     }
   },
   "selector": {
@@ -190,42 +222,6 @@
       "options": {
         "automatic": "Automatic"
       }
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Edit blind or group",
-        "description": "Edit device settings while keeping the current remote calibration.",
-        "data": {
-          "name": "Device name",
-          "channels": "Channel or channel set",
-          "travel_up": "Up travel time",
-          "travel_down": "Down travel time",
-          "area_id": "Home Assistant area"
-        },
-        "data_description": {
-          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3."
-        },
-        "sections": {
-          "advanced": {
-            "name": "Advanced",
-            "data": {
-              "repeats": "RF repeats",
-              "coalesce_window_ms": "Group coalescing window"
-            },
-            "data_description": {
-              "repeats": "How many times each RF frame is sent.",
-              "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
-            }
-          }
-        }
-      }
-    },
-    "error": {
-      "invalid_config": "Check the channel set, travel times, area, and Advanced settings.",
-      "already_configured": "Another device already uses this remote channel set.",
-      "cross_area_overlap": "These channels of this remote already exist in a different area. A blind lives in one room; keep all of its entries (and groups) in that room's area."
     }
   },
   "services": {

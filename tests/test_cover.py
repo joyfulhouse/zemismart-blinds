@@ -15,11 +15,11 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.zemismart_blinds import cover as cover_module
 from custom_components.zemismart_blinds import models as models_module
 from custom_components.zemismart_blinds.codec import encode_b0, make_payload
+from custom_components.zemismart_blinds.coordinator import RemoteCoordinator
 from custom_components.zemismart_blinds.cover import ZemismartCover
 from custom_components.zemismart_blinds.models import (
     BlindConfig,
     BridgeRegistry,
-    EntryRuntime,
     RemoteIdentity,
     ZemismartHub,
 )
@@ -77,7 +77,7 @@ async def attach_cover(
     entity_id: str = "cover.living_room_left",
 ) -> ZemismartCover:
     """Attach one entity to the real HA core without a platform wrapper."""
-    entity = cover_type(entry_id, EntryRuntime(config or cover_config(), hub))
+    entity = cover_type(entry_id, "remote-entry", config or cover_config(), hub)
     entity.hass = hass
     entity.entity_id = entity_id
     entity.platform = platform_stub()
@@ -301,66 +301,6 @@ async def test_ack_timeout_marks_position_unknown_and_degraded(hass: HomeAssista
         await entity.async_will_remove_from_hass()
 
 
-@pytest.mark.parametrize("timeout_phase", ("ack", "started"))
-@pytest.mark.asyncio
-async def test_group_timeout_marks_and_notifies_member_covers_unknown(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-    timeout_phase: str,
-) -> None:
-    """Ambiguous group receipt invalidates every registered addressed channel."""
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        if timeout_phase == "started":
-            body: dict[str, Any] = json.loads(payload)
-            assert hub.handle_status(
-                topic.split("/")[1],
-                {"status": "accepted", "command_id": body["command_id"]},
-            )
-
-    hub = ZemismartHub(
-        online_registry(),
-        publish,
-        ack_timeout=0.001,
-        started_timeout=0.001,
-    )
-    group = await attach_cover(hass, hub)
-    member_config = BlindConfig(
-        name="Living Room channel 1",
-        remote=group._config.remote,
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        area_id="living_room",
-        repeats=2,
-    )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
-    member.hass = hass
-    member.entity_id = "cover.living_room_channel_1"
-    member.platform = platform_stub()
-    await member.async_internal_added_to_hass()
-    await member.async_added_to_hass()
-    group._position = 50.0
-    member._position = 60.0
-    writes: list[str] = []
-    monkeypatch.setattr(
-        ZemismartCover,
-        "async_write_ha_state",
-        lambda entity: writes.append(entity.entity_id),
-    )
-    try:
-        with pytest.raises(HomeAssistantError, match="timed out"):
-            await group.async_open_cover()
-
-        assert group.current_cover_position is None
-        assert member.current_cover_position is None
-        assert set(writes) == {"cover.living_room_left", "cover.living_room_channel_1"}
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
 @pytest.mark.asyncio
 async def test_publish_failure_preserves_prior_motion_tracking(
     hass: HomeAssistant,
@@ -468,48 +408,6 @@ async def test_cover_commands_are_serialized_until_each_start(hass: HomeAssistan
 
 
 @pytest.mark.asyncio
-async def test_group_motion_updates_each_member_channel_estimate(hass: HomeAssistant) -> None:
-    """A group command advances the individual covers backed by its physical channels."""
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(online_registry(), publish)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    member_config = BlindConfig(
-        name="Living Room channel 1",
-        remote=group._config.remote,
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        area_id="living_room",
-        repeats=2,
-    )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
-    member.hass = hass
-    member.entity_id = "cover.living_room_channel_1"
-    member.platform = platform_stub()
-    await member.async_internal_added_to_hass()
-    await member.async_added_to_hass()
-    group._position = 20.0
-    member._position = 50.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 60})
-        await asyncio.sleep(0.02)
-
-        assert group.current_cover_position is not None
-        assert member.is_opening
-        # The RF frame moves the member for the group's duration from the
-        # member's OWN estimate: +40% of full travel on top of 50, capped 100.
-        assert member._motion_target == pytest.approx(90.0, abs=0.01)
-        assert member._motion_start_position == 50.0
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
 async def test_group_motion_marks_unknown_member_unknown(hass: HomeAssistant) -> None:
     """A member with no estimate becomes unknown when its group moves partially."""
     hub: ZemismartHub
@@ -528,7 +426,7 @@ async def test_group_motion_marks_unknown_member_unknown(hass: HomeAssistant) ->
         area_id="living_room",
         repeats=2,
     )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
+    member = ZemismartCover("entry-2", "remote-entry", member_config, hub)
     member.hass = hass
     member.entity_id = "cover.living_room_channel_1"
     member.platform = platform_stub()
@@ -655,7 +553,9 @@ def test_current_position_getter_is_pure() -> None:
 
     entity = ZemismartCover(
         "entry-1",
-        EntryRuntime(cover_config(), ZemismartHub(online_registry(), publish)),
+        "remote-entry",
+        cover_config(),
+        ZemismartHub(online_registry(), publish),
     )
     entity._position = 40.0
     entity._direction = 1
@@ -1232,114 +1132,6 @@ async def test_partial_heard_press_disarms_timed_command_before_unknown(
         )
     finally:
         await cover.async_will_remove_from_hass()
-        hub.close()
-
-
-@pytest.mark.asyncio
-async def test_partial_heard_takeover_invalidates_unpressed_bound_member(
-    hass: HomeAssistant,
-) -> None:
-    """A whole-command abort invalidates idle and bound unpressed members.
-
-    The round-8 panel ruled that an idle cover on an unpressed command channel
-    is also honestly unknown: disarming the old movement erases its fail-safe
-    STOP, so that motor can keep running. A different live commanded model owns
-    its cover and remains governed by its own lifecycle.
-    """
-    published: list[tuple[str, dict[str, Any]]] = []
-    disarm_published = asyncio.Event()
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        body: dict[str, Any] = json.loads(payload)
-        published.append((topic, body))
-        if topic.endswith("/tx"):
-            acknowledge(hub, topic.split("/")[1], body)
-        else:
-            disarm_published.set()
-
-    hub = ZemismartHub(
-        online_registry(),
-        publish,
-        command_id_factory=lambda: "group-timed",
-    )
-    group = await attach_cover(hass, hub, config=cover_config(travel=5.0))
-    first = await attach_cover(
-        hass,
-        hub,
-        config=member_config(channel=1, travel=5.0),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    second = await attach_cover(
-        hass,
-        hub,
-        config=member_config(channel=2, travel=5.0),
-        entry_id="entry-3",
-        entity_id="cover.living_room_channel_2",
-    )
-    unbound = await attach_cover(
-        hass,
-        hub,
-        config=member_config(channel=2, travel=5.0),
-        entry_id="entry-4",
-        entity_id="cover.unbound_channel_2",
-    )
-    protected = await attach_cover(
-        hass,
-        hub,
-        config=member_config(channel=2, travel=5.0),
-        entry_id="entry-5",
-        entity_id="cover.protected_channel_2",
-    )
-    for cover in (group, first, second, unbound, protected):
-        cover._position = 20.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 40})
-        assert second._motion_command_id == "group-timed"
-        unbound._position = 65.0
-        unbound._clear_motion()
-        unbound._degraded = False
-        protected._cancel_motion_task()
-        protected._clear_motion()
-        protected._position = 75.0
-        protected._motion_command_id = "newer-command"
-        protected._direction = 1
-        protected._degraded = False
-
-        dispatch_heard_press(
-            hub,
-            group._config,
-            "UP",
-            (1,),
-            at=cover_module.WALL_CLOCK(),
-        )
-        await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
-
-        assert first.is_opening
-        assert group.current_cover_position is None
-        assert second.current_cover_position is None
-        assert unbound.current_cover_position is None
-        assert unbound.extra_state_attributes["degraded_bridge"] is True
-        assert protected.current_cover_position == 75
-        assert protected._motion_command_id == "newer-command"
-        assert protected.extra_state_attributes["degraded_bridge"] is False
-        assert [item for item in published if item[0].endswith("/cmd")] == [
-            (
-                "rf433/bridge-a/cmd",
-                {"action": "disarm", "command_id": "group-timed"},
-            )
-        ]
-        assert hub.handle_status(
-            "bridge-a",
-            {"status": "disarmed", "command_id": "group-timed"},
-        )
-    finally:
-        await protected.async_will_remove_from_hass()
-        await group.async_will_remove_from_hass()
-        await first.async_will_remove_from_hass()
-        await second.async_will_remove_from_hass()
-        await unbound.async_will_remove_from_hass()
         hub.close()
 
 
@@ -3045,246 +2837,6 @@ async def test_transmitted_stop_still_publishes_records_ack_and_freezes(
 
 
 @pytest.mark.asyncio
-async def test_raced_group_displacement_stops_members_and_reconciles_overlaps(
-    hass: HomeAssistant,
-) -> None:
-    """A timed group command displaced after STARTED still stops every channel model."""
-    published: list[dict[str, Any]] = []
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        body: dict[str, Any] = json.loads(payload)
-        published.append(body)
-        bridge_id = topic.split("/")[1]
-        acknowledge(hub, bridge_id, body)
-        if len(published) == 2:
-            assert hub.handle_status(
-                bridge_id,
-                {"status": "displaced", "command_id": body["command_id"]},
-            )
-
-    hub = ZemismartHub(online_registry(), publish)
-    member = await attach_cover(hass, hub, config=member_config(travel=5.0))
-    member._position = 20.0
-    await member.async_open_cover()
-    assert member.is_opening
-
-    group = await attach_cover(
-        hass,
-        hub,
-        config=cover_config(travel=5.0),
-        entry_id="entry-2",
-        entity_id="cover.living_room_group",
-    )
-    overlap_config = BlindConfig(
-        name="Living Room overlap",
-        remote=cover_config().remote,
-        channels=(2, 3),
-        travel_up=5.0,
-        travel_down=5.0,
-        area_id="living_room",
-        repeats=2,
-    )
-    overlap = await attach_cover(
-        hass,
-        hub,
-        config=overlap_config,
-        entry_id="entry-3",
-        entity_id="cover.living_room_overlap",
-    )
-    group._position = 20.0
-    overlap._position = 40.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 60})
-
-        assert not group.is_opening
-        assert not member.is_opening
-        assert overlap.current_cover_position is None
-    finally:
-        await member.async_will_remove_from_hass()
-        await group.async_will_remove_from_hass()
-        await overlap.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
-async def test_displaced_user_stop_still_freezes_group_members(hass: HomeAssistant) -> None:
-    """A user STOP displaced after STARTED still freezes the group and its members.
-
-    A full-travel group member is untimed, so the timed-only _on_displaced never
-    freezes it; before the round-14 fix _async_stop returned on displacement
-    BEFORE the freeze, leaving a non-re-driven member tracking a stale full travel.
-    """
-    published: list[dict[str, Any]] = []
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        body: dict[str, Any] = json.loads(payload)
-        published.append(body)
-        bridge_id = topic.split("/")[1]
-        acknowledge(hub, bridge_id, body)
-        # Displace the STOP (the 2nd published frame) right after it starts.
-        if len(published) == 2:
-            hub.handle_status(
-                bridge_id,
-                {"status": "displaced", "command_id": body["command_id"]},
-            )
-
-    hub = ZemismartHub(online_registry(), publish)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    member = await attach_cover(
-        hass,
-        hub,
-        config=member_config(),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    group._position = 20.0
-    member._position = 20.0
-    try:
-        await group.async_open_cover()
-        assert group.is_opening
-        assert member.is_opening
-
-        await group.async_stop_cover()
-
-        assert not group.is_opening
-        assert not member.is_opening
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
-async def test_member_stop_marks_moving_containing_group_unknown(hass: HomeAssistant) -> None:
-    """Stopping one member channel invalidates its moving group's aggregate.
-
-    The STOP frame halts only that channel's motor; the group's remaining
-    members keep moving, so the group estimate no longer describes anything
-    physical. The stopped member itself freezes at its own estimate.
-    """
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(online_registry(), publish)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    member = await attach_cover(
-        hass,
-        hub,
-        config=member_config(),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    group._position = 20.0
-    member._position = 50.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 60})
-        await asyncio.sleep(0.02)
-        assert group.is_opening
-
-        await member.async_stop_cover()
-
-        assert group.current_cover_position is None
-        assert not group.is_opening
-        assert member.current_cover_position is not None
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
-async def test_overlapping_group_movement_marks_other_group_unknown(
-    hass: HomeAssistant,
-) -> None:
-    """Driving group {2,3} while group {1,2} moves invalidates {1,2}.
-
-    Channel 2 physically follows the newer frame, so the older group's
-    aggregate estimate no longer describes its members.
-    """
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(online_registry(), publish)
-    group_a = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    config_b = BlindConfig(
-        name="Living Room Right",
-        remote=cover_config().remote,
-        channels=(2, 3),
-        travel_up=1.0,
-        travel_down=1.0,
-        area_id="living_room",
-        repeats=2,
-    )
-    group_b = await attach_cover(
-        hass,
-        hub,
-        config=config_b,
-        entry_id="entry-3",
-        entity_id="cover.living_room_right",
-    )
-    group_a._position = 20.0
-    try:
-        await group_a.async_set_cover_position(**{ATTR_POSITION: 60})
-        await asyncio.sleep(0.02)
-        assert group_a.is_opening
-        # group_a's own start already invalidated the idle overlapping group.
-        assert group_b.current_cover_position is None
-
-        await group_b.async_open_cover()
-        await asyncio.sleep(0.02)
-
-        assert group_a.current_cover_position is None
-        assert not group_a.is_opening
-        assert group_b.is_opening
-    finally:
-        await group_a.async_will_remove_from_hass()
-        await group_b.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
-async def test_group_endpoint_models_member_over_its_own_calibration(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A group full travel models each member over the member's OWN travel time.
-
-    A fast member reaches its limit switch long before a slow group duration;
-    inheriting the group's duration would report it moving long after it
-    physically stopped (and let a follow-up set_position compute from a stale
-    mid-travel estimate).
-    """
-    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(online_registry(), publish)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    member = await attach_cover(
-        hass,
-        hub,
-        config=member_config(travel=0.1),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    group._position = 50.0
-    member._position = 50.0
-    try:
-        await group.async_open_cover()
-        await asyncio.sleep(0.02)
-
-        assert member._motion_duration == pytest.approx(0.11)
-        assert group._motion_duration == pytest.approx(1.01)
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
 async def test_restored_timed_motion_with_offline_bridge_becomes_unknown(
     hass: HomeAssistant,
 ) -> None:
@@ -3600,81 +3152,6 @@ async def test_later_heard_press_overtakes_restore_invalidation(
         await entity.async_will_remove_from_hass()
         await pressed.async_will_remove_from_hass()
         hub.close()
-
-
-@pytest.mark.asyncio
-async def test_clamped_member_models_only_its_physical_distance(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A member clamped at an endpoint stops modeling at its limit switch.
-
-    Member at 90 in a group moving +40%: the member physically arrives at 100
-    after 10% of its own travel, not after the group's full frame duration.
-    """
-    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(online_registry(), publish)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    member = await attach_cover(
-        hass,
-        hub,
-        config=member_config(travel=1.0),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    group._position = 20.0
-    member._position = 90.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 60})
-        await asyncio.sleep(0.02)
-
-        assert member._motion_target == 100.0
-        assert member._motion_duration == pytest.approx(0.11, abs=0.001)
-        assert group._motion_duration == pytest.approx(0.4, abs=0.01)
-    finally:
-        await group.async_will_remove_from_hass()
-        await member.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
-async def test_single_channel_timeout_invalidates_containing_group(
-    hass: HomeAssistant,
-) -> None:
-    """An ambiguous single-channel timeout may have moved a group member.
-
-    The frame MAY have reached RF, so a containing group's aggregate estimate
-    can no longer be trusted either.
-    """
-
-    async def publish(_topic: str, _payload: str) -> None:
-        return
-
-    hub = ZemismartHub(online_registry(), publish, ack_timeout=0.001)
-    group = await attach_cover(hass, hub, config=cover_config(travel=1.0))
-    single = await attach_cover(
-        hass,
-        hub,
-        config=member_config(),
-        entry_id="entry-2",
-        entity_id="cover.living_room_channel_1",
-    )
-    group._position = 40.0
-    single._position = 40.0
-    try:
-        with pytest.raises(HomeAssistantError, match="acknowledgement"):
-            await single.async_open_cover()
-
-        assert single.current_cover_position is None
-        assert group.current_cover_position is None
-        assert group.extra_state_attributes["degraded_bridge"] is True
-    finally:
-        await group.async_will_remove_from_hass()
-        await single.async_will_remove_from_hass()
 
 
 @pytest.mark.asyncio
@@ -4251,58 +3728,6 @@ async def test_offline_anchor_cancels_running_relative_motion(
 
 
 @pytest.mark.asyncio
-async def test_relative_group_motion_revalidates_member_absolute_anchor(
-    hass: HomeAssistant,
-) -> None:
-    """A member leaving exempt full travel cannot reuse an offline origin."""
-    member_state = State(
-        "cover.living_room_channel_1",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 80,
-            "remote": cover_config().remote_key,
-            "channels": [1],
-            "motion_direction": 0,
-            "unverified_anchor_bridge": "bridge-a",
-        },
-    )
-    registry = online_registry("bridge-b")
-    hub: ZemismartHub
-
-    async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
-
-    hub = ZemismartHub(registry, publish)
-    member = await attach_cover(
-        hass,
-        hub,
-        config=member_config(travel=5.0),
-        cover_type=restored_cover_type(member_state),
-    )
-    await member.async_open_cover()
-    registry.update_availability("bridge-a", "offline")
-    hub.notify_bridge_change()
-    assert member.is_opening
-
-    group = await attach_cover(
-        hass,
-        hub,
-        config=cover_config(travel=5.0),
-        entry_id="entry-2",
-        entity_id="cover.living_room_group",
-    )
-    group._position = 20.0
-    try:
-        await group.async_set_cover_position(**{ATTR_POSITION: 60})
-
-        assert member.current_cover_position is None
-        assert not member.is_opening
-    finally:
-        await member.async_will_remove_from_hass()
-        await group.async_will_remove_from_hass()
-
-
-@pytest.mark.asyncio
 async def test_offline_anchor_remains_revocable_when_absolute_motion_is_stopped(
     hass: HomeAssistant,
 ) -> None:
@@ -4695,3 +4120,350 @@ async def test_expired_absolute_restore_settles_unverified_anchor(
         assert entity.current_cover_position == 100
     finally:
         await entity.async_will_remove_from_hass()
+
+
+# --- Aggregate covers (coordinator-derived state, single-frame RF) ---
+
+
+def aggregate_family(
+    hass: HomeAssistant,
+    hub: ZemismartHub,
+    *,
+    travel: float = 1.0,
+) -> tuple[RemoteCoordinator, BlindConfig, BlindConfig, BlindConfig]:
+    """Return a coordinator plus configs for leaves {1},{2} and aggregate {1,2}."""
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    del hub  # the family shares the caller's hub; nothing to derive from it
+    covers = {
+        "sub-1": CoverConfig(name="Channel 1", channels=(1,), travel_up=travel, travel_down=travel),
+        "sub-2": CoverConfig(name="Channel 2", channels=(2,), travel_up=travel, travel_down=travel),
+        "sub-agg": CoverConfig(name="Both", channels=(1, 2)),
+    }
+    coordinator = RemoteCoordinator(hass, covers)
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    leaf_one = BlindConfig(
+        name="Channel 1",
+        remote=remote,
+        channels=(1,),
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+    leaf_two = BlindConfig(
+        name="Channel 2",
+        remote=remote,
+        channels=(2,),
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+    from custom_components.zemismart_blinds.models import Role as _Role
+
+    aggregate = BlindConfig(
+        name="Both",
+        remote=remote,
+        channels=(1, 2),
+        travel_up=None,
+        travel_down=None,
+        area_id="living_room",
+        repeats=2,
+        role=_Role.AGGREGATE,
+    )
+    return coordinator, leaf_one, leaf_two, aggregate
+
+
+async def attach_family(
+    hass: HomeAssistant,
+    hub: ZemismartHub,
+    *,
+    travel: float = 1.0,
+) -> tuple[ZemismartCover, ZemismartCover, cover_module.ZemismartAggregateCover]:
+    """Attach two leaves and their aggregate wired through one coordinator."""
+    coordinator, leaf_one_config, leaf_two_config, aggregate_config = aggregate_family(
+        hass, hub, travel=travel
+    )
+    leaf_one = ZemismartCover("sub-1", "remote-entry", leaf_one_config, hub, coordinator)
+    leaf_two = ZemismartCover("sub-2", "remote-entry", leaf_two_config, hub, coordinator)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg", "remote-entry", aggregate_config, hub, coordinator
+    )
+    for entity, entity_id in (
+        (leaf_one, "cover.channel_1"),
+        (leaf_two, "cover.channel_2"),
+        (aggregate, "cover.both"),
+    ):
+        entity.hass = hass
+        entity.entity_id = entity_id
+        entity.platform = platform_stub()
+        await entity.async_internal_added_to_hass()
+        await entity.async_added_to_hass()
+    return leaf_one, leaf_two, aggregate
+
+
+async def detach_family(*entities: Any) -> None:
+    """Tear the family down in reverse order."""
+    for entity in reversed(entities):
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_state_derives_from_members(hass: HomeAssistant) -> None:
+    """Position is the member mean; closed only when every member is closed."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        leaf_one._position = 100.0
+        leaf_two._position = 0.0
+        assert aggregate.current_cover_position == 50
+        assert aggregate.is_closed is False
+
+        leaf_one._position = 0.0
+        assert aggregate.current_cover_position == 0
+        assert aggregate.is_closed is True
+
+        leaf_one._position = None
+        assert aggregate.current_cover_position == 0  # only known members average
+        assert aggregate.is_closed is None  # none open, one unknown
+
+        leaf_two._position = 60.0
+        assert aggregate.is_closed is False  # any open wins over unknown
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_open_drives_each_member_model(hass: HomeAssistant) -> None:
+    """One full-set frame starts every member's own absolute-anchor travel."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    leaf_one._position = 20.0
+    leaf_two._position = 80.0
+    try:
+        await aggregate.async_open_cover()
+        assert leaf_one.is_opening
+        assert leaf_two.is_opening
+        assert leaf_one._motion_target == 100.0
+        assert leaf_two._motion_target == 100.0
+        assert leaf_one._motion_absolute_anchor is True
+        assert aggregate.is_opening  # derived
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_stop_freezes_members_at_ack(hass: HomeAssistant) -> None:
+    """A displaced or clean aggregate STOP freezes every member's model."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 20.0
+    try:
+        await aggregate.async_open_cover()
+        assert leaf_one.is_opening
+        await aggregate.async_stop_cover()
+        assert not leaf_one.is_opening
+        assert not leaf_two.is_opening
+        assert leaf_one.current_cover_position is not None
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_set_position_fans_out_with_member_timing(
+    hass: HomeAssistant,
+) -> None:
+    """Position commands delegate to each member's own timed positioning."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 80.0
+    try:
+        await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert leaf_one._motion_target == 60.0
+        assert leaf_two._motion_target == 60.0
+        assert leaf_one.is_opening  # 20 -> 60
+        assert leaf_two.is_closing  # 80 -> 60
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_set_position_names_failing_members(hass: HomeAssistant) -> None:
+    """A member without a known position fails the call by name; others move."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = None  # unknown: set_position must reject this member
+    try:
+        with pytest.raises(HomeAssistantError, match="Channel 2"):
+            await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert leaf_one._motion_target == 60.0  # the healthy member still moved
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_recompute_batches_into_one_write(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Several member writes in one iteration flush the aggregate once."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    writes: list[int] = []
+    original_write = aggregate.async_write_ha_state
+
+    def counting_write() -> None:
+        writes.append(1)
+        original_write()
+
+    monkeypatch.setattr(aggregate, "async_write_ha_state", counting_write)
+    try:
+        leaf_one._position = 10.0
+        leaf_two._position = 30.0
+        leaf_one.async_write_ha_state()
+        leaf_two.async_write_ha_state()
+        assert writes == []  # deferred to the scheduled flush
+        await hass.async_block_till_done()
+        assert len(writes) == 1
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_partial_press_invalidates_only_intersected_leaf(hass: HomeAssistant) -> None:
+    """A press covering part of a leaf invalidates it; disjoint leaves model on."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    wide = await attach_cover(
+        hass,
+        hub,
+        config=BlindConfig(
+            name="Wide",
+            remote=remote,
+            channels=(1, 2),
+            travel_up=1.0,
+            travel_down=1.0,
+            area_id="living_room",
+            repeats=2,
+        ),
+        entry_id="sub-wide",
+        entity_id="cover.wide",
+    )
+    solo = await attach_cover(
+        hass,
+        hub,
+        config=member_config(channel=3, travel=1.0),
+        entry_id="sub-solo",
+        entity_id="cover.solo",
+    )
+    wide._position = 50.0
+    solo._position = 50.0
+    try:
+        dispatch_heard_press(hub, wide._config, "UP", (1,), at=cover_module.WALL_CLOCK())
+        assert wide.current_cover_position is None  # partial: only unknown is honest
+        assert solo.current_cover_position == 50  # disjoint: untouched
+
+        dispatch_heard_press(hub, solo._config, "UP", (3,), at=cover_module.WALL_CLOCK())
+        assert solo.is_opening  # full coverage: models the press
+    finally:
+        await solo.async_will_remove_from_hass()
+        await wide.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_open_cancels_inflight_fanout(hass: HomeAssistant) -> None:
+    """A full-set command preempts pending member position delegations."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 20.0
+    blocked = asyncio.Event()
+
+    async def never_done() -> None:
+        await blocked.wait()
+
+    pending = hass.async_create_task(never_done(), "stub fan-out")
+    aggregate._fanout_tasks.add(pending)
+    try:
+        await aggregate.async_open_cover()
+        assert pending.cancelled()
+        assert not aggregate._fanout_tasks
+    finally:
+        blocked.set()
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_takeover_state_expires_and_tracks_heard_stop(
+    hass: HomeAssistant,
+) -> None:
+    """Retired command ids stop feeding takeover; heard STOPs are flagged."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        await aggregate.async_open_cover()
+        state = aggregate._takeover_state()
+        assert state.command_id is not None
+
+        aggregate._last_command_at = cover_module.WALL_CLOCK() - 3600.0
+        expired = aggregate._takeover_state()
+        assert expired.command_id is None
+        assert expired.disarm_deadline is None
+
+        dispatch_heard_press(
+            hub,
+            aggregate._config,
+            "STOP",
+            (1, 2),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert aggregate._takeover_state().stopped_by_heard is True
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
