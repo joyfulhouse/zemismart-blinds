@@ -106,7 +106,20 @@ async def async_setup_entry(
     registry = dr.async_get(hass)
     for subentry_id, cover in covers.items():
         role = coordinator.roles[subentry_id]
-        config = BlindConfig.derive(runtime.remote, cover, role)
+        try:
+            config = BlindConfig.derive(runtime.remote, cover, role)
+        except ValueError as err:
+            # A demoted aggregate without stored travel times must not take
+            # the whole entry down; it just has no entity until the user
+            # adds travel times via subentry reconfigure.
+            _LOGGER.warning(
+                "Cover %r of %s has no usable configuration (%s); "
+                "reconfigure the cover to add travel times",
+                cover.name,
+                entry.title,
+                err,
+            )
+            continue
         entity: ZemismartCover | ZemismartAggregateCover
         if role is Role.LEAF:
             entity = ZemismartCover(
@@ -124,12 +137,14 @@ async def async_setup_entry(
                 runtime.hub,
                 coordinator,
             )
+        # Creation detection must precede the add: a user's cleared area
+        # (area_id None on an EXISTING device) must never be re-assigned.
+        existed = registry.async_get_device(identifiers={(DOMAIN, subentry_id)}) is not None
         async_add_entities([entity], config_subentry_id=subentry_id)
-        device = registry.async_get_device(identifiers={(DOMAIN, subentry_id)})
-        if device is not None and device.area_id is None:
-            # Configured area applies at creation only; a user's later
-            # device-page override must survive reloads.
-            registry.async_update_device(device.id, area_id=runtime.remote.area_id)
+        if not existed:
+            device = registry.async_get_device(identifiers={(DOMAIN, subentry_id)})
+            if device is not None:
+                registry.async_update_device(device.id, area_id=runtime.remote.area_id)
 
 
 def _number(value: object) -> float | None:
@@ -1079,6 +1094,7 @@ class ZemismartAggregateCover(CoverEntity):
         self._last_command_bridge: str | None = None
         self._last_command_id: str | None = None
         self._last_command_button: Button | None = None
+        self._last_command_at = 0.0
         self._stopped_by_heard = False
         self._fanout_tasks: set[asyncio.Task[None]] = set()
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
@@ -1177,20 +1193,36 @@ class ZemismartAggregateCover(CoverEntity):
     @callback
     def _on_heard_press(self, event: HeardEvent) -> None:
         """Track heard STOPs for takeover; members model their own motion."""
-        del event
         # Members receive their own callbacks and model the press; the
         # aggregate's displayed state re-derives through the coordinator.
+        # Only the takeover flag is aggregate-owned: a physical STOP covering
+        # the whole set halted this aggregate's own command, and the hub's
+        # takeover truth table must not re-invalidate a heard-stopped cover.
+        if event.button == "STOP" and frozenset(self._config.channels) <= event.chans:
+            self._stopped_by_heard = True
 
     def _takeover_state(self) -> TakeoverCoverState:
-        """Expose the last single-frame command for hub takeover disarms."""
-        disarm_deadline: float | None = None
-        if self._last_command_bridge is not None and self._last_command_id is not None:
-            disarm_deadline = WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+        """Expose the last single-frame command for hub takeover disarms.
+
+        The command identity EXPIRES after the untimed drain window: the hub
+        treats unknown command ids as takeover-live, so reporting a
+        long-retired command forever would spawn pointless disarm retries on
+        every later physical press.
+        """
+        expired = WALL_CLOCK() > self._last_command_at + _UNTIMED_DISARM_DRAIN_SECONDS
+        if self._last_command_bridge is None or self._last_command_id is None or expired:
+            return TakeoverCoverState(
+                bridge_id=None,
+                command_id=None,
+                button=None,
+                disarm_deadline=None,
+                stopped_by_heard=self._stopped_by_heard,
+            )
         return TakeoverCoverState(
             bridge_id=self._last_command_bridge,
             command_id=self._last_command_id,
             button=self._last_command_button,
-            disarm_deadline=disarm_deadline,
+            disarm_deadline=WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS,
             stopped_by_heard=self._stopped_by_heard,
         )
 
@@ -1223,6 +1255,7 @@ class ZemismartAggregateCover(CoverEntity):
         self._last_command_bridge = result.bridge.bridge_id
         self._last_command_id = result.command_id
         self._last_command_button = button
+        self._last_command_at = WALL_CLOCK()
         self._stopped_by_heard = False
         return result
 
@@ -1251,12 +1284,17 @@ class ZemismartAggregateCover(CoverEntity):
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open every channel with one frame; members model their own travel."""
         del kwargs
+        # A full-set command supersedes any in-flight position fan-out: a
+        # member's timed frame published after the group frame would displace
+        # it channel-by-channel on the bridge.
+        self._cancel_fanout()
         async with self._command_lock:
             await self._async_move_full("UP", 1, 100.0)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close every channel with one frame; members model their own travel."""
         del kwargs
+        self._cancel_fanout()
         async with self._command_lock:
             await self._async_move_full("DOWN", -1, 0.0)
 
@@ -1282,9 +1320,12 @@ class ZemismartAggregateCover(CoverEntity):
         if target == 100:
             await self.async_open_cover()
             return
-        members = self._members()
+        registered = self._members()
+        members = [member for member in registered if member.available]
+        skipped = [member for member in registered if not member.available]
         if not members:
-            msg = "no member covers are available to position"
+            names = ", ".join(member._config.name for member in skipped) or "none"
+            msg = f"no member covers are available to position (unavailable: {names})"
             raise HomeAssistantError(msg)
         failures: list[str] = []
 

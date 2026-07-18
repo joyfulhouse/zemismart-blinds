@@ -338,6 +338,18 @@ class CommandLedger:
             return True
         return not entry.displaced and any(window.ends_at >= now for window in entry.windows)
 
+    def disarm_deadline(self, command_id: str, *, fallback: float) -> float:
+        """Return how long a disarm for this command stays worth retrying.
+
+        A confirmed command's bridge-armed frames stay dangerous until its
+        last emission window closes; before confirmation only the caller's
+        fallback bound applies.
+        """
+        entry = self._entries.get(command_id)
+        if entry is None or not entry.windows:
+            return fallback
+        return max(fallback, *(window.ends_at for window in entry.windows))
+
     def retire(self, command_id: str) -> None:
         """Remove all frame state for one command."""
         self._entries.pop(command_id, None)

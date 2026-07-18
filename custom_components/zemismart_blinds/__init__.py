@@ -305,6 +305,9 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
 
     remote = entry.runtime_data.remote
     registry = dr.async_get(hass)
+    # Creation detection must precede get_or_create: a user's cleared area
+    # (area_id None on an EXISTING device) must never be re-assigned.
+    existed = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)}) is not None
     device = registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
@@ -312,7 +315,7 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
         model="RF433 remote",
         name=remote.name,
     )
-    if device.area_id is None:
+    if not existed:
         registry.async_update_device(device.id, area_id=remote.area_id)
 
 

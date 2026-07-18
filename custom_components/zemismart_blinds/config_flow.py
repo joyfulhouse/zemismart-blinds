@@ -761,8 +761,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="already_configured")
         runtime = getattr(entry, "runtime_data", None)
         if isinstance(runtime, RemoteRuntime):
-            # A published timed command's fail-safe STOP lives on the bridge;
-            # disarm (acknowledged, bounded) before the old identity vanishes.
+            # Drain first: a queued-unpublished old-identity frame must not
+            # slip onto the air between the disarm and the reload. Then
+            # disarm bridge-held state (acknowledged, bounded await; the
+            # request keeps retrying in the background until the real STOP
+            # window closes).
+            runtime.hub.drain_owner(entry.entry_id)
             await runtime.hub.async_disarm_remote(current.key)
         self.hass.config_entries.async_update_entry(
             entry,

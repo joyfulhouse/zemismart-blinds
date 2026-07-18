@@ -4403,3 +4403,65 @@ async def test_partial_press_invalidates_only_intersected_leaf(hass: HomeAssista
     finally:
         await solo.async_will_remove_from_hass()
         await wide.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_open_cancels_inflight_fanout(hass: HomeAssistant) -> None:
+    """A full-set command preempts pending member position delegations."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 20.0
+    blocked = asyncio.Event()
+
+    async def never_done() -> None:
+        await blocked.wait()
+
+    pending = hass.async_create_task(never_done(), "stub fan-out")
+    aggregate._fanout_tasks.add(pending)
+    try:
+        await aggregate.async_open_cover()
+        assert pending.cancelled()
+        assert not aggregate._fanout_tasks
+    finally:
+        blocked.set()
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_takeover_state_expires_and_tracks_heard_stop(
+    hass: HomeAssistant,
+) -> None:
+    """Retired command ids stop feeding takeover; heard STOPs are flagged."""
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        await aggregate.async_open_cover()
+        state = aggregate._takeover_state()
+        assert state.command_id is not None
+
+        aggregate._last_command_at = cover_module.WALL_CLOCK() - 3600.0
+        expired = aggregate._takeover_state()
+        assert expired.command_id is None
+        assert expired.disarm_deadline is None
+
+        dispatch_heard_press(
+            hub,
+            aggregate._config,
+            "STOP",
+            (1, 2),
+            at=cover_module.WALL_CLOCK(),
+        )
+        assert aggregate._takeover_state().stopped_by_heard is True
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)

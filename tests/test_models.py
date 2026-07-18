@@ -4072,3 +4072,73 @@ async def test_disarm_remote_awaits_acknowledged_bridge_disarms() -> None:
     hub.on_disarmed("bridge-a", "cmd-live")
     await asyncio.wait_for(disarm_task, timeout=1.0)
     hub.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
+    """A fast-lane STOP still waiting on publish barriers drains too."""
+    release = asyncio.Event()
+    first_published = asyncio.Event()
+
+    async def publisher(topic: str, payload: str) -> None:
+        del topic, payload
+        first_published.set()
+        await release.wait()
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_availability("bridge-a", "online")
+    config = BlindConfig(
+        name="Blind",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1,),
+        travel_up=10.0,
+        travel_down=10.0,
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    # Movement occupies the worker with its publish incomplete (blocked
+    # publisher), so the following STOP's fast lane waits on its barrier.
+    movement = asyncio.create_task(hub.async_transmit(config, "UP", owner="entry-a"))
+    await asyncio.wait_for(first_published.wait(), timeout=1.0)
+    stop = asyncio.create_task(hub.async_transmit(config, "STOP", owner="entry-a"))
+    await asyncio.sleep(0)
+    assert not stop.done()
+
+    hub.drain_owner("entry-a")
+    assert await asyncio.wait_for(stop, timeout=1.0) == "superseded"
+
+    release.set()
+    movement.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await movement
+    hub.close()
+
+
+def test_ledger_disarm_deadline_extends_to_window_end() -> None:
+    """A confirmed command's disarm retries until its last window closes."""
+    from custom_components.zemismart_blinds.state_sync import CommandLedger
+
+    ledger = CommandLedger()
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    signature = frame_signature(frame)
+    assert signature is not None
+    ledger.register_pending(
+        "cmd-timed",
+        "bridge-a",
+        (1,),
+        "UP",
+        [
+            LedgerFrameSpec(signature=signature, offset_ms=0, airtime_ms=100),
+            LedgerFrameSpec(signature=signature, offset_ms=45_000, airtime_ms=100),
+        ],
+    )
+    # Pending: only the fallback applies.
+    assert ledger.disarm_deadline("cmd-timed", fallback=50.0) == 50.0
+    ledger.confirm("cmd-timed", 100.0)
+    # Confirmed: the far STOP frame's window end wins over the fallback.
+    deadline = ledger.disarm_deadline("cmd-timed", fallback=110.0)
+    assert deadline > 140.0
+    # Unknown commands keep the fallback.
+    assert ledger.disarm_deadline("cmd-unknown", fallback=7.0) == 7.0

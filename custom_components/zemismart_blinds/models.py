@@ -2526,6 +2526,16 @@ class ZemismartHub:
             else:
                 retained.append(queued)
         self._queue = retained
+        # Fast-lane STOPs never enter the queue; one still waiting on its
+        # publish barriers must not transmit for a departed owner either.
+        # _async_run_direct re-checks resolved futures after the barriers,
+        # so resolving here is enough — an already-publishing command is
+        # in-flight and out of drain scope by design.
+        for fast in tuple(self._fast_inflight):
+            if fast.owner == owner and fast.published is not None and not fast.published.is_set():
+                for future in fast.futures:
+                    if not future.done():
+                        future.set_result("superseded")
 
     async def async_disarm_remote(
         self,
@@ -2547,10 +2557,18 @@ class ZemismartHub:
             frozenset(range(1, 17)),
             now,
         ):
+            # Retry each disarm until the command's REAL bridge-side STOP
+            # window ends (hours for a long timed move), not a flat bound;
+            # the flow only awaits the short bound below — the background
+            # request keeps retrying past the reload because the hub is
+            # shared and survives it.
             request = self._start_disarm_request(
                 command.bridge_id,
                 command.command_id,
-                now + deadline_seconds,
+                self._ledger.disarm_deadline(
+                    command.command_id,
+                    fallback=now + deadline_seconds,
+                ),
             )
             if not request.waiter.done():
                 waiters.append(asyncio.shield(request.waiter))

@@ -197,7 +197,18 @@ Commands:
   aggregate does not hold a lock that would make STOP wait on fan-out
   completion.
 
-### RX press ownership (coordinator-arbitrated)
+### RX press ownership (laminar leaf-local rules — rev 4.1)
+
+> **Rev 4.1 (implementation-validated):** with the laminar channel family
+> enforced at the config layer, coordinator-side owner arbitration is
+> unnecessary — the rules below collapse to leaf-local decisions that are
+> behaviorally equivalent (each leaf is either fully covered by a press,
+> partially intersected, or disjoint; aggregates never model presses and
+> re-derive from members). The implementation uses the leaf-local rules;
+> both Gemini 3.1 Pro and Grok 4.5 flagged the deviation in the panel
+> review, and it is accepted as the simpler equivalent design.
+
+#### Original (superseded) coordinator-arbitrated description
 
 The hub still dispatches every intersecting RX listener (unchanged), and
 aggregates still register listeners with their full channel sets and own

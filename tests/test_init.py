@@ -836,3 +836,111 @@ async def test_update_listener_schedules_one_reload_per_mutation(
     assert reloads == ["one", "one"]
 
     await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_underivable_cover_skips_without_failing_entry(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A demoted aggregate without travel loses its entity, not the entry."""
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    entry = ConfigEntry(
+        data=config_entry("ignored").data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id="remote-demoted",
+        minor_version=1,
+        options={},
+        source="user",
+        subentries_data=[
+            {
+                # Former aggregate, members deleted: no travel stored, and no
+                # contained cover left to make it an aggregate again.
+                "data": {"name": "Orphan", "channels": [1, 2], "travel_up": "", "travel_down": ""},
+                "subentry_type": "cover",
+                "title": "Orphan",
+                "unique_id": "1-2",
+            },
+            {
+                "data": {"name": "Solo", "channels": [5], "travel_up": 9.0, "travel_down": 9.0},
+                "subentry_type": "cover",
+                "title": "Solo",
+                "unique_id": "5",
+            },
+        ],
+        title="Kitchen remote",
+        unique_id="a1b2c3:42",
+        version=1,
+    )
+    add_to_manager(hass, entry)
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    added: list[Any] = []
+
+    def record_add(
+        entities: list[Any],
+        update_before_add: bool = False,
+        *,
+        config_subentry_id: str | None = None,
+    ) -> None:
+        del update_before_add, config_subentry_id
+        added.extend(entities)
+
+    async def forward(_entry: Any, _platforms: list[Any]) -> None:
+        await cover_module.async_setup_entry(hass, entry, record_add)
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    assert await async_setup_entry(hass, entry)
+    assert [entity._config.name for entity in added] == ["Solo"]
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_cleared_device_area_survives_reload(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user's explicit no-area choice is never re-assigned on reload."""
+    from homeassistant.helpers import device_registry as dr
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    entry = config_entry("one")
+    add_to_manager(hass, entry)
+    await async_setup_entry(hass, entry)
+
+    registry = dr.async_get(hass)
+    parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    assert parent is not None
+    assert parent.area_id == "living_room"
+    registry.async_update_device(parent.id, area_id=None)
+
+    integration_module._ensure_remote_device(hass, entry)
+    parent_after = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    assert parent_after is not None
+    assert parent_after.area_id is None
+
+    await async_unload_entry(hass, entry)
