@@ -25,7 +25,12 @@ CONF_COALESCE_WINDOW_MS: Final = "coalesce_window_ms"
 
 DEFAULT_TRAVEL_UP: Final = 15.0
 DEFAULT_TRAVEL_DOWN: Final = 15.0
-DEFAULT_REPEATS: Final = 5
+# Two scheduler-level dispatches x the embedded Portisch repeat of 8 puts 16
+# OEM-grade frame repetitions on air across two time-diverse ~560 ms windows.
+# Higher values date from before firmware v1.2.0 paced dispatch by airtime
+# (most extra repeats then corrupted in the EFM8BB1's UART ring); now every
+# repeat transmits, so they only occupy air and delay queued fail-safe STOPs.
+DEFAULT_REPEATS: Final = 2
 DEFAULT_COALESCE_WINDOW_MS: Final = 150
 DEFAULT_SNIFF_WINDOW_SECONDS: Final = 30
 MAX_SNIFF_WINDOW_SECONDS: Final = 60

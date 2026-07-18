@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-17
+
+### Changed
+
+- `DEFAULT_REPEATS` lowered from 5 to 2. Companion firmware v1.2.0 paces dispatch by frame
+  airtime, so every scheduler-level repeat now actually transmits (16 OEM-grade on-air
+  repetitions across two time-diverse windows); higher values only occupy air and delay queued
+  fail-safe STOPs. Existing entries keep their configured value.
+
+[0.2.1]: https://github.com/joyfulhouse/zemismart-blinds/releases/tag/v0.2.1
+
 ## [0.2.0] - 2026-07-17
 
 Live state sync: physical remote presses now move the matching covers.
