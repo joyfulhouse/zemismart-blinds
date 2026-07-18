@@ -113,13 +113,6 @@ def _int_value(value: object, fallback: int) -> int:
         return fallback
 
 
-def effective_values(entry: config_entries.ConfigEntry[Any]) -> dict[str, object]:
-    """Merge an existing entry's mutable options over initial data."""
-    values: dict[str, object] = dict(entry.data)
-    values.update(entry.options)
-    return values
-
-
 def _payload_text(payload: str | bytes | bytearray) -> str:
     """Normalize an MQTT payload received with or without text decoding."""
     return payload.decode() if isinstance(payload, bytes | bytearray) else payload
@@ -537,8 +530,7 @@ def _validate_cover_input(
     if conflict is not None:
         return None, {CONF_CHANNELS: conflict}
     born_aggregate = any(
-        frozenset(sibling_channels) < frozenset(channels)
-        for sibling_channels in existing
+        frozenset(sibling_channels) < frozenset(channels) for sibling_channels in existing
     )
     raw_up = user_input.get(CONF_TRAVEL_UP)
     raw_down = user_input.get(CONF_TRAVEL_DOWN)
@@ -757,11 +749,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         updated = RemoteConfig(
             name=self._learn_name if self._learn_name is not None else current.name,
             remote=self._identity,
-            area_id=(
-                self._learn_area_id
-                if self._learn_area_id is not None
-                else current.area_id
-            ),
+            area_id=(self._learn_area_id if self._learn_area_id is not None else current.area_id),
             repeats=current.repeats,
             coalesce_window_ms=current.coalesce_window_ms,
         )

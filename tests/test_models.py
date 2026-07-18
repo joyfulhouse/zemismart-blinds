@@ -3875,3 +3875,101 @@ def test_remote_runtime_carries_remote_and_hub() -> None:
     runtime = RemoteRuntime(remote=remote, hub=hub)
     assert runtime.remote is remote
     assert runtime.hub is hub
+
+
+def test_blindconfig_defaults_to_leaf_role() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="Sink",
+        remote=_remote_identity(),
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    assert config.role is Role.LEAF
+    assert config.is_aggregate is False
+
+
+def test_blindconfig_leaf_still_requires_travel() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    with pytest.raises(ValueError, match="travel"):
+        BlindConfig(
+            name="Sink",
+            remote=_remote_identity(),
+            channels=(5,),
+            travel_up=None,
+            travel_down=None,
+            area_id="kitchen",
+            repeats=5,
+            role=Role.LEAF,
+        )
+
+
+def test_blindconfig_aggregate_allows_no_travel() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="All",
+        remote=_remote_identity(),
+        channels=(1, 2, 3, 4, 5, 6),
+        travel_up=None,
+        travel_down=None,
+        area_id="kitchen",
+        repeats=5,
+        role=Role.AGGREGATE,
+    )
+    assert config.is_aggregate is True
+    assert config.travel_up is None
+
+
+def test_blindconfig_derive_from_remote_and_cover() -> None:
+    from custom_components.zemismart_blinds.models import (
+        BlindConfig,
+        CoverConfig,
+        RemoteConfig,
+        Role,
+    )
+
+    remote = RemoteConfig(
+        name="Kitchen remote",
+        remote=_remote_identity(),
+        area_id="kitchen",
+        repeats=7,
+        coalesce_window_ms=200,
+    )
+    leaf = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
+    derived = BlindConfig.derive(remote, leaf, Role.LEAF)
+    assert derived.name == "Sink"
+    assert derived.channels == (5,)
+    assert derived.area_id == "kitchen"
+    assert derived.repeats == 7
+    assert derived.coalesce_window_ms == 200
+    assert derived.travel_up == 9.0
+    assert derived.role is Role.LEAF
+    assert derived.remote.key == remote.key
+
+    aggregate_cover = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    aggregate = BlindConfig.derive(remote, aggregate_cover, Role.AGGREGATE)
+    assert aggregate.is_aggregate is True
+    assert aggregate.travel_up is None
+
+
+def test_blindconfig_from_mapping_stays_leaf() -> None:
+    from custom_components.zemismart_blinds.models import BlindConfig, Role
+
+    config = BlindConfig(
+        name="Sink",
+        remote=_remote_identity(),
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        area_id="kitchen",
+        repeats=5,
+    )
+    restored = BlindConfig.from_mapping(config.as_dict())
+    assert restored.role is Role.LEAF
+    assert restored.travel_up == 9.0

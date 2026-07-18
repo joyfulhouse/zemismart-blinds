@@ -19,7 +19,6 @@ from custom_components.zemismart_blinds.cover import ZemismartCover
 from custom_components.zemismart_blinds.models import (
     BlindConfig,
     BridgeRegistry,
-    EntryRuntime,
     RemoteIdentity,
     ZemismartHub,
 )
@@ -77,7 +76,7 @@ async def attach_cover(
     entity_id: str = "cover.living_room_left",
 ) -> ZemismartCover:
     """Attach one entity to the real HA core without a platform wrapper."""
-    entity = cover_type(entry_id, EntryRuntime(config or cover_config(), hub))
+    entity = cover_type(entry_id, "remote-entry", config or cover_config(), hub)
     entity.hass = hass
     entity.entity_id = entity_id
     entity.platform = platform_stub()
@@ -335,7 +334,7 @@ async def test_group_timeout_marks_and_notifies_member_covers_unknown(
         area_id="living_room",
         repeats=2,
     )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
+    member = ZemismartCover("entry-2", "remote-entry", member_config, hub)
     member.hass = hass
     member.entity_id = "cover.living_room_channel_1"
     member.platform = platform_stub()
@@ -486,7 +485,7 @@ async def test_group_motion_updates_each_member_channel_estimate(hass: HomeAssis
         area_id="living_room",
         repeats=2,
     )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
+    member = ZemismartCover("entry-2", "remote-entry", member_config, hub)
     member.hass = hass
     member.entity_id = "cover.living_room_channel_1"
     member.platform = platform_stub()
@@ -528,7 +527,7 @@ async def test_group_motion_marks_unknown_member_unknown(hass: HomeAssistant) ->
         area_id="living_room",
         repeats=2,
     )
-    member = ZemismartCover("entry-2", EntryRuntime(member_config, hub))
+    member = ZemismartCover("entry-2", "remote-entry", member_config, hub)
     member.hass = hass
     member.entity_id = "cover.living_room_channel_1"
     member.platform = platform_stub()
@@ -655,7 +654,9 @@ def test_current_position_getter_is_pure() -> None:
 
     entity = ZemismartCover(
         "entry-1",
-        EntryRuntime(cover_config(), ZemismartHub(online_registry(), publish)),
+        "remote-entry",
+        cover_config(),
+        ZemismartHub(online_registry(), publish),
     )
     entity._position = 40.0
     entity._direction = 1

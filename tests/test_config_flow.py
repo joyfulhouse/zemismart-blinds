@@ -548,9 +548,7 @@ def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
     )
     assert strings["config_subentries"]["cover"]["abort"] == {
         "reconfigure_successful": "The cover was reconfigured successfully.",
-        "already_configured": (
-            "Another cover of this remote already uses exactly these channels."
-        ),
+        "already_configured": ("Another cover of this remote already uses exactly these channels."),
     }
 
 
@@ -611,9 +609,7 @@ async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
     )
     assert config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
         remote_entry
-    ) == {
-        "cover": config_flow_module.CoverSubentryFlow
-    }
+    ) == {"cover": config_flow_module.CoverSubentryFlow}
 
     await hass.config_entries.async_add(legacy_entry)
     result = await hass.config_entries.flow.async_init(
@@ -918,13 +914,16 @@ async def test_advanced_setup_clears_learned_cover_channel_prefill(
     assert result["step_id"] == "cover"
     schema = result["data_schema"]
     assert schema is not None
-    assert schema(
-        {
-            CONF_NAME: "Manual cover",
-            CONF_TRAVEL_UP: 12,
-            CONF_TRAVEL_DOWN: 12,
-        }
-    )[CONF_CHANNELS] == ""
+    assert (
+        schema(
+            {
+                CONF_NAME: "Manual cover",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            }
+        )[CONF_CHANNELS]
+        == ""
+    )
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
 from homeassistant.core import callback
+from homeassistant.exceptions import ConfigEntryError
 
 from .codec import CommandBases, synthesize_bases
 from .const import (
@@ -32,10 +33,8 @@ from .const import (
     SERVICE_SEND_RAW,
 )
 from .models import (
-    BlindConfig,
     BridgeRegistry,
     DomainRuntime,
-    EntryRuntime,
     RemoteConfig,
     RemoteRuntime,
     ZemismartHub,
@@ -47,14 +46,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
     from homeassistant.helpers.typing import ConfigType
 
-    type ZemismartConfigEntry = ConfigEntry[EntryRuntime | RemoteRuntime]
-
-
-def _entry_config(entry: ZemismartConfigEntry) -> BlindConfig:
-    """Build the typed config from an entry's effective values."""
-    from .config_flow import effective_values
-
-    return BlindConfig.from_mapping(effective_values(entry))
+    type ZemismartConfigEntry = ConfigEntry[RemoteRuntime]
 
 
 def _bridge_id(topic: str, leaf: str) -> str | None:
@@ -293,18 +285,25 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def _async_assign_device_area(
-    hass: HomeAssistant,
-    entry: ZemismartConfigEntry,
-    config: BlindConfig,
-) -> None:
-    """Put the entry's one device in the area selected by the user."""
+def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
+    """Create the parent remote device before its cover children.
+
+    The configured area applies at creation only: a user's later device-page
+    override must survive reloads, so an existing device is never re-homed.
+    """
     from homeassistant.helpers import device_registry as dr
 
+    remote = entry.runtime_data.remote
     registry = dr.async_get(hass)
-    device = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
-    if device is not None and device.area_id != config.area_id:
-        registry.async_update_device(device.id, area_id=config.area_id)
+    device = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, entry.entry_id)},
+        manufacturer="Zemismart",
+        model="RF433 remote",
+        name=remote.name,
+    )
+    if device.area_id is None:
+        registry.async_update_device(device.id, area_id=remote.area_id)
 
 
 def _clear_domain_registrations(hass: HomeAssistant, runtime: DomainRuntime) -> None:
@@ -331,7 +330,14 @@ async def async_setup_entry(
     """Set up one blind/group entry and the shared MQTT runtime."""
     from homeassistant.const import Platform
 
-    legacy_config = None if CONF_CHANNELS not in entry.data else _entry_config(entry)
+    if CONF_CHANNELS in entry.data:
+        # Rev 4: legacy per-blind entries are kept only as migration
+        # reference data — they never load. See the deployment runbook.
+        msg = (
+            "This entry uses the retired per-blind format. Add its remote "
+            "through the integration's new wizard, then delete this entry."
+        )
+        raise ConfigEntryError(msg)
     while True:
         candidate = _create_domain_runtime(hass)
         runtime = cast("DomainRuntime", hass.data.setdefault(DOMAIN, candidate))
@@ -345,22 +351,15 @@ async def async_setup_entry(
                     continue
                 if not runtime.initialized:
                     await _async_initialize_domain_runtime(hass, runtime)
-                if legacy_config is None:
-                    entry.runtime_data = RemoteRuntime(
-                        remote=RemoteConfig.from_entry(entry.data),
-                        hub=runtime.hub,
-                    )
-                else:
-                    entry.runtime_data = EntryRuntime(
-                        config=legacy_config,
-                        hub=runtime.hub,
-                    )
+                entry.runtime_data = RemoteRuntime(
+                    remote=RemoteConfig.from_entry(entry.data),
+                    hub=runtime.hub,
+                )
                 if entry.entry_id in runtime.loaded_entries:
                     failed = False
                     return True
+                _ensure_remote_device(hass, entry)
                 await hass.config_entries.async_forward_entry_setups(entry, [Platform.COVER])
-                if legacy_config is not None:
-                    await _async_assign_device_area(hass, entry, legacy_config)
                 runtime.loaded_entries.add(entry.entry_id)
                 failed = False
                 return True

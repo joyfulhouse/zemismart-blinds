@@ -31,10 +31,11 @@ from custom_components.zemismart_blinds.const import (
     SERVICE_SEND_RAW,
 )
 from custom_components.zemismart_blinds.models import (
+    BlindConfig,
     BridgeRegistry,
     CommandAck,
     DomainRuntime,
-    EntryRuntime,
+    RemoteRuntime,
     ZemismartHub,
 )
 from custom_components.zemismart_blinds.state_sync import (
@@ -50,8 +51,36 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 
-def config_entry(entry_id: str) -> ConfigEntry[EntryRuntime]:
-    """Build one real HA ConfigEntry without invoking the flow manager."""
+def config_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
+    """Build one real remote-format ConfigEntry without invoking the flow manager."""
+    return ConfigEntry(
+        data={
+            "name": f"Remote {entry_id}",
+            "prefix": "a1b2c3",
+            "remote_id": "42",
+            "area_id": "living_room",
+            "repeats": 5,
+            "coalesce_window_ms": 150,
+            "base_up": "f42a",
+            "base_down": "bcf2",
+            "base_stop": "dc12",
+            "base_trailer": "",
+        },
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=1,
+        options={},
+        source="user",
+        subentries_data=None,
+        title=f"Remote {entry_id}",
+        unique_id="a1b2c3:42",
+        version=1,
+    )
+
+
+def legacy_config_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
+    """Build one retired per-blind entry kept only as migration reference."""
     return ConfigEntry(
         data={
             "name": f"Blind {entry_id}",
@@ -77,6 +106,11 @@ def config_entry(entry_id: str) -> ConfigEntry[EntryRuntime]:
         unique_id=f"a1b2c3:42:{entry_id}",
         version=1,
     )
+
+
+def add_to_manager(hass: HomeAssistant, entry: ConfigEntry[RemoteRuntime]) -> None:
+    """Register a hand-built entry so registries can link devices to it."""
+    hass.config_entries._entries[entry.entry_id] = entry
 
 
 def message(
@@ -140,11 +174,12 @@ async def test_remote_format_entry_sets_up_with_no_entities(
         assert qos == 1
         return lambda: None
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    add_to_manager(hass, entry)
     assert await async_setup_entry(hass, entry)
 
     runtime = entry.runtime_data
@@ -267,27 +302,21 @@ async def test_concurrent_setup_and_unload_share_one_runtime(
         assert qos == 1
         assert not retain
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         await asyncio.sleep(0)
 
-    async def unload(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> bool:
+    async def unload(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
         await asyncio.sleep(0)
         return True
-
-    async def assign_area(
-        _hass: HomeAssistant,
-        _entry: ConfigEntry[EntryRuntime],
-        _config: Any,
-    ) -> None:
-        return
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
-    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     first = config_entry("one")
     second = config_entry("two")
+    add_to_manager(hass, first)
+    add_to_manager(hass, second)
 
     assert await async_setup(hass, {})
     setup_results = await asyncio.gather(
@@ -352,28 +381,22 @@ async def test_setup_waiter_survives_final_unload_generation(
 
         return unsubscribe
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
-    async def unload(entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> bool:
+    async def unload(entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
         if entry.entry_id == "one":
             unload_entered.set()
             await release_unload.wait()
         return True
 
-    async def assign_area(
-        _hass: HomeAssistant,
-        _entry: ConfigEntry[EntryRuntime],
-        _config: Any,
-    ) -> None:
-        return
-
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
-    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     first = config_entry("one")
     second = config_entry("two")
+    add_to_manager(hass, first)
+    add_to_manager(hass, second)
     await async_setup_entry(hass, first)
     runtime: DomainRuntime = hass.data[DOMAIN]
 
@@ -430,21 +453,14 @@ async def test_retained_discovery_order_and_status_ack_filtering(
         published.append((topic, json.loads(payload)))
         published_event.set()
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
-        return
-
-    async def assign_area(
-        _hass: HomeAssistant,
-        _entry: ConfigEntry[EntryRuntime],
-        _config: Any,
-    ) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
-    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     entry = config_entry("one")
+    add_to_manager(hass, entry)
     await async_setup_entry(hass, entry)
     runtime: DomainRuntime = hass.data[DOMAIN]
 
@@ -465,9 +481,16 @@ async def test_retained_discovery_order_and_status_ack_filtering(
     )
     assert runtime.hub.registry.resolve("living_room") == bridge
 
-    transmit = asyncio.create_task(
-        entry.runtime_data.hub.async_transmit(entry.runtime_data.config, "UP")
+    transmit_config = BlindConfig(
+        name="Blind one",
+        remote=entry.runtime_data.remote.remote,
+        channels=(1,),
+        travel_up=14.0,
+        travel_down=13.0,
+        area_id="living_room",
+        repeats=5,
     )
+    transmit = asyncio.create_task(entry.runtime_data.hub.async_transmit(transmit_config, "UP"))
     await published_event.wait()
     body = published[0][1]
     status_payload = json.dumps(
@@ -512,23 +535,17 @@ async def test_virtual_remote_keeps_known_family_prefix(
         assert qos == 1
         return lambda: None
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
-        return
-
-    async def assign_area(
-        _hass: HomeAssistant,
-        _entry: ConfigEntry[EntryRuntime],
-        _config: Any,
-    ) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
-    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     values = iter((0x1234, 0x56, 0x2B))
     monkeypatch.setattr(secrets, "randbelow", lambda _limit: next(values))
     assert await async_setup(hass, {})
-    await async_setup_entry(hass, config_entry("one"))
+    entry_one = config_entry("one")
+    add_to_manager(hass, entry_one)
+    await async_setup_entry(hass, entry_one)
 
     response = await hass.services.async_call(
         DOMAIN,
@@ -583,22 +600,16 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
     ) -> None:
         published.append(payload)
 
-    async def forward(_entry: ConfigEntry[EntryRuntime], _platforms: list[Any]) -> None:
-        return
-
-    async def assign_area(
-        _hass: HomeAssistant,
-        _entry: ConfigEntry[EntryRuntime],
-        _config: Any,
-    ) -> None:
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
-    monkeypatch.setattr(integration_module, "_async_assign_device_area", assign_area)
     assert await async_setup(hass, {})
-    await async_setup_entry(hass, config_entry("one"))
+    entry_one = config_entry("one")
+    add_to_manager(hass, entry_one)
+    await async_setup_entry(hass, entry_one)
     callbacks[MQTT_AVAILABILITY_TOPIC](
         message("rf433/bridge-a/availability", "online", retain=True)
     )
@@ -612,3 +623,140 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
         )
 
     assert published == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_entry_fails_setup_and_keeps_data(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retired per-blind entry never loads; its data stays for migration."""
+    from homeassistant.exceptions import ConfigEntryError
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    entry = legacy_config_entry("legacy-one")
+    add_to_manager(hass, entry)
+    original = dict(entry.data)
+    with pytest.raises(ConfigEntryError, match="retired per-blind format"):
+        await async_setup_entry(hass, entry)
+    assert dict(entry.data) == original
+    assert DOMAIN not in hass.data  # no shared runtime was leaked
+
+
+@pytest.mark.asyncio
+async def test_remote_entry_builds_leaf_entities_and_devices(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leaf subentries become subentry-bound covers; aggregates wait; devices nest."""
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    entry = ConfigEntry(
+        data=config_entry("ignored").data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id="remote-topology",
+        minor_version=1,
+        options={},
+        source="user",
+        subentries_data=[
+            {
+                "data": {
+                    "name": "Slider",
+                    "channels": [1, 2, 3],
+                    "travel_up": 12.0,
+                    "travel_down": 12.0,
+                },
+                "subentry_type": "cover",
+                "title": "Slider",
+                "unique_id": "1-2-3",
+            },
+            {
+                "data": {"name": "Sink", "channels": [5], "travel_up": 9.0, "travel_down": 9.0},
+                "subentry_type": "cover",
+                "title": "Sink",
+                "unique_id": "5",
+            },
+            {
+                "data": {
+                    "name": "Kitchen shades",
+                    "channels": [1, 2, 3, 4, 5, 6],
+                    "travel_up": "",
+                    "travel_down": "",
+                },
+                "subentry_type": "cover",
+                "title": "Kitchen shades",
+                "unique_id": "1-2-3-4-5-6",
+            },
+        ],
+        title="Kitchen remote",
+        unique_id="a1b2c3:42",
+        version=1,
+    )
+    add_to_manager(hass, entry)
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    added: list[tuple[list[Any], str | None]] = []
+
+    def record_add(
+        entities: list[Any],
+        update_before_add: bool = False,
+        *,
+        config_subentry_id: str | None = None,
+    ) -> None:
+        del update_before_add
+        added.append((list(entities), config_subentry_id))
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        await cover_module.async_setup_entry(hass, entry, record_add)
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    assert await async_setup_entry(hass, entry)
+
+    # Two leaf entities, each bound to its own subentry; the aggregate waits.
+    by_subentry = {subentry.unique_id: subentry for subentry in entry.subentries.values()}
+    assert len(added) == 2
+    bound_ids = {config_subentry_id for _entities, config_subentry_id in added}
+    assert bound_ids == {
+        by_subentry["1-2-3"].subentry_id,
+        by_subentry["5"].subentry_id,
+    }
+    for entities, config_subentry_id in added:
+        assert len(entities) == 1
+        entity = entities[0]
+        assert entity.unique_id == config_subentry_id
+        assert entity._config.area_id == "living_room"  # inherited from remote
+        assert entity._config.repeats == 5
+
+    # Parent device exists with the remote's area; reload keeps a user override.
+    registry = dr.async_get(hass)
+    parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    assert parent is not None
+    assert parent.area_id == "living_room"
+    registry.async_update_device(parent.id, area_id="pantry")
+    integration_module._ensure_remote_device(hass, entry)
+    parent_after = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    assert parent_after is not None
+    assert parent_after.area_id == "pantry"
+
+    await async_unload_entry(hass, entry)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import weakref
 from dataclasses import dataclass
@@ -31,10 +32,12 @@ from .models import (
     CommandAck,
     CommandAckTimeoutError,
     CommandStartedTimeoutError,
-    EntryRuntime,
+    CoverConfig,
     RemoteRuntime,
+    Role,
     TakeoverCoverState,
     ZemismartHub,
+    derive_role,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
     from .state_sync import HeardEvent
+
+_LOGGER = logging.getLogger(__name__)
 
 _ATTR_DEGRADED = "degraded_bridge"
 _ATTR_LAST_BRIDGE = "last_bridge"
@@ -80,16 +85,39 @@ class _MotionStart:
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry[EntryRuntime | RemoteRuntime],
+    entry: ConfigEntry[RemoteRuntime],
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create cover entities for one legacy blind/group entry."""
-    del hass
+    """Create one leaf cover entity per leaf subentry of this remote."""
+    from homeassistant.helpers import device_registry as dr
+
     runtime = entry.runtime_data
-    if isinstance(runtime, RemoteRuntime):
-        # Remote-centric entries grow per-subentry entities in Plan 03.
-        return
-    async_add_entities([ZemismartCover(entry.entry_id, runtime)])
+    covers: dict[str, CoverConfig] = {}
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != "cover":
+            continue
+        try:
+            covers[subentry.subentry_id] = CoverConfig.from_subentry(subentry.data)
+        except TypeError, ValueError:
+            _LOGGER.warning(
+                "Skipping unreadable cover subentry %s of %s",
+                subentry.subentry_id,
+                entry.title,
+            )
+    registry = dr.async_get(hass)
+    for subentry_id, cover in covers.items():
+        role = derive_role(cover, covers.values())
+        if role is not Role.LEAF:
+            # Aggregate covers gain entities in the next phase.
+            continue
+        config = BlindConfig.derive(runtime.remote, cover, role)
+        entity = ZemismartCover(subentry_id, entry.entry_id, config, runtime.hub)
+        async_add_entities([entity], config_subentry_id=subentry_id)
+        device = registry.async_get_device(identifiers={(DOMAIN, subentry_id)})
+        if device is not None and device.area_id is None:
+            # Configured area applies at creation only; a user's later
+            # device-page override must survive reloads.
+            registry.async_update_device(device.id, area_id=runtime.remote.area_id)
 
 
 def _number(value: object) -> float | None:
@@ -114,12 +142,24 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         | CoverEntityFeature.SET_POSITION
     )
 
-    def __init__(self, entry_id: str, runtime: EntryRuntime) -> None:
+    def __init__(
+        self,
+        subentry_id: str,
+        via_entry_id: str,
+        config: BlindConfig,
+        hub: ZemismartHub,
+    ) -> None:
         """Initialize one cover with its own travel-time estimate."""
-        self._config: BlindConfig = runtime.config
-        self._hub = runtime.hub
-        self._entry_id = entry_id
-        self._attr_unique_id = entry_id
+        if config.travel_up is None or config.travel_down is None:
+            msg = "leaf cover entities require travel calibration"
+            raise ValueError(msg)
+        self._travel_up: float = config.travel_up
+        self._travel_down: float = config.travel_down
+        self._config: BlindConfig = config
+        self._hub = hub
+        self._entry_id = subentry_id
+        self._via_entry_id = via_entry_id
+        self._attr_unique_id = subentry_id
         self._position: float | None = None
         self._direction = 0
         self._motion_started = 0.0
@@ -149,12 +189,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Represent each blind/group entry as its own area-assignable HA device."""
+        """Represent this cover as a child device of its remote."""
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry_id)},
             name=self._config.name,
             manufacturer="Zemismart",
             model="433 MHz blind group" if self._config.is_group else "433 MHz blind",
+            via_device=(DOMAIN, self._via_entry_id),
         )
 
     @property
@@ -189,6 +230,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         return {
             "channels": list(self._config.channels),
             "remote": self._config.remote_key,
+            "role": self._config.role.value,
             _ATTR_LAST_BRIDGE: self._last_bridge,
             _ATTR_DEGRADED: self._degraded,
             _ATTR_MOTION_DIRECTION: self._direction,
@@ -234,6 +276,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # channel set changed in options): the persisted position and
             # motion describe the OLD physical target and must not be
             # assigned to the new one.
+            return
+        restored_role = state.attributes.get("role", Role.LEAF.value)
+        if restored_role != self._config.role.value:
+            # A topology change flipped this cover's role since the state
+            # was persisted; the old model does not describe the new shape.
             return
         restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
         if restored is not None and 0 <= restored <= 100:
@@ -686,11 +733,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if event.button == "UP":
             direction = 1
             target = 100.0
-            configured = self._config.travel_up
+            configured = self._travel_up
         elif event.button == "DOWN":
             direction = -1
             target = 0.0
-            configured = self._config.travel_down
+            configured = self._travel_down
         else:
             return
         motion = _MotionStart(
@@ -841,7 +888,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         travels the same fraction of full travel from wherever it physically
         is — not from the group's aggregate estimate.
         """
-        full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
+        full_travel = self._travel_up if direction > 0 else self._travel_down
         # Compute from the member's estimate AT RF start: if this member was
         # itself still moving, its stored position is up to one update
         # interval stale, and _commit_motion will sync the model origin to
@@ -951,7 +998,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         ack = await self._async_transmit(button)
         if ack is None or intent_generation != self._intent_generation:
             return
-        configured = self._config.travel_up if direction > 0 else self._config.travel_down
+        configured = self._travel_up if direction > 0 else self._travel_down
         self._start_motion(
             ack,
             direction=direction,
@@ -1062,7 +1109,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return
 
         direction = 1 if target > current else -1
-        full_travel = self._config.travel_up if direction > 0 else self._config.travel_down
+        full_travel = self._travel_up if direction > 0 else self._travel_down
         duration = abs(target - current) / 100 * full_travel
         stop_after_ms = max(1, round(duration * 1_000))
         intent_generation = self._intent_generation

@@ -475,11 +475,12 @@ class BlindConfig:
     name: str
     remote: RemoteIdentity
     channels: tuple[int, ...]
-    travel_up: float
-    travel_down: float
+    travel_up: float | None
+    travel_down: float | None
     area_id: str
     repeats: int
     coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
+    role: Role = Role.LEAF
 
     def __post_init__(self) -> None:
         """Normalize and validate values at the config-entry boundary."""
@@ -495,9 +496,13 @@ class BlindConfig:
         if self.remote.bases is None:
             msg = "remote calibration is required"
             raise ValueError(msg)
+        if self.role is Role.LEAF and (self.travel_up is None or self.travel_down is None):
+            msg = "leaf covers require travel_up and travel_down"
+            raise ValueError(msg)
         if not all(
             math.isfinite(value) and 0 < value <= MAX_TRAVEL_SECONDS
             for value in (self.travel_up, self.travel_down)
+            if value is not None
         ):
             # NaN slips through plain comparisons (nan <= 0 is False) and
             # would leave the position model "moving" forever. The upper
@@ -601,6 +606,31 @@ class BlindConfig:
     def is_group(self) -> bool:
         """Return whether this device addresses more than one motor channel."""
         return len(self.channels) > 1
+
+    @property
+    def is_aggregate(self) -> bool:
+        """Return whether this cover aggregates member covers' state."""
+        return self.role is Role.AGGREGATE
+
+    @classmethod
+    def derive(
+        cls,
+        remote: RemoteConfig,
+        cover: CoverConfig,
+        role: Role,
+    ) -> BlindConfig:
+        """Build the runtime config for one cover from its remote and subentry."""
+        return cls(
+            name=cover.name,
+            remote=remote.remote,
+            channels=cover.channels,
+            travel_up=cover.travel_up,
+            travel_down=cover.travel_down,
+            area_id=remote.area_id,
+            repeats=remote.repeats,
+            coalesce_window_ms=remote.coalesce_window_ms,
+            role=role,
+        )
 
     @property
     def remote_key(self) -> str:
@@ -2513,14 +2543,6 @@ class ZemismartHub:
         self.displaced_listeners.clear()
         self.emission_proof_listeners.clear()
         self.bridge_listeners.clear()
-
-
-@dataclass(slots=True)
-class EntryRuntime:
-    """Runtime data owned by one blind/group config entry."""
-
-    config: BlindConfig
-    hub: ZemismartHub
 
 
 @dataclass(slots=True)
