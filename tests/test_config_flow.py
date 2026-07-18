@@ -484,7 +484,7 @@ def test_validate_cover_input_travel_required_for_born_leaf() -> None:
 
 def test_validate_cover_input_laminar_errors() -> None:
     """Duplicates and partial overlaps map to channel-field form errors."""
-    collected = [(1, 2, 3)]
+    collected: list[tuple[int, ...]] = [(1, 2, 3)]
     _cover, errors = config_flow_module._validate_cover_input(
         {
             CONF_NAME: "X",
@@ -509,7 +509,7 @@ def test_validate_cover_input_laminar_errors() -> None:
 
 def test_validate_cover_input_born_aggregate_travel_optional() -> None:
     """Strictly containing a collected cover lifts the travel requirement."""
-    collected = [(1, 2, 3), (4,)]
+    collected: list[tuple[int, ...]] = [(1, 2, 3), (4,)]
     cover, errors = config_flow_module._validate_cover_input(
         {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3,4,5,6"},
         collected,

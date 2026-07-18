@@ -4330,7 +4330,10 @@ async def test_aggregate_set_position_names_failing_members(hass: HomeAssistant)
 
 
 @pytest.mark.asyncio
-async def test_aggregate_recompute_batches_into_one_write(hass: HomeAssistant) -> None:
+async def test_aggregate_recompute_batches_into_one_write(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Several member writes in one iteration flush the aggregate once."""
 
     async def publish(_topic: str, _payload: str) -> None:
@@ -4345,7 +4348,7 @@ async def test_aggregate_recompute_batches_into_one_write(hass: HomeAssistant) -
         writes.append(1)
         original_write()
 
-    aggregate.async_write_ha_state = counting_write  # type: ignore[method-assign]
+    monkeypatch.setattr(aggregate, "async_write_ha_state", counting_write)
     try:
         leaf_one._position = 10.0
         leaf_two._position = 30.0
@@ -4355,7 +4358,6 @@ async def test_aggregate_recompute_batches_into_one_write(hass: HomeAssistant) -
         await hass.async_block_till_done()
         assert len(writes) == 1
     finally:
-        aggregate.async_write_ha_state = original_write  # type: ignore[method-assign]
         await detach_family(leaf_one, leaf_two, aggregate)
 
 

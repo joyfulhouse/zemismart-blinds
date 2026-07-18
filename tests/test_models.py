@@ -88,8 +88,8 @@ _REPLAY_DELIVERY_TIME: Final = 700.0
 def test_role_is_str_enum() -> None:
     from custom_components.zemismart_blinds.models import Role
 
-    assert Role.LEAF == "leaf"
-    assert Role.AGGREGATE == "aggregate"
+    assert Role.LEAF.value == "leaf"
+    assert Role.AGGREGATE.value == "aggregate"
 
 
 def test_cover_config_normalizes_and_exposes_channel_key() -> None:

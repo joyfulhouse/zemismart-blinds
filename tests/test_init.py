@@ -6,7 +6,7 @@ import asyncio
 import json
 import secrets
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from homeassistant.components import mqtt
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 
 def config_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
@@ -727,7 +728,11 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         added.append((list(entities), config_subentry_id))
 
     async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        await cover_module.async_setup_entry(hass, entry, record_add)
+        await cover_module.async_setup_entry(
+            hass,
+            entry,
+            cast("AddConfigEntryEntitiesCallback", record_add),
+        )
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
@@ -897,7 +902,11 @@ async def test_underivable_cover_skips_without_failing_entry(
         added.extend(entities)
 
     async def forward(_entry: Any, _platforms: list[Any]) -> None:
-        await cover_module.async_setup_entry(hass, entry, record_add)
+        await cover_module.async_setup_entry(
+            hass,
+            entry,
+            cast("AddConfigEntryEntitiesCallback", record_add),
+        )
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
