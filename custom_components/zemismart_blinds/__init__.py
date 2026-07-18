@@ -322,16 +322,25 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
 def _prune_stale_cover_devices(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
     """Drop per-cover child devices left behind by pre-0.3.1 layouts.
 
-    Must run after platform setup: by then every cover entity has re-homed
-    onto the remote's shared device, so removing the now-empty child devices
-    cannot take live entity registrations with it.
+    Must run after platform setup: covers added this cycle have re-homed onto
+    the remote's shared device by then. A cover SKIPPED this cycle (demotion
+    guard) still keeps its registry row on the old child device, and removing
+    that device would delete the row — so a device holding any entity
+    registration is kept until its cover re-homes on a later reload.
     """
     from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
 
-    registry = dr.async_get(hass)
-    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
-        if (DOMAIN, entry.entry_id) not in device.identifiers:
-            registry.async_remove_device(device.id)
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+    for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
+        if (DOMAIN, entry.entry_id) in device.identifiers:
+            continue
+        if er.async_entries_for_device(
+            entity_registry, device.id, include_disabled_entities=True
+        ):
+            continue
+        device_registry.async_remove_device(device.id)
 
 
 def _clear_domain_registrations(hass: HomeAssistant, runtime: DomainRuntime) -> None:

@@ -899,6 +899,36 @@ async def test_underivable_cover_skips_without_failing_entry(
     )
     add_to_manager(hass, entry)
 
+    # An upgrading install: the demoted cover still owns its pre-0.3.1 child
+    # device, and its live entity registration still points at it. The stale-
+    # device prune must not delete either (deleting the device would delete
+    # the entity registry row with it).
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    orphan_subentry_id = next(
+        subentry.subentry_id
+        for subentry in entry.subentries.values()
+        if subentry.unique_id == "1-2"
+    )
+    device_registry = dr.async_get(hass)
+    legacy_device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=orphan_subentry_id,
+        identifiers={(DOMAIN, orphan_subentry_id)},
+        name="Orphan",
+    )
+    entity_registry = er.async_get(hass)
+    orphan_entity = entity_registry.async_get_or_create(
+        "cover",
+        DOMAIN,
+        orphan_subentry_id,
+        config_entry=entry,
+        config_subentry_id=orphan_subentry_id,
+        device_id=legacy_device.id,
+        original_name="Orphan",
+    )
+
     async def subscribe(
         _hass: HomeAssistant,
         _topic: str,
@@ -930,6 +960,12 @@ async def test_underivable_cover_skips_without_failing_entry(
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     assert await async_setup_entry(hass, entry)
     assert [entity._config.name for entity in added] == ["Solo"]
+
+    # The skipped cover's registry row and its legacy device both survive the
+    # stale-device prune; they re-home only once the cover gains travel times.
+    assert entity_registry.async_get(orphan_entity.entity_id) is not None
+    assert device_registry.async_get(legacy_device.id) is not None
+
     await async_unload_entry(hass, entry)
 
 
