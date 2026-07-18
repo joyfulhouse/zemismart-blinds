@@ -748,6 +748,16 @@ class StateSyncConsumer:
         if previous is not None and abs(heard_at - previous.heard_at) <= _DEBOUNCE_WINDOW_SECONDS:
             return
         self._debounce.pop(signature, None)
+        # A dispatched press ends every overlapping earlier signature's
+        # repeat train: their stamps must not swallow a genuine re-press
+        # (UP → STOP → UP inside one debounce window). Stale late copies
+        # stay dropped by the heard_at ordering guard above.
+        for stale in [
+            key
+            for key in self._debounce
+            if key[0] == remote_key and not key[1].isdisjoint(channels)
+        ]:
+            del self._debounce[stale]
         self._debounce[signature] = _DebounceStamp(heard_at=heard_at, seen_at=seen_at)
         while len(self._debounce) > _DEBOUNCE_CAP:
             del self._debounce[next(iter(self._debounce))]

@@ -733,6 +733,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         absolute_anchor: bool,
     ) -> None:
         """Commit travel fields from either a command ack or a heard press."""
+        # Live motion supersedes a still-pending restore: a member registers
+        # with the coordinator BEFORE its restore await, so a group command
+        # can commit here first — the stale persisted snapshot must then
+        # never be applied over it.
+        self._restore_epoch += 1
         self._interrupt_motion(motion.started_at)
         if self._timed_motion_bridge_offline(motion):
             # The started status and retained offline LWT can be delivered in
@@ -953,6 +958,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if provenance not in {"commanded", "heard"}:
             msg = f"unsupported STOP provenance: {provenance}"
             raise ValueError(msg)
+        # A live freeze also supersedes a still-pending restore snapshot.
+        self._restore_epoch += 1
         self._interrupt_motion(at)
         self._reconcile_unverified_anchor()
         self.async_write_ha_state()
@@ -1253,6 +1260,11 @@ class ZemismartAggregateCover(CoverEntity):
 
     async def _async_move_full(self, button: Button, direction: int, target: float) -> None:
         """Run one group frame and start every member's own motion model."""
+        # Snapshot BEFORE the transmit await: a physical press heard while
+        # this frame is queued is NEWER intent for that member, and the older
+        # group command must not overwrite it (mirrors the leaf-side
+        # intent-generation checks around every transmit).
+        generations = {member: member._intent_generation for member in self._members()}
         ack = await self._async_transmit(button)
         if ack is None:
             return
@@ -1264,6 +1276,9 @@ class ZemismartAggregateCover(CoverEntity):
             command_id=ack.command_id,
         )
         for member in self._members():
+            generation = generations.get(member)
+            if generation is not None and generation != member._intent_generation:
+                continue
             member._start_member_motion(
                 motion,
                 ack=ack,
@@ -1295,10 +1310,16 @@ class ZemismartAggregateCover(CoverEntity):
         del kwargs
         self._cancel_fanout()
         async with self._command_lock:
+            generations = {member: member._intent_generation for member in self._members()}
             ack = await self._async_transmit("STOP")
             if ack is None:
                 return
             for member in self._members():
+                generation = generations.get(member)
+                if generation is not None and generation != member._intent_generation:
+                    # A press heard during the STOP await is newer intent for
+                    # this member; its own heard model wins the freeze.
+                    continue
                 member._record_ack(ack)
                 member._apply_stop(ack.started_at, provenance="commanded")
             self.async_write_ha_state()
