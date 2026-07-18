@@ -296,7 +296,7 @@ async def _async_entry_updated(hass: HomeAssistant, entry: ZemismartConfigEntry)
 
 
 def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
-    """Create the parent remote device before its cover children.
+    """Create the remote's device; every cover entity attaches to it.
 
     The configured area applies at creation only: a user's later device-page
     override must survive reloads, so an existing device is never re-homed.
@@ -317,6 +317,21 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
     )
     if not existed:
         registry.async_update_device(device.id, area_id=remote.area_id)
+
+
+def _prune_stale_cover_devices(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
+    """Drop per-cover child devices left behind by pre-0.3.1 layouts.
+
+    Must run after platform setup: by then every cover entity has re-homed
+    onto the remote's shared device, so removing the now-empty child devices
+    cannot take live entity registrations with it.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        if (DOMAIN, entry.entry_id) not in device.identifiers:
+            registry.async_remove_device(device.id)
 
 
 def _clear_domain_registrations(hass: HomeAssistant, runtime: DomainRuntime) -> None:
@@ -374,6 +389,7 @@ async def async_setup_entry(
                 entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
                 _ensure_remote_device(hass, entry)
                 await hass.config_entries.async_forward_entry_setups(entry, [Platform.COVER])
+                _prune_stale_cover_devices(hass, entry)
                 runtime.loaded_entries.add(entry.entry_id)
                 failed = False
                 return True

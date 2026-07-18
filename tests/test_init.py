@@ -658,7 +658,7 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Leaf subentries become subentry-bound covers; aggregates wait; devices nest."""
+    """Leaf subentries become subentry-bound covers sharing the remote's device."""
     from homeassistant.helpers import device_registry as dr
 
     from custom_components.zemismart_blinds import cover as cover_module
@@ -736,6 +736,15 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+
+    # A per-cover child device left behind by the pre-0.3.1 layout.
+    registry = dr.async_get(hass)
+    stale = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "stale-child-subentry")},
+        name="Old child device",
+    )
+
     assert await async_setup_entry(hass, entry)
 
     # One entity per subentry, each bound to its own subentry id.
@@ -756,6 +765,11 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         assert entity.unique_id == config_subentry_id
         assert entity._config.area_id == "living_room"  # inherited from remote
         assert entity._config.repeats == 5
+        # Covers are entities INSIDE the remote's device, carrying their own
+        # unprefixed name (deployed friendly names must stay byte-stable).
+        assert entity.device_info == {"identifiers": {(DOMAIN, entry.entry_id)}}
+        assert entity.has_entity_name is False
+        assert entity.name == entity._config.name
         if config_subentry_id == aggregate_subentry_id:
             assert isinstance(entity, ZemismartAggregateCover)
         else:
@@ -769,8 +783,12 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         )
     }
 
-    # Parent device exists with the remote's area; reload keeps a user override.
-    registry = dr.async_get(hass)
+    # The stale pre-0.3.1 child device was pruned; only the remote remains.
+    assert registry.async_get(stale.id) is None
+    entry_devices = dr.async_entries_for_config_entry(registry, entry.entry_id)
+    assert [device.identifiers for device in entry_devices] == [{(DOMAIN, entry.entry_id)}]
+
+    # Remote device exists with the remote's area; reload keeps a user override.
     parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
     assert parent is not None
     assert parent.area_id == "living_room"
