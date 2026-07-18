@@ -733,20 +733,36 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     assert await async_setup_entry(hass, entry)
 
-    # Two leaf entities, each bound to its own subentry; the aggregate waits.
+    # One entity per subentry, each bound to its own subentry id.
     by_subentry = {subentry.unique_id: subentry for subentry in entry.subentries.values()}
-    assert len(added) == 2
+    assert len(added) == 3
     bound_ids = {config_subentry_id for _entities, config_subentry_id in added}
     assert bound_ids == {
         by_subentry["1-2-3"].subentry_id,
         by_subentry["5"].subentry_id,
+        by_subentry["1-2-3-4-5-6"].subentry_id,
     }
+    from custom_components.zemismart_blinds.cover import ZemismartAggregateCover
+
+    aggregate_subentry_id = by_subentry["1-2-3-4-5-6"].subentry_id
     for entities, config_subentry_id in added:
         assert len(entities) == 1
         entity = entities[0]
         assert entity.unique_id == config_subentry_id
         assert entity._config.area_id == "living_room"  # inherited from remote
         assert entity._config.repeats == 5
+        if config_subentry_id == aggregate_subentry_id:
+            assert isinstance(entity, ZemismartAggregateCover)
+        else:
+            assert not isinstance(entity, ZemismartAggregateCover)
+    runtime_data = entry.runtime_data
+    assert runtime_data.coordinator is not None
+    assert runtime_data.coordinator.members == {
+        aggregate_subentry_id: (
+            by_subentry["1-2-3"].subentry_id,
+            by_subentry["5"].subentry_id,
+        )
+    }
 
     # Parent device exists with the remote's area; reload keeps a user override.
     registry = dr.async_get(hass)

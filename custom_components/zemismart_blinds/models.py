@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Final, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from .calibrations import KNOWN_CALIBRATIONS
 from .codec import (
@@ -49,6 +49,9 @@ from .state_sync import (
     StateSyncConsumer,
     frame_signature,
 )
+
+if TYPE_CHECKING:
+    from .coordinator import RemoteCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2551,6 +2554,8 @@ class RemoteRuntime:
 
     remote: RemoteConfig
     hub: ZemismartHub
+    # Built during cover-platform setup; None only before the platform loads.
+    coordinator: RemoteCoordinator | None = None
 
 
 @dataclass(slots=True)
