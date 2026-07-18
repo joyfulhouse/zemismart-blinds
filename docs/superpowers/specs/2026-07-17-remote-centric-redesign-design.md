@@ -129,11 +129,17 @@ which changes coalescing eligibility relative to today's channel-count rule).
 
 - Remote device: created **before** platform forwarding
   (`identifiers={(DOMAIN, entry_id)}`, manufacturer Zemismart, model "RF433
-  remote") so children's `via_device` always resolves.
-- Cover device per subentry: `identifiers={(DOMAIN, subentry_id)}`,
-  `via_device=(DOMAIN, entry_id)`. Entities are added with
-  `async_add_entities(..., config_subentry_id=...)` so HA ties entity/device
-  records to the subentry and native subentry deletion cleans them up.
+  remote").
+- **Rev 5 (user correction, v0.3.1)**: covers are NOT child devices. Every
+  cover entity attaches to the remote's own device (EG4-inverter pattern):
+  entity `device_info` returns identifiers `{(DOMAIN, entry_id)}` only, no
+  `via_device`, no per-subentry devices. Entities carry their full cover name
+  with `has_entity_name=False` so deployed friendly names and entity_ids stay
+  byte-stable (no remote-name prefix). Entities are still added with
+  `async_add_entities(..., config_subentry_id=...)` so native subentry
+  deletion cleans up the entity registrations; the shared device survives via
+  its subentry-less entry link. Setup prunes any pre-0.3.1 per-cover child
+  devices after platform forwarding (entities have re-homed by then).
 - **Area assignment API**: `async_get_or_create`/`DeviceInfo` accept only
   `suggested_area` (an area *name*, not id). Passing the stored `area_id`
   there would create a bogus area named after the id. Devices therefore get

@@ -29,8 +29,11 @@ from custom_components.zemismart_blinds.models import (
     parse_channels,
 )
 from custom_components.zemismart_blinds.state_sync import (
+    BridgeClock,
+    CommandLedger,
     HeardEvent,
     LedgerFrameSpec,
+    StateSyncConsumer,
     frame_signature,
 )
 from tests.synthetic import (
@@ -4075,6 +4078,36 @@ async def test_disarm_remote_awaits_acknowledged_bridge_disarms() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disarm_idle_callback_fires_once_when_last_request_resolves() -> None:
+    """Pending disarms are reported, and draining fires the one-shot callback."""
+
+    async def publisher(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    assert hub.has_pending_disarms is False
+
+    request = hub._start_disarm_request("bridge-a", "cmd-live", hub._now() + 30.0)
+    assert hub.has_pending_disarms is True
+
+    fired: list[int] = []
+    hub.set_disarm_idle_callback(lambda: fired.append(1))
+    hub.on_disarmed("bridge-a", "cmd-live")
+    assert request.task is not None
+    await asyncio.wait_for(request.task, timeout=1.0)
+    assert fired == [1]
+    assert hub.has_pending_disarms is False
+
+    # One-shot: a later drain must not re-fire the consumed callback.
+    second = hub._start_disarm_request("bridge-a", "cmd-live-2", hub._now() + 30.0)
+    hub.on_disarmed("bridge-a", "cmd-live-2")
+    assert second.task is not None
+    await asyncio.wait_for(second.task, timeout=1.0)
+    assert fired == [1]
+    hub.close()
+
+
+@pytest.mark.asyncio
 async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
     """A fast-lane STOP still waiting on publish barriers drains too."""
     release = asyncio.Event()
@@ -4116,10 +4149,38 @@ async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
     hub.close()
 
 
+def test_dispatched_press_resets_overlapping_debounce_signatures() -> None:
+    """A rapid physical UP → STOP → UP jog dispatches all three presses.
+
+    The second UP lands inside the first UP's debounce window, but the
+    intervening STOP dispatch proves the first press's repeat train ended —
+    the stamp must not swallow the genuine re-press. Stale late copies stay
+    dropped by the heard_at ordering guard, which this reset never touches.
+    """
+    dispatched: list[HeardEvent] = []
+    now_value = [10.0]
+    clocks: dict[str, BridgeClock] = {}
+    consumer = StateSyncConsumer(
+        ledger=CommandLedger(),
+        clock_resolver=lambda bridge_id: clocks.setdefault(bridge_id, BridgeClock()),
+        dispatch=dispatched.append,
+        on_emission_proof=lambda _proof: None,
+        now=lambda: now_value[0],
+    )
+    up = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+    stop = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "STOP", bases=TEST_BASES))
+
+    consumer.handle_rx("bridge-a", 7, 1_000, up, 10.0)
+    now_value[0] = 10.5
+    consumer.handle_rx("bridge-a", 7, 1_500, stop, 10.5)
+    now_value[0] = 11.0
+    consumer.handle_rx("bridge-a", 7, 2_000, up, 11.0)
+
+    assert [event.button for event in dispatched] == ["UP", "STOP", "UP"]
+
+
 def test_ledger_disarm_deadline_extends_to_window_end() -> None:
     """A confirmed command's disarm retries until its last window closes."""
-    from custom_components.zemismart_blinds.state_sync import CommandLedger
-
     ledger = CommandLedger()
     frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
     signature = frame_signature(frame)

@@ -1001,6 +1001,7 @@ class ZemismartHub:
         )
         self._pending: dict[tuple[str, str], _PendingStatuses] = {}
         self._disarm_requests: dict[tuple[str, str], _DisarmRequest] = {}
+        self._on_disarms_idle: Callable[[], None] | None = None
         self._queue: deque[_QueuedCommand] = deque()
         self._queue_ready = asyncio.Condition()
         self._worker_task: asyncio.Task[None] | None = None
@@ -1575,6 +1576,9 @@ class ZemismartHub:
                 del self._disarm_requests[key]
             if not request.waiter.done():
                 request.waiter.cancel()
+            if not self._disarm_requests and self._on_disarms_idle is not None:
+                idle_callback, self._on_disarms_idle = self._on_disarms_idle, None
+                idle_callback()
 
     async def _wait_for_disarm_retry(
         self,
@@ -2559,9 +2563,10 @@ class ZemismartHub:
         ):
             # Retry each disarm until the command's REAL bridge-side STOP
             # window ends (hours for a long timed move), not a flat bound;
-            # the flow only awaits the short bound below — the background
-            # request keeps retrying past the reload because the hub is
-            # shared and survives it.
+            # the flow only awaits the short bound below. The background
+            # request survives the reload this flow triggers because entry
+            # teardown defers hub cleanup while disarms are pending
+            # (_release_domain_runtime), even for the last loaded entry.
             request = self._start_disarm_request(
                 command.bridge_id,
                 command.command_id,
@@ -2578,9 +2583,19 @@ class ZemismartHub:
             async with asyncio.timeout(deadline_seconds):
                 await asyncio.gather(*waiters, return_exceptions=True)
 
+    @property
+    def has_pending_disarms(self) -> bool:
+        """Return whether any bridge-side disarm retry is still unresolved."""
+        return bool(self._disarm_requests)
+
+    def set_disarm_idle_callback(self, idle_callback: Callable[[], None] | None) -> None:
+        """Arm a one-shot callback invoked when the last disarm request resolves."""
+        self._on_disarms_idle = idle_callback
+
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
         self._closed = True
+        self._on_disarms_idle = None
         self._state_sync.close()
         for clock in self._bridge_clocks.values():
             clock.clear()

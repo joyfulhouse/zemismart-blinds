@@ -85,8 +85,6 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create one leaf cover entity per leaf subentry of this remote."""
-    from homeassistant.helpers import device_registry as dr
-
     runtime = entry.runtime_data
     covers: dict[str, CoverConfig] = {}
     for subentry in entry.subentries.values():
@@ -103,7 +101,6 @@ async def async_setup_entry(
     coordinator = RemoteCoordinator(hass, covers)
     runtime.coordinator = coordinator
     entry.async_on_unload(coordinator.detach)
-    registry = dr.async_get(hass)
     for subentry_id, cover in covers.items():
         role = coordinator.roles[subentry_id]
         try:
@@ -137,14 +134,7 @@ async def async_setup_entry(
                 runtime.hub,
                 coordinator,
             )
-        # Creation detection must precede the add: a user's cleared area
-        # (area_id None on an EXISTING device) must never be re-assigned.
-        existed = registry.async_get_device(identifiers={(DOMAIN, subentry_id)}) is not None
         async_add_entities([entity], config_subentry_id=subentry_id)
-        if not existed:
-            device = registry.async_get_device(identifiers={(DOMAIN, subentry_id)})
-            if device is not None:
-                registry.async_update_device(device.id, area_id=runtime.remote.area_id)
 
 
 def _number(value: object) -> float | None:
@@ -159,8 +149,6 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     _attr_assumed_state = True
     _attr_device_class = CoverDeviceClass.SHADE
-    _attr_has_entity_name = True
-    _attr_name = None
     _attr_should_poll = False
     _attr_supported_features = (
         CoverEntityFeature.OPEN
@@ -172,7 +160,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     def __init__(
         self,
         subentry_id: str,
-        via_entry_id: str,
+        remote_entry_id: str,
         config: BlindConfig,
         hub: ZemismartHub,
         coordinator: RemoteCoordinator | None = None,
@@ -186,9 +174,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._config: BlindConfig = config
         self._hub = hub
         self._coordinator = coordinator
-        self._entry_id = subentry_id
-        self._via_entry_id = via_entry_id
+        self._subentry_id = subentry_id
+        self._remote_entry_id = remote_entry_id
         self._attr_unique_id = subentry_id
+        # Full name, not a device-prefixed has_entity_name: deployed
+        # friendly names predate the shared-device layout and must not gain
+        # the remote's name as a prefix.
+        self._attr_name = config.name
         self._position: float | None = None
         self._direction = 0
         self._motion_started = 0.0
@@ -223,14 +215,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Represent this cover as a child device of its remote."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._entry_id)},
-            name=self._config.name,
-            manufacturer="Zemismart",
-            model="433 MHz blind group" if self._config.is_group else "433 MHz blind",
-            via_device=(DOMAIN, self._via_entry_id),
-        )
+        """Attach to the remote's own device; covers are entities, not children.
+
+        Identifiers only: the remote device's name/model belong to
+        _ensure_remote_device, and repeating them here would let one cover
+        rename the shared device.
+        """
+        return DeviceInfo(identifiers={(DOMAIN, self._remote_entry_id)})
 
     @property
     def available(self) -> bool:
@@ -285,7 +276,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Restore a stopped estimate or reconstruct complete started motion."""
         await super().async_added_to_hass()
         if self._coordinator is not None:
-            self._coordinator.register_leaf(self._entry_id, self)
+            self._coordinator.register_leaf(self._subentry_id, self)
         self._unsubscribe_rx_listener = self._hub.register_rx_listener(
             self._config.remote.key,
             frozenset(self._config.channels),
@@ -447,7 +438,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._unsubscribe_rx_listener()
             self._unsubscribe_rx_listener = None
         if self._coordinator is not None:
-            self._coordinator.unregister_leaf(self._entry_id)
+            self._coordinator.unregister_leaf(self._subentry_id)
         if self._on_displaced in self._hub.displaced_listeners:
             self._hub.displaced_listeners.remove(self._on_displaced)
         if self._on_emission_proof in self._hub.emission_proof_listeners:
@@ -742,6 +733,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         absolute_anchor: bool,
     ) -> None:
         """Commit travel fields from either a command ack or a heard press."""
+        # Live motion supersedes a still-pending restore: a member registers
+        # with the coordinator BEFORE its restore await, so a group command
+        # can commit here first — the stale persisted snapshot must then
+        # never be applied over it.
+        self._restore_epoch += 1
         self._interrupt_motion(motion.started_at)
         if self._timed_motion_bridge_offline(motion):
             # The started status and retained offline LWT can be delivered in
@@ -908,7 +904,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 button,
                 stop_after_ms=stop_after_ms,
                 overlap_token=overlap_token,
-                owner=self._via_entry_id,
+                owner=self._remote_entry_id,
             )
         except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
             # The frame MAY have reached RF; only unknown is honest. Aggregates
@@ -962,6 +958,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if provenance not in {"commanded", "heard"}:
             msg = f"unsupported STOP provenance: {provenance}"
             raise ValueError(msg)
+        # A live freeze also supersedes a still-pending restore snapshot.
+        self._restore_epoch += 1
         self._interrupt_motion(at)
         self._reconcile_unverified_anchor()
         self.async_write_ha_state()
@@ -1066,8 +1064,6 @@ class ZemismartAggregateCover(CoverEntity):
 
     _attr_assumed_state = True
     _attr_device_class = CoverDeviceClass.SHADE
-    _attr_has_entity_name = True
-    _attr_name = None
     _attr_should_poll = False
     _attr_supported_features = (
         CoverEntityFeature.OPEN
@@ -1079,7 +1075,7 @@ class ZemismartAggregateCover(CoverEntity):
     def __init__(
         self,
         subentry_id: str,
-        via_entry_id: str,
+        remote_entry_id: str,
         config: BlindConfig,
         hub: ZemismartHub,
         coordinator: RemoteCoordinator,
@@ -1089,8 +1085,12 @@ class ZemismartAggregateCover(CoverEntity):
         self._hub = hub
         self._coordinator = coordinator
         self._subentry_id = subentry_id
-        self._via_entry_id = via_entry_id
+        self._remote_entry_id = remote_entry_id
         self._attr_unique_id = subentry_id
+        # Full name, not a device-prefixed has_entity_name: deployed
+        # friendly names predate the shared-device layout and must not gain
+        # the remote's name as a prefix.
+        self._attr_name = config.name
         self._last_command_bridge: str | None = None
         self._last_command_id: str | None = None
         self._last_command_button: Button | None = None
@@ -1105,14 +1105,13 @@ class ZemismartAggregateCover(CoverEntity):
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Represent this aggregate as a child device of its remote."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._subentry_id)},
-            name=self._config.name,
-            manufacturer="Zemismart",
-            model="433 MHz blind group",
-            via_device=(DOMAIN, self._via_entry_id),
-        )
+        """Attach to the remote's own device; covers are entities, not children.
+
+        Identifiers only: the remote device's name/model belong to
+        _ensure_remote_device, and repeating them here would let one cover
+        rename the shared device.
+        """
+        return DeviceInfo(identifiers={(DOMAIN, self._remote_entry_id)})
 
     async def async_added_to_hass(self) -> None:
         """Register with the coordinator and the hub's takeover machinery."""
@@ -1246,7 +1245,7 @@ class ZemismartAggregateCover(CoverEntity):
             result = await self._hub.async_transmit(
                 self._config,
                 button,
-                owner=self._via_entry_id,
+                owner=self._remote_entry_id,
             )
         except Exception as exc:
             raise HomeAssistantError(str(exc)) from exc
@@ -1261,6 +1260,11 @@ class ZemismartAggregateCover(CoverEntity):
 
     async def _async_move_full(self, button: Button, direction: int, target: float) -> None:
         """Run one group frame and start every member's own motion model."""
+        # Snapshot BEFORE the transmit await: a physical press heard while
+        # this frame is queued is NEWER intent for that member, and the older
+        # group command must not overwrite it (mirrors the leaf-side
+        # intent-generation checks around every transmit).
+        generations = {member: member._intent_generation for member in self._members()}
         ack = await self._async_transmit(button)
         if ack is None:
             return
@@ -1272,6 +1276,9 @@ class ZemismartAggregateCover(CoverEntity):
             command_id=ack.command_id,
         )
         for member in self._members():
+            generation = generations.get(member)
+            if generation is not None and generation != member._intent_generation:
+                continue
             member._start_member_motion(
                 motion,
                 ack=ack,
@@ -1303,10 +1310,16 @@ class ZemismartAggregateCover(CoverEntity):
         del kwargs
         self._cancel_fanout()
         async with self._command_lock:
+            generations = {member: member._intent_generation for member in self._members()}
             ack = await self._async_transmit("STOP")
             if ack is None:
                 return
             for member in self._members():
+                generation = generations.get(member)
+                if generation is not None and generation != member._intent_generation:
+                    # A press heard during the STOP await is newer intent for
+                    # this member; its own heard model wins the freeze.
+                    continue
                 member._record_ack(ack)
                 member._apply_stop(ack.started_at, provenance="commanded")
             self.async_write_ha_state()

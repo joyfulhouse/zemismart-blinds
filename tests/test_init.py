@@ -422,6 +422,71 @@ async def test_setup_waiter_survives_final_unload_generation(
 
 
 @pytest.mark.asyncio
+async def test_final_unload_defers_hub_close_while_disarms_pend(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relearn's background disarm keeps the shared hub alive past unload.
+
+    Closing the hub with the retry pending would cancel it and leave the old
+    identity's fail-safe STOP armed on the bridge; the last resolving disarm
+    finishes the deferred cleanup instead.
+    """
+    unsubscribed = 0
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+
+        def unsubscribe() -> None:
+            nonlocal unsubscribed
+            unsubscribed += 1
+
+        return unsubscribe
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        return
+
+    async def unload(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
+        return True
+
+    async def publish(*_args: Any, **_kwargs: Any) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(mqtt, "async_publish", publish)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
+    entry = config_entry("one")
+    add_to_manager(hass, entry)
+    await async_setup_entry(hass, entry)
+    runtime: DomainRuntime = hass.data[DOMAIN]
+
+    request = runtime.hub._start_disarm_request(
+        "bridge-a",
+        "cmd-live",
+        runtime.hub._now() + 30.0,
+    )
+
+    assert await async_unload_entry(hass, entry)
+    # Cleanup deferred: the runtime stays adoptable, subscriptions stay alive
+    # (the disarm ack arrives through them).
+    assert hass.data[DOMAIN] is runtime
+    assert unsubscribed == 0
+    assert runtime.hub.has_pending_disarms is True
+
+    runtime.hub.on_disarmed("bridge-a", "cmd-live")
+    assert request.task is not None
+    await asyncio.wait_for(request.task, timeout=1.0)
+    assert DOMAIN not in hass.data
+    assert unsubscribed == 4
+
+
+@pytest.mark.asyncio
 async def test_retained_discovery_order_and_status_ack_filtering(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -658,7 +723,7 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Leaf subentries become subentry-bound covers; aggregates wait; devices nest."""
+    """Leaf subentries become subentry-bound covers sharing the remote's device."""
     from homeassistant.helpers import device_registry as dr
 
     from custom_components.zemismart_blinds import cover as cover_module
@@ -736,6 +801,15 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
 
     monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+
+    # A per-cover child device left behind by the pre-0.3.1 layout.
+    registry = dr.async_get(hass)
+    stale = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, "stale-child-subentry")},
+        name="Old child device",
+    )
+
     assert await async_setup_entry(hass, entry)
 
     # One entity per subentry, each bound to its own subentry id.
@@ -756,6 +830,11 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         assert entity.unique_id == config_subentry_id
         assert entity._config.area_id == "living_room"  # inherited from remote
         assert entity._config.repeats == 5
+        # Covers are entities INSIDE the remote's device, carrying their own
+        # unprefixed name (deployed friendly names must stay byte-stable).
+        assert entity.device_info == {"identifiers": {(DOMAIN, entry.entry_id)}}
+        assert entity.has_entity_name is False
+        assert entity.name == entity._config.name
         if config_subentry_id == aggregate_subentry_id:
             assert isinstance(entity, ZemismartAggregateCover)
         else:
@@ -769,8 +848,12 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         )
     }
 
-    # Parent device exists with the remote's area; reload keeps a user override.
-    registry = dr.async_get(hass)
+    # The stale pre-0.3.1 child device was pruned; only the remote remains.
+    assert registry.async_get(stale.id) is None
+    entry_devices = dr.async_entries_for_config_entry(registry, entry.entry_id)
+    assert [device.identifiers for device in entry_devices] == [{(DOMAIN, entry.entry_id)}]
+
+    # Remote device exists with the remote's area; reload keeps a user override.
     parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
     assert parent is not None
     assert parent.area_id == "living_room"
@@ -881,6 +964,36 @@ async def test_underivable_cover_skips_without_failing_entry(
     )
     add_to_manager(hass, entry)
 
+    # An upgrading install: the demoted cover still owns its pre-0.3.1 child
+    # device, and its live entity registration still points at it. The stale-
+    # device prune must not delete either (deleting the device would delete
+    # the entity registry row with it).
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    orphan_subentry_id = next(
+        subentry.subentry_id
+        for subentry in entry.subentries.values()
+        if subentry.unique_id == "1-2"
+    )
+    device_registry = dr.async_get(hass)
+    legacy_device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=orphan_subentry_id,
+        identifiers={(DOMAIN, orphan_subentry_id)},
+        name="Orphan",
+    )
+    entity_registry = er.async_get(hass)
+    orphan_entity = entity_registry.async_get_or_create(
+        "cover",
+        DOMAIN,
+        orphan_subentry_id,
+        config_entry=entry,
+        config_subentry_id=orphan_subentry_id,
+        device_id=legacy_device.id,
+        original_name="Orphan",
+    )
+
     async def subscribe(
         _hass: HomeAssistant,
         _topic: str,
@@ -912,6 +1025,12 @@ async def test_underivable_cover_skips_without_failing_entry(
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     assert await async_setup_entry(hass, entry)
     assert [entity._config.name for entity in added] == ["Solo"]
+
+    # The skipped cover's registry row and its legacy device both survive the
+    # stale-device prune; they re-home only once the cover gains travel times.
+    assert entity_registry.async_get(orphan_entity.entity_id) is not None
+    assert device_registry.async_get(legacy_device.id) is not None
+
     await async_unload_entry(hass, entry)
 
 

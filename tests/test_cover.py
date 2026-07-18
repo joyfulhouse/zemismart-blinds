@@ -3076,6 +3076,72 @@ async def test_heard_press_during_restore_supersedes_cached_motion(
 
 
 @pytest.mark.asyncio
+async def test_group_motion_during_restore_supersedes_cached_motion(
+    hass: HomeAssistant,
+) -> None:
+    """A live group command cannot be clobbered by an older cached motion.
+
+    Members register with the coordinator BEFORE their restore await, so an
+    aggregate can drive a member while its persisted state is still loading.
+    """
+    config = member_config(channel=1, travel=5.0)
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "closing",
+        {
+            ATTR_CURRENT_POSITION: 60,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": -1,
+            "motion_target": 0,
+            "motion_started": now - 1.0,
+            "motion_deadline": now + 10.0,
+            "motion_start_position": 80,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "cached-down",
+            "motion_timed": False,
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+
+    class GroupDrivenDuringRestore(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            self._start_member_motion(
+                cover_module._MotionStart(
+                    source="commanded",
+                    started_at=cover_module.WALL_CLOCK(),
+                    deadline=None,
+                    bridge_id="bridge-a",
+                    command_id="group-up",
+                ),
+                ack=None,
+                direction=1,
+                duration=0.0,
+                group_target=100.0,
+            )
+            return restored_state
+
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=GroupDrivenDuringRestore,
+    )
+    try:
+        assert entity.is_opening
+        assert not entity.is_closing
+        assert entity._motion_target == 100.0
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_later_heard_press_overtakes_restore_invalidation(
     hass: HomeAssistant,
 ) -> None:
@@ -4207,6 +4273,43 @@ async def detach_family(*entities: Any) -> None:
     """Tear the family down in reverse order."""
     for entity in reversed(entities):
         await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_command_yields_to_press_heard_during_transmit(
+    hass: HomeAssistant,
+) -> None:
+    """A press heard while the group frame is queued wins for that member."""
+    hub: ZemismartHub
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish(topic: str, payload: str) -> None:
+        if not topic.endswith("/tx"):
+            return
+        entered.set()
+        await release.wait()
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    try:
+        leaf_one._position = 50.0
+        leaf_two._position = 50.0
+        opening = asyncio.create_task(aggregate.async_open_cover())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        dispatch_heard_press(hub, leaf_one._config, "DOWN", (1,), at=cover_module.WALL_CLOCK())
+        release.set()
+        await asyncio.wait_for(opening, timeout=1.0)
+
+        # The pressed member keeps its newer heard model; the other member
+        # follows the group command.
+        assert leaf_one.is_closing
+        assert not leaf_one.is_opening
+        assert leaf_two.is_opening
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
 
 
 @pytest.mark.asyncio
