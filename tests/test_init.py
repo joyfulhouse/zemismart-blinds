@@ -422,6 +422,71 @@ async def test_setup_waiter_survives_final_unload_generation(
 
 
 @pytest.mark.asyncio
+async def test_final_unload_defers_hub_close_while_disarms_pend(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relearn's background disarm keeps the shared hub alive past unload.
+
+    Closing the hub with the retry pending would cancel it and leave the old
+    identity's fail-safe STOP armed on the bridge; the last resolving disarm
+    finishes the deferred cleanup instead.
+    """
+    unsubscribed = 0
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+
+        def unsubscribe() -> None:
+            nonlocal unsubscribed
+            unsubscribed += 1
+
+        return unsubscribe
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        return
+
+    async def unload(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
+        return True
+
+    async def publish(*_args: Any, **_kwargs: Any) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(mqtt, "async_publish", publish)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
+    entry = config_entry("one")
+    add_to_manager(hass, entry)
+    await async_setup_entry(hass, entry)
+    runtime: DomainRuntime = hass.data[DOMAIN]
+
+    request = runtime.hub._start_disarm_request(
+        "bridge-a",
+        "cmd-live",
+        runtime.hub._now() + 30.0,
+    )
+
+    assert await async_unload_entry(hass, entry)
+    # Cleanup deferred: the runtime stays adoptable, subscriptions stay alive
+    # (the disarm ack arrives through them).
+    assert hass.data[DOMAIN] is runtime
+    assert unsubscribed == 0
+    assert runtime.hub.has_pending_disarms is True
+
+    runtime.hub.on_disarmed("bridge-a", "cmd-live")
+    assert request.task is not None
+    await asyncio.wait_for(request.task, timeout=1.0)
+    assert DOMAIN not in hass.data
+    assert unsubscribed == 4
+
+
+@pytest.mark.asyncio
 async def test_retained_discovery_order_and_status_ack_filtering(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,

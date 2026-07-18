@@ -336,9 +336,7 @@ def _prune_stale_cover_devices(hass: HomeAssistant, entry: ZemismartConfigEntry)
     for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
         if (DOMAIN, entry.entry_id) in device.identifiers:
             continue
-        if er.async_entries_for_device(
-            entity_registry, device.id, include_disabled_entities=True
-        ):
+        if er.async_entries_for_device(entity_registry, device.id, include_disabled_entities=True):
             continue
         device_registry.async_remove_device(device.id)
 
@@ -358,6 +356,30 @@ def _cleanup_domain_runtime(hass: HomeAssistant, runtime: DomainRuntime) -> None
     runtime.hub.close()
     if hass.data.get(DOMAIN) is runtime:
         hass.data.pop(DOMAIN)
+
+
+def _release_domain_runtime(hass: HomeAssistant, runtime: DomainRuntime) -> None:
+    """Clean up now, or defer until pending bridge disarms resolve.
+
+    A relearn's disarm retries deliberately outlive the flow's bounded wait;
+    closing the hub with them pending would cancel the retries and leave the
+    old identity's fail-safe STOP armed on the bridge. The runtime therefore
+    stays adoptable in hass.data — the reload this flow triggered picks it up
+    with its MQTT subscriptions intact (disarm acks arrive through them). If
+    nothing adopts it, the last resolving disarm finishes the cleanup.
+    """
+    if not runtime.hub.has_pending_disarms:
+        _cleanup_domain_runtime(hass, runtime)
+        return
+
+    def _finish() -> None:
+        if runtime.loaded_entries or runtime.setup_users:
+            return
+        if hass.data.get(DOMAIN) is not runtime:
+            return
+        _cleanup_domain_runtime(hass, runtime)
+
+    runtime.hub.set_disarm_idle_callback(_finish)
 
 
 async def async_setup_entry(
@@ -405,7 +427,7 @@ async def async_setup_entry(
         finally:
             runtime.setup_users -= 1
             if failed and not retry and not runtime.loaded_entries and runtime.setup_users == 0:
-                _cleanup_domain_runtime(hass, runtime)
+                _release_domain_runtime(hass, runtime)
 
 
 async def async_unload_entry(
@@ -428,5 +450,5 @@ async def async_unload_entry(
             return False
         runtime.loaded_entries.discard(entry.entry_id)
         if not runtime.loaded_entries and runtime.setup_users == 0:
-            _cleanup_domain_runtime(hass, runtime)
+            _release_domain_runtime(hass, runtime)
         return True

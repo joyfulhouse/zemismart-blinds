@@ -4075,6 +4075,36 @@ async def test_disarm_remote_awaits_acknowledged_bridge_disarms() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disarm_idle_callback_fires_once_when_last_request_resolves() -> None:
+    """Pending disarms are reported, and draining fires the one-shot callback."""
+
+    async def publisher(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(BridgeRegistry(), publisher)
+    assert hub.has_pending_disarms is False
+
+    request = hub._start_disarm_request("bridge-a", "cmd-live", hub._now() + 30.0)
+    assert hub.has_pending_disarms is True
+
+    fired: list[int] = []
+    hub.set_disarm_idle_callback(lambda: fired.append(1))
+    hub.on_disarmed("bridge-a", "cmd-live")
+    assert request.task is not None
+    await asyncio.wait_for(request.task, timeout=1.0)
+    assert fired == [1]
+    assert hub.has_pending_disarms is False
+
+    # One-shot: a later drain must not re-fire the consumed callback.
+    second = hub._start_disarm_request("bridge-a", "cmd-live-2", hub._now() + 30.0)
+    hub.on_disarmed("bridge-a", "cmd-live-2")
+    assert second.task is not None
+    await asyncio.wait_for(second.task, timeout=1.0)
+    assert fired == [1]
+    hub.close()
+
+
+@pytest.mark.asyncio
 async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
     """A fast-lane STOP still waiting on publish barriers drains too."""
     release = asyncio.Event()
