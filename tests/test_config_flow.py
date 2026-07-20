@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from homeassistant import config_entries, loader
@@ -1878,3 +1878,48 @@ async def test_learn_ignores_our_own_transmission_echo(
     await hub.async_transmit(blind, "UP", stop_after_ms=None)
 
     assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is True
+
+
+@pytest.mark.asyncio
+async def test_sniff_handler_skips_our_echo_but_accepts_a_real_press(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard HANDLER itself must consult _is_own_emission, not just exist."""
+    from types import SimpleNamespace
+
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    session_id = "session-echo"
+    flow._sniff_session_id = session_id
+    topic = "rf433/rf433-bridge-office/rx"
+
+    def deliver(future: asyncio.Future[Any]) -> None:
+        config_flow_module._handle_sniff_message(
+            flow,
+            session_id,
+            topic,
+            future,
+            cast(
+                "ReceiveMessage",
+                SimpleNamespace(
+                    topic=topic,
+                    payload=json.dumps({"frame": TEST_CH12_UP_B0}),
+                    retain=False,
+                ),
+            ),
+        )
+
+    # Classified as our own echo -> the capture is dropped.
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: True)
+    echo_future: asyncio.Future[Any] = hass.loop.create_future()
+    deliver(echo_future)
+    assert not echo_future.done(), "our own transmission must not be learned"
+
+    # Classified as foreign -> it is a real remote press and gets captured.
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
+    press_future: asyncio.Future[Any] = hass.loop.create_future()
+    deliver(press_future)
+    assert press_future.done()
+    assert press_future.result().button == "UP"
+    echo_future.cancel()

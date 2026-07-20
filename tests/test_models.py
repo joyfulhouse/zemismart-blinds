@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final
 
@@ -4219,3 +4220,72 @@ def test_frame_is_own_emission_ignores_undecodable_and_foreign_frames() -> None:
         )
         is False
     )
+
+
+def test_timed_move_envelope_stops_at_the_preempting_stop_deadline() -> None:
+    """An armed timed STOP preempts action repeats, so the window must shrink."""
+    registry = _online_registry()
+    published: list[dict[str, Any]] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        body = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    # 20 repeats would nominally hold the UP/DOWN signature for 20 s, but the
+    # firmware promotes to STOP at 1 s and stops sending the action frame.
+    config = replace(blind_config(), repeats=20)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "command-timed",
+        now=lambda: clock["now"],
+    )
+    asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=1_000))
+    action_raw = published[0]["raw"]
+    assert isinstance(action_raw, str)
+
+    # Shortly after the deadline the action frame is still plausibly ours.
+    clock["now"] = 1_001.5
+    assert hub.frame_is_own_emission(action_raw) is True
+    # Long after the preempting STOP, a same-direction press is a REAL press
+    # and must not be swallowed as our own echo.
+    clock["now"] = 1_010.0
+    assert hub.frame_is_own_emission(action_raw) is False
+
+
+def test_pending_command_is_not_proof_of_emission() -> None:
+    """An accepted-but-never-started command must not mask a real press.
+
+    The masking window is WHILE the command is pending, so the check has to
+    happen mid-flight -- after the timeout the entry is retired anyway and the
+    bug is invisible.
+    """
+    registry = _online_registry()
+    verdict: dict[str, bool] = {}
+    clock = {"now": 500.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        # Acknowledge admission but NEVER report `started`: published and
+        # pending, with no proof it ever keyed RF. Sample the classification
+        # right here, inside the pending window.
+        body = json.loads(payload)
+        hub.handle_status("bridge-a", bytearray(json.dumps(accepted(body)).encode()))
+        raw = body["raw"]
+        assert isinstance(raw, str)
+        verdict["pending_masks"] = hub.frame_is_own_emission(raw)
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        ack_timeout=0.05,
+        started_timeout=0.05,
+        command_id_factory=lambda: "command-pending",
+        now=lambda: clock["now"],
+    )
+    with suppress(CommandStartedTimeoutError, CommandAckTimeoutError):
+        asyncio.run(hub.async_transmit(blind_config(), "UP", stop_after_ms=None))
+
+    assert verdict, "publish should have run"
+    assert verdict["pending_masks"] is False

@@ -1087,17 +1087,25 @@ class ZemismartHub:
         return self._ledger.command_live_for_takeover(command_id, self._now())
 
     def frame_is_own_emission(self, frame_hex: str) -> bool:
-        """Return whether a captured frame is one this hub is transmitting now.
+        """Return whether a captured frame is one this hub PROVABLY put on air.
 
         The Learn wizard sniffs raw RF and cannot otherwise tell a human's
         remote press from our OWN frame echoing back off the sniffing bridge,
         so a command in flight during the wizard could be learned as if it
         were the user's remote.
+
+        Only a CONFIRMED emission counts. A pending command has been published
+        but has not reported `started`, so there is no proof it ever keyed RF
+        -- and unlike state sync, which holds a capture and re-evaluates it,
+        Learn discards permanently. An accepted-but-never-started command
+        would otherwise mask every matching press for the whole 30 s started
+        timeout, burning the user's entire Learn attempt.
         """
         signature = frame_signature(frame_hex)
         if signature is None:
             return False
-        return self._ledger.match(signature, self._now()) is not None
+        match = self._ledger.match(signature, self._now())
+        return match is not None and match[0] == "confirmed"
 
     def _record_emission_proof(self, command_id: str) -> None:
         """Remember proof and notify only command-id-aware cover listeners."""
@@ -2095,12 +2103,22 @@ class ZemismartHub:
         action_signature = frame_signature(action_raw)
         if action_signature is None:
             return None
-        airtime_ms = _ledger_airtime_ms(command.body.get("repeats"))
+        train_ms = _ledger_airtime_ms(command.body.get("repeats"))
+        # An armed timed STOP PREEMPTS the remaining action/trailer repeats:
+        # at the deadline the firmware promotes the command to Phase::STOP and
+        # dispatches STOP ahead of normal work. Charging the full repeat train
+        # anyway would keep classifying the UP/DOWN signature as our own long
+        # after we stopped sending it -- discarding a real remote press (and,
+        # in the Learn wizard, discarding it permanently). Allow one extra
+        # slot for the frame already in flight at the deadline.
+        action_ms = train_ms
+        if command.stop_after_ms is not None:
+            action_ms = min(train_ms, command.stop_after_ms + _LEDGER_REPEAT_AIRTIME_MS)
         frames = [
             LedgerFrameSpec(
                 signature=action_signature,
                 offset_ms=0,
-                airtime_ms=airtime_ms,
+                airtime_ms=action_ms,
             )
         ]
         for body_field in ("trailer_raw", "stop_raw"):
@@ -2116,7 +2134,9 @@ class ZemismartHub:
                 LedgerFrameSpec(
                     signature=signature,
                     offset_ms=offset_ms,
-                    airtime_ms=airtime_ms,
+                    # The STOP train runs to completion; only the pre-deadline
+                    # action/trailer phases get preempted by the deadline.
+                    airtime_ms=train_ms if body_field == "stop_raw" else action_ms,
                 )
             )
         return action_signature[2], frames

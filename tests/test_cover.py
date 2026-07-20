@@ -27,7 +27,7 @@ from custom_components.zemismart_blinds.state_sync import HeardEvent
 from tests.synthetic import TEST_ACTION_BASES, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import EntityPlatform
@@ -4498,3 +4498,49 @@ async def test_covers_go_unavailable_when_ha_loses_the_broker(
         assert aggregate.available is False
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_broker_drop_rerenders_cover_availability(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection-status subscription must be wired and released."""
+    from homeassistant.components import mqtt
+
+    subscribers: list[Callable[[bool], None]] = []
+    unsubscribed: list[Callable[[bool], None]] = []
+
+    def fake_subscribe(_hass: object, callback_fn: Callable[[bool], None]):
+        subscribers.append(callback_fn)
+        return lambda: unsubscribed.append(callback_fn)
+
+    monkeypatch.setattr(mqtt, "async_subscribe_connection_status", fake_subscribe)
+
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        # Every entity registered a connection-status callback.
+        assert len(subscribers) == 3
+
+        writes: list[str] = []
+        for entity in (leaf_one, leaf_two, aggregate):
+            monkeypatch.setattr(
+                entity,
+                "async_write_ha_state",
+                lambda entity=entity: writes.append(entity.entity_id),
+            )
+        # A broker drop must push new state, not wait for an unrelated event.
+        for notify in subscribers:
+            notify(False)
+        assert len(writes) == 3
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+
+    # ...and every callback is released on teardown.
+    assert len(unsubscribed) == 3

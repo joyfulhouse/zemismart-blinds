@@ -322,9 +322,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
-        self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
         restore_guard = (self._intent_generation, self._restore_epoch)
         await self._async_restore_state(restore_guard)
+        # Subscribed LAST, after every await: if restoration raises, HA logs the
+        # entity-add failure without immediately calling
+        # async_will_remove_from_hass(), so a callback registered beforehand
+        # stays on the MQTT dispatcher until a later platform unload.
+        self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
 
     async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
         """Restore one stopped estimate or complete started motion."""
