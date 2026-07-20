@@ -4467,3 +4467,34 @@ async def test_aggregate_takeover_state_expires_and_tracks_heard_stop(
         assert aggregate._takeover_state().stopped_by_heard is True
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_covers_go_unavailable_when_ha_loses_the_broker(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retained bridge beacons must not keep covers available with MQTT down."""
+    from homeassistant.components import mqtt
+
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        # The bridge's retained availability still says online...
+        assert all(bridge.online for bridge in hub.registry.bridges)
+        assert leaf_one.available is True
+        assert aggregate.available is True
+
+        # ...but with HA's own client down, nothing can reach the air.
+        monkeypatch.setattr(mqtt, "is_connected", lambda _hass: False)
+
+        assert leaf_one.available is False
+        assert leaf_two.available is False
+        assert aggregate.available is False
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)

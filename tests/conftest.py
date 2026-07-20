@@ -61,4 +61,12 @@ def _mqtt_client_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     async def ready(_hass: object) -> bool:
         return True
 
+    def connected(_hass: object) -> bool:
+        return True
+
     monkeypatch.setattr(mqtt, "async_wait_for_mqtt_client", ready, raising=False)
+    # Entity availability consults the live client. Tests that build entities
+    # directly never set up the mqtt integration, so the real is_connected
+    # would raise KeyError on hass.data; production is safe because
+    # manifest `dependencies: ["mqtt"]` keeps mqtt loaded under our entries.
+    monkeypatch.setattr(mqtt, "is_connected", connected, raising=False)

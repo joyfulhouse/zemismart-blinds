@@ -68,6 +68,31 @@ WALL_CLOCK = time.time
 _UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
 
 
+def _rf_reachable(hass: HomeAssistant, hub: ZemismartHub) -> bool:
+    """Return whether a command issued right now could physically reach the air."""
+    from homeassistant.components import mqtt
+
+    # Bridge availability is learned from RETAINED LWT beacons, so every bridge
+    # keeps reporting `online` from cached state after HA's own broker link
+    # drops -- covers stayed available while nothing could reach a bridge. The
+    # local client state is the other half of the path and must be gated too.
+    return mqtt.is_connected(hass) and any(bridge.online for bridge in hub.registry.bridges)
+
+
+def _subscribe_rf_reachability(hass: HomeAssistant, entity: CoverEntity) -> Callable[[], None]:
+    """Re-render one entity's availability when the broker link flips."""
+    from homeassistant.components import mqtt
+
+    @callback
+    def _on_connection_change(_connected: bool) -> None:
+        # _rf_reachable() reads the live client state; this only schedules the
+        # write. Without it a broker drop leaves every cover rendered available
+        # until some unrelated event happens to rewrite the entity.
+        entity.async_write_ha_state()
+
+    return mqtt.async_subscribe_connection_status(hass, _on_connection_change)
+
+
 @dataclass(frozen=True, slots=True)
 class _MotionStart:
     """Carry model timing and provenance independently of a transport ack."""
@@ -210,6 +235,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._intent_generation = 0
         self._restore_epoch = 0
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
+        self._unsubscribe_mqtt_status: Callable[[], None] | None = None
         self._stopped_by_heard = False
         # Serializes this entity's own commands: without it, a set_position
         # racing an unstarted open/close computes travel from a stale
@@ -234,8 +260,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     @property
     def available(self) -> bool:
-        """Reflect whether any RF bridge is currently online."""
-        return any(bridge.online for bridge in self._hub.registry.bridges)
+        """Reflect whether any RF bridge is reachable over a live broker link."""
+        return _rf_reachable(self.hass, self._hub)
 
     @property
     def current_cover_position(self) -> int | None:
@@ -296,6 +322,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
+        self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
         restore_guard = (self._intent_generation, self._restore_epoch)
         await self._async_restore_state(restore_guard)
 
@@ -454,6 +481,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._hub.emission_proof_listeners.remove(self._on_emission_proof)
         if self._on_bridge_change in self._hub.bridge_listeners:
             self._hub.bridge_listeners.remove(self._on_bridge_change)
+        if self._unsubscribe_mqtt_status is not None:
+            self._unsubscribe_mqtt_status()
+            self._unsubscribe_mqtt_status = None
         self._cancel_motion_task()
         await super().async_will_remove_from_hass()
 
@@ -1098,6 +1128,7 @@ class ZemismartAggregateCover(CoverEntity):
         self._stopped_by_heard = False
         self._fanout_tasks: set[asyncio.Task[None]] = set()
         self._unsubscribe_rx_listener: Callable[[], None] | None = None
+        self._unsubscribe_mqtt_status: Callable[[], None] | None = None
         # Serializes the aggregate's own single-frame commands. Position
         # fan-out deliberately runs OUTSIDE this lock so STOP never queues
         # behind an in-flight fan-out (it cancels the fan-out instead).
@@ -1125,12 +1156,16 @@ class ZemismartAggregateCover(CoverEntity):
             takeover_state=self._takeover_state,
             invalidate_takeover=self._invalidate_for_takeover,
         )
+        self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
 
     async def async_will_remove_from_hass(self) -> None:
         """Unregister and cancel any in-flight fan-out."""
         if self._unsubscribe_rx_listener is not None:
             self._unsubscribe_rx_listener()
             self._unsubscribe_rx_listener = None
+        if self._unsubscribe_mqtt_status is not None:
+            self._unsubscribe_mqtt_status()
+            self._unsubscribe_mqtt_status = None
         self._coordinator.unregister_aggregate(self._subentry_id)
         self._cancel_fanout()
         await super().async_will_remove_from_hass()
@@ -1145,7 +1180,7 @@ class ZemismartAggregateCover(CoverEntity):
     @property
     def available(self) -> bool:
         """Available while RF works and at least one member is registered."""
-        return bool(self._members()) and any(bridge.online for bridge in self._hub.registry.bridges)
+        return bool(self._members()) and _rf_reachable(self.hass, self._hub)
 
     @property
     def current_cover_position(self) -> int | None:

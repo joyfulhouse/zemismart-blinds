@@ -84,12 +84,35 @@ _EMISSION_PROOF_MAX_ENTRIES: Final = 256
 _DISARM_RETRY_SECONDS: Final = 0.25
 _DISARM_RETRY_MAX_SECONDS: Final = 5.0
 _PRESTART_DISARM_DEADLINE_SECONDS: Final = 10.0
+# Emission envelope charged to ONE repeat of a movement frame: the bridge's
+# airtime-paced scheduler holds the air for serialization + ~550 ms of AOK
+# airtime (embedded hardware repeat 8) + margin per copy, and only then
+# dispatches the next. 1 s per repeat carries that with headroom.
+_LEDGER_REPEAT_AIRTIME_MS: Final = 1_000
+# Floor on the whole train, so the production repeats=2 envelope is exactly the
+# 2 s this was fixed at before repeats was taken into account.
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _PRESS_SEQ_CAP: Final = 512
 _UINT32_MAX: Final = (1 << 32) - 1
 _MAX_STARTED_AGE_MS: Final = 7_200_000
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
 _STARTED_PROJECTION_TOLERANCE_SECONDS: Final = 30.0
+
+
+def _ledger_airtime_ms(repeats: object) -> int:
+    """Return the emission envelope one frame's full repeat train occupies.
+
+    The bridge sends `repeats` copies of every frame, so a fixed envelope
+    under-covers the tail of any command configured above the production
+    default: our own late copies then fall outside the ledger window, get
+    classified as a PHYSICAL remote press, and spuriously take the cover over.
+    Widening is the safe direction -- an over-wide window only suppresses
+    takeover detection while we are demonstrably still transmitting.
+    """
+    if isinstance(repeats, bool) or not isinstance(repeats, int):
+        return _LEDGER_FRAME_AIRTIME_MS
+    bounded = min(max(repeats, MIN_REPEATS), MAX_REPEATS)
+    return max(_LEDGER_FRAME_AIRTIME_MS, bounded * _LEDGER_REPEAT_AIRTIME_MS)
 
 
 def _strict_uint32(value: object) -> int | None:
@@ -1062,6 +1085,19 @@ class ZemismartHub:
     def command_takeover_live(self, command_id: str) -> bool:
         """Return whether a cover-owned command can still affect takeover."""
         return self._ledger.command_live_for_takeover(command_id, self._now())
+
+    def frame_is_own_emission(self, frame_hex: str) -> bool:
+        """Return whether a captured frame is one this hub is transmitting now.
+
+        The Learn wizard sniffs raw RF and cannot otherwise tell a human's
+        remote press from our OWN frame echoing back off the sniffing bridge,
+        so a command in flight during the wizard could be learned as if it
+        were the user's remote.
+        """
+        signature = frame_signature(frame_hex)
+        if signature is None:
+            return False
+        return self._ledger.match(signature, self._now()) is not None
 
     def _record_emission_proof(self, command_id: str) -> None:
         """Remember proof and notify only command-id-aware cover listeners."""
@@ -2059,11 +2095,12 @@ class ZemismartHub:
         action_signature = frame_signature(action_raw)
         if action_signature is None:
             return None
+        airtime_ms = _ledger_airtime_ms(command.body.get("repeats"))
         frames = [
             LedgerFrameSpec(
                 signature=action_signature,
                 offset_ms=0,
-                airtime_ms=_LEDGER_FRAME_AIRTIME_MS,
+                airtime_ms=airtime_ms,
             )
         ]
         for body_field in ("trailer_raw", "stop_raw"):
@@ -2079,7 +2116,7 @@ class ZemismartHub:
                 LedgerFrameSpec(
                     signature=signature,
                     offset_ms=offset_ms,
-                    airtime_ms=_LEDGER_FRAME_AIRTIME_MS,
+                    airtime_ms=airtime_ms,
                 )
             )
         return action_signature[2], frames

@@ -1815,3 +1815,66 @@ async def test_reconfigure_relearn_collision_aborts(
     assert result["reason"] == "already_configured"
     assert dict(entry.data) == original_data
     assert entry.unique_id == "a1b2c3:42"
+
+
+@pytest.mark.asyncio
+async def test_learn_ignores_our_own_transmission_echo(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command we are transmitting must not be learned as a remote press."""
+    from types import SimpleNamespace
+
+    from custom_components.zemismart_blinds.models import (
+        BridgeRegistry,
+        RemoteRuntime,
+        ZemismartHub,
+    )
+
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_availability("bridge-a", "online")
+
+    async def publish(topic: str, payload: str) -> None:
+        """Complete both firmware lifecycle statuses for the published command."""
+        body = json.loads(payload)
+        bridge_id = topic.split("/")[1]
+        for status in ("accepted", "started"):
+            hub.handle_status(
+                bridge_id,
+                bytearray(
+                    json.dumps({"status": status, "command_id": body["command_id"]}).encode()
+                ),
+            )
+
+    hub = ZemismartHub(registry, publish)
+    remote = RemoteConfig(
+        name="Living Room",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    entry = SimpleNamespace(runtime_data=RemoteRuntime(remote=remote, hub=hub))
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_entries",
+        lambda _domain: [entry],
+    )
+    blind = BlindConfig(
+        name="Living Room",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1, 2),
+        travel_up=14.0,
+        travel_down=13.0,
+        area_id="living_room",
+        repeats=2,
+    )
+
+    # Before we transmit, an identical capture is a genuine remote press.
+    assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is False
+
+    # Transmitting it makes the very same capture our own echo off the bridge.
+    await hub.async_transmit(blind, "UP", stop_after_ms=None)
+
+    assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is True

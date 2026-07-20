@@ -4142,3 +4142,80 @@ def test_ledger_disarm_deadline_extends_to_window_end() -> None:
     assert deadline > 140.0
     # Unknown commands keep the fallback.
     assert ledger.disarm_deadline("cmd-unknown", fallback=7.0) == 7.0
+
+
+def _online_registry(bridge_id: str = "bridge-a") -> BridgeRegistry:
+    """Return one same-area online bridge."""
+    registry = BridgeRegistry()
+    registry.update_info(bridge_id, {"area": "living_room"})
+    registry.update_availability(bridge_id, "online")
+    return registry
+
+
+async def _noop_publish(_topic: str, _payload: str) -> None:
+    """Accept a publish without a transport or a lifecycle response."""
+
+
+@pytest.mark.parametrize(
+    ("repeats", "expected_ms"),
+    [
+        (None, 2_000),
+        ("2", 2_000),
+        (True, 2_000),
+        (1, 2_000),
+        (2, 2_000),
+        (5, 5_000),
+        (20, 20_000),
+        (999, 20_000),
+        (-3, 2_000),
+    ],
+)
+def test_ledger_airtime_tracks_repeats_and_clamps(repeats: object, expected_ms: int) -> None:
+    """The emission envelope covers the whole repeat train, never less than 2 s."""
+    assert models_module._ledger_airtime_ms(repeats) == expected_ms
+
+
+def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
+    """A high-repeats command's tail echo stays recognized as our own emission."""
+    registry = _online_registry()
+    published: list[tuple[str, dict[str, Any]]] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        body = json.loads(payload)
+        published.append((topic, body))
+        accept_and_start(hub, "bridge-a", body)
+
+    # 20 repeats keeps the bridge on air for roughly 12 s; the ledger's old
+    # fixed 2 s envelope expired mid-train and reclassified our own remaining
+    # copies as a physical remote takeover.
+    config = replace(blind_config(), repeats=20)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "command-repeats",
+        now=lambda: clock["now"],
+    )
+    asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=None))
+    action_raw = published[0][1]["raw"]
+    assert isinstance(action_raw, str)
+
+    # Still inside the envelope 10 s after handoff.
+    clock["now"] = 1_010.0
+    assert hub.frame_is_own_emission(action_raw) is True
+    # Well past the whole train, a genuine press is no longer masked.
+    clock["now"] = 1_100.0
+    assert hub.frame_is_own_emission(action_raw) is False
+
+
+def test_frame_is_own_emission_ignores_undecodable_and_foreign_frames() -> None:
+    """Only frames this hub actually put on air count as its own emission."""
+    hub = ZemismartHub(_online_registry(), _noop_publish)
+
+    assert hub.frame_is_own_emission("not-a-frame") is False
+    assert (
+        hub.frame_is_own_emission(
+            encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+        )
+        is False
+    )
