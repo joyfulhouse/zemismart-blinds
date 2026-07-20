@@ -1,11 +1,20 @@
 # Bridge overlap graph — measured 2026-07-20
 
-Empirical answer to open question #1 of
+Partial evidence toward open question #1 of
 [the air arbitration design](2026-07-20-cross-bridge-air-arbitration-design.md):
 *should all seven bridges be serialized conservatively, or is the scene skew bad
 enough to justify measuring and configuring an overlap graph?*
 
-**Answer: serialize conservatively. The overlap graph is not worth building.**
+**Answer: start with one conservative collision domain — because this evidence
+cannot certify safe concurrency, not because concurrency was shown worthless.
+Phase 3.3 stays on the table.**
+
+> **This document was corrected after adversarial review.** Its first version
+> concluded "the conflict graph is not worth building; drop Phase 3.3." That
+> conclusion was wrong on two counts: it used the wrong graph metric (max
+> independent set instead of chromatic number), and it treated two sweeps as
+> sufficient to certify a non-edge. Both errors are documented below rather
+> than quietly edited out. Review session `019f8183-0f27-7461-8043-6114c1188da5`.
 
 ## Method
 
@@ -21,82 +30,141 @@ against the transmitted frame does not work.
 Script: session scratchpad `overlap_graph.py`. Two valid runs.
 
 > **Gotcha worth remembering:** the firmware replay ring remembers recent
-> `command_id`s. A second run reusing `overlap-probe-{i}` was silently rejected
+> `command_id`s. A run reusing `overlap-probe-{i}` was silently rejected
 > fleet-wide as QoS-1 redeliveries and transmitted **nothing** — producing a
 > perfect all-zeros matrix that looks like "no bridge can hear any other."
 > Probe ids must be unique per run.
 
-## Result
+### Probe representativeness — verified, no bias
 
-18 of 21 bridge pairs conflict in **both** runs (86%).
+This was the main threat to validity and it does not materialize. All 32
+production UP/DOWN frames for the ten remotes were reconstructed and compared:
+
+| Metric | Probe | All production UP/DOWN frames |
+|---|---:|---:|
+| Encoded length | 162 hex chars / 81 bytes | 162 / 81 |
+| RF interval | 560,160 µs | 560,160 µs |
+| UART time | 43 ms | 43 ms |
+| Firmware slot | 609 ms | 609 ms |
+
+The fixed 64-bit encoder and bucket table mean payload contents reorder pulses
+without changing total duration. Carrier-high time: probe 292,320 µs vs
+production range 278,720–316,800 µs — comfortably inside. No length bias.
+
+## Result
 
 | measure | value |
 |---|---:|
 | conflicting pairs, run 1 | 18/21 |
 | conflicting pairs, run 2 | 18/21 |
-| edges present in both runs | 17 |
-| edges appearing in only one run | 2 |
+| edges present in **both** runs (intersection) | **17** |
+| edges present in **either** run (union) | **19** |
+| non-conflicting in both runs | **2** |
 
-Marginal, run-to-run unstable links: `starrys-office ↔ sunroom`,
-`sunroom ↔ kitchen`.
+Run-to-run unstable links: `kitchen ↔ sunroom`, `starrys-office ↔ sunroom`
+(one run each).
 
-**Non-conflicting in both runs — only two pairs:**
+**Non-conflicting in both runs:** `living-room ↔ sunroom`,
+`master-bedroom ↔ starrys-office`.
 
-- `living-room ↔ sunroom`
-- `master-bedroom ↔ starrys-office`
+## Graph metrics — independent set is the WRONG metric
 
-**Maximum set that may transmit concurrently: 2 bridges.** The two isolated
-pairs do not combine into any larger independent set.
+| Graph | Edges | α (max independent set) | χ (chromatic number) |
+|---|---:|---:|---:|
+| Run 1 | 18 | 2 | 5 |
+| Run 2 | 18 | 2 | 5 |
+| Intersection | 17 | 2 | 5 |
+| Union (conservative) | 19 | 2 | 5 |
 
-## Why this kills the conflict-graph optimization
+α = 2 says only two bridges may transmit *simultaneously*. But the scheduling
+question is how many **rounds** are needed to get everyone through, which is
+the chromatic number. A five-colouring of the conservative union graph:
 
-A conflict graph buys concurrency proportional to the size of its independent
-sets. At a maximum independent set of 2 — and only two stable pairs, neither
-guaranteed to be the pair a given scene needs — the best case halves
-serialization for a minority of command combinations, in exchange for
-per-deployment RF calibration that must be re-measured whenever a bridge moves.
+1. living-room + sunroom
+2. master-bedroom + starrys-office
+3. kaelyn
+4. kitchen
+5. office
 
-That is not a good trade. Phase 3.3 of the design should be dropped, and the
-single-collision-domain default retained.
+With 1.218 s action trains and a 100 ms guard, all-seven last-start latency:
 
-## The measurement understates conflict
+- fully serial: 6 × 1.318 = **7.908 s**
+- five rounds: 4 × 1.318 = **5.272 s**
 
-Two reasons the true collision domain is at least this connected, probably more:
+That is a **33% reduction**, not a marginal one. The first version of this
+document reasoned from α and wrongly concluded the optimization was dead.
 
-1. **Decode threshold is stricter than interference threshold.** A bridge that
-   cannot *demodulate* a peer may still *degrade* that peer's reception at a
-   receiver. Measured audibility is a lower bound on interference.
-2. **Bridges are not blinds.** This is bridge-to-bridge audibility, a proxy for
-   what actually matters — whether a *blind* can hear two bridges. Blinds sit at
-   different locations than the bridges serving them.
+Implementing it is not free: the hub's worker currently awaits each command's
+first `started` before taking the next (`models.py:2048`), so concurrent rounds
+need scheduler changes. That cost should be weighed explicitly — but on its
+merits, not dismissed via α.
 
-Both push the same way: treat the house as one collision domain.
+## Why this still cannot certify concurrency
 
-## Correction to the design's latency estimate
+**1. Audibility is neither necessary nor sufficient for a collision at a blind.**
+The experiment never transmitted two frames simultaneously and never observed a
+blind. It measured whether bridge B can decode bridge A *in isolation*.
 
-The design computes scene latency from **7 bridges**. Arbitration serializes
-**command trains**, and the house has **10 distinct remotes**
-(`5cad7c:da` alone backs 7 covers, the other nine back one each). With
-per-remote coalescing, a whole-house scene is ~10 trains, not 7.
+The earlier claim that both uncertainties "push the same way" (i.e. that decode
+success is a lower bound on interference) is **false**:
 
-Exactly one remote (`5cad7c:da`, office) is calibrated with a `base_trailer`;
-the other nine are action-only.
+- a signal too weak to decode alone can still raise the error rate of a desired
+  signal near sensitivity — pushing toward *more* conflict; but
+- **capture effect** means a peer that decodes perfectly alone may cause no
+  failure when the desired transmitter is substantially stronger — making an
+  audible edge a *false* conflict;
+- AGC and preamble acquisition make the outcome timing-dependent.
 
-| | design estimate | measured basis |
-|---|---:|---:|
-| whole-house close | ~7.8 s | **~13.2 s** (9 × ~1.2 s + 1 × ~2.4 s) |
+So the measured graph bounds the real one in neither direction.
 
-The real number is worse than specced. It should be stated as ~13 s before
-anyone signs off on the trade.
+**2. Bridges are not blinds.** What matters for a blind served by bridge B is
+the desired B→blind signal relative to the interfering A→blind signal. A→B
+audibility does not determine that ratio. The blind-level graph may be
+materially sparser *or* denser, and it can be target-specific and directional.
 
-## What this means for the recommendation
+**3. Two sweeps cannot certify a non-edge.** Every cell carries 0–1
+observations (`repeats: 2` did not yield two recorded captures). After zero
+detections, one-sided 95% bounds are:
 
-- Keep the single conservative collision domain; drop the conflict graph.
-- The lever for latency is **reducing airtime per scene**, not parallelizing:
-  fewer trains (coalescing already helps), and trailers only where a remote
-  genuinely needs one.
-- The cost lands almost entirely on **unattended** scene automations. A single
-  interactive tap still publishes immediately — the design's first-command
-  fast path is unaffected. "Blinds close over ~13 s" is a different and
-  arguably better failure mode than "blinds close at once and one to three
-  silently miss."
+| trials with zero detections | true detection rate could still be as high as |
+|---:|---:|
+| 0/2 | 77.6% |
+| 0/4 | 52.7% |
+
+Bounding a pair under 10% at 95% needs ~29 zero-event trials; under 5%, ~59 —
+and ~58/~118 after correcting across 21 pairs. Claiming a blind-level miss rate
+below 1% would need roughly 300 independent collision tests. Those must be
+**blind-level simultaneous-transmission** tests across varied start offsets;
+more passive bridge decodes cannot validate the missing proxy.
+
+## Scene latency — corrected
+
+The design's ~7.8 s is **last-start** latency. An earlier revision of this
+document compared it against 13.2 s, which summed all ten trains *including the
+last* and omitted guards — different metrics.
+
+Using the design's own model (609 ms slot, 1,218 ms action train, 2,436 ms
+action+trailer):
+
+| scenario | last start |
+|---|---:|
+| trailer command last | 11.862 s |
+| trailer command among the first nine | 13.080 s |
+
+So **~11.9–13.1 s last-start**, with the final RF train finishing ≈14.3 s.
+
+The "ten trains" premise is workload-dependent. Coalescing applies only to
+untimed non-group UP/DOWN commands (`models.py:2458`), and any multi-channel
+cover is a group (`models.py:631`). The office remote has five single-channel
+leaves and two groups, so a scene targeting all 16 entities emits **≥12
+trains**, not 10. Ten holds for a curated one-logical-cover-per-remote scene.
+
+## What to do
+
+- Deploy Phase 2 with **one conservative collision domain**. Justified by
+  inability to certify concurrency, not by concurrency being worthless.
+- Keep **Phase 3.3 open**. χ = 5 offers ~33% last-start reduction if the
+  blind-level graph supports it.
+- Any future attempt to enable spatial reuse must be validated at the
+  **blind level** with simultaneous transmissions and adequate sample size —
+  not by re-running this passive sweep more times.

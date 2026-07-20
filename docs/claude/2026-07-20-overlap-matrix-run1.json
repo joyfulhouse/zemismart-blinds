@@ -1,0 +1,138 @@
+{
+  "bridges": [
+    "rf433-bridge-kaelyn",
+    "rf433-bridge-kitchen",
+    "rf433-bridge-living-room",
+    "rf433-bridge-master-bedroom",
+    "rf433-bridge-office",
+    "rf433-bridge-starrys-office",
+    "rf433-bridge-sunroom"
+  ],
+  "listening": {
+    "rf433-bridge-office": true,
+    "rf433-bridge-starrys-office": true,
+    "rf433-bridge-kaelyn": true,
+    "rf433-bridge-sunroom": true,
+    "rf433-bridge-living-room": true,
+    "rf433-bridge-master-bedroom": true,
+    "rf433-bridge-kitchen": true
+  },
+  "counts": {
+    "rf433-bridge-kaelyn|rf433-bridge-starrys-office": 1,
+    "rf433-bridge-kaelyn|rf433-bridge-office": 1,
+    "rf433-bridge-kaelyn|rf433-bridge-sunroom": 1,
+    "rf433-bridge-kaelyn|rf433-bridge-master-bedroom": 1,
+    "rf433-bridge-kitchen|rf433-bridge-starrys-office": 1,
+    "rf433-bridge-kitchen|rf433-bridge-kaelyn": 1,
+    "rf433-bridge-kitchen|rf433-bridge-master-bedroom": 1,
+    "rf433-bridge-kitchen|rf433-bridge-office": 1,
+    "rf433-bridge-kitchen|rf433-bridge-living-room": 1,
+    "rf433-bridge-living-room|rf433-bridge-kitchen": 1,
+    "rf433-bridge-living-room|rf433-bridge-starrys-office": 1,
+    "rf433-bridge-living-room|rf433-bridge-office": 1,
+    "rf433-bridge-living-room|rf433-bridge-kaelyn": 1,
+    "rf433-bridge-master-bedroom|rf433-bridge-living-room": 1,
+    "rf433-bridge-master-bedroom|rf433-bridge-kaelyn": 1,
+    "rf433-bridge-master-bedroom|rf433-bridge-kitchen": 1,
+    "rf433-bridge-office|rf433-bridge-master-bedroom": 1,
+    "rf433-bridge-office|rf433-bridge-sunroom": 1,
+    "rf433-bridge-starrys-office|rf433-bridge-kaelyn": 1,
+    "rf433-bridge-starrys-office|rf433-bridge-living-room": 1,
+    "rf433-bridge-starrys-office|rf433-bridge-office": 1,
+    "rf433-bridge-starrys-office|rf433-bridge-kitchen": 1,
+    "rf433-bridge-sunroom|rf433-bridge-kitchen": 1,
+    "rf433-bridge-sunroom|rf433-bridge-master-bedroom": 1,
+    "rf433-bridge-sunroom|rf433-bridge-office": 1,
+    "rf433-bridge-sunroom|rf433-bridge-kaelyn": 1,
+    "rf433-bridge-kaelyn|rf433-bridge-kitchen": 0,
+    "rf433-bridge-kaelyn|rf433-bridge-living-room": 0,
+    "rf433-bridge-kitchen|rf433-bridge-sunroom": 0,
+    "rf433-bridge-living-room|rf433-bridge-master-bedroom": 0,
+    "rf433-bridge-living-room|rf433-bridge-sunroom": 0,
+    "rf433-bridge-master-bedroom|rf433-bridge-office": 0,
+    "rf433-bridge-master-bedroom|rf433-bridge-starrys-office": 0,
+    "rf433-bridge-master-bedroom|rf433-bridge-sunroom": 0,
+    "rf433-bridge-office|rf433-bridge-kaelyn": 0,
+    "rf433-bridge-office|rf433-bridge-kitchen": 0,
+    "rf433-bridge-office|rf433-bridge-living-room": 0,
+    "rf433-bridge-office|rf433-bridge-starrys-office": 0,
+    "rf433-bridge-starrys-office|rf433-bridge-master-bedroom": 0,
+    "rf433-bridge-starrys-office|rf433-bridge-sunroom": 0,
+    "rf433-bridge-sunroom|rf433-bridge-living-room": 0,
+    "rf433-bridge-sunroom|rf433-bridge-starrys-office": 0
+  },
+  "conflict_edges": [
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-kitchen"
+    ],
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-living-room"
+    ],
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-master-bedroom"
+    ],
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-office"
+    ],
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-starrys-office"
+    ],
+    [
+      "rf433-bridge-kaelyn",
+      "rf433-bridge-sunroom"
+    ],
+    [
+      "rf433-bridge-kitchen",
+      "rf433-bridge-living-room"
+    ],
+    [
+      "rf433-bridge-kitchen",
+      "rf433-bridge-master-bedroom"
+    ],
+    [
+      "rf433-bridge-kitchen",
+      "rf433-bridge-office"
+    ],
+    [
+      "rf433-bridge-kitchen",
+      "rf433-bridge-starrys-office"
+    ],
+    [
+      "rf433-bridge-kitchen",
+      "rf433-bridge-sunroom"
+    ],
+    [
+      "rf433-bridge-living-room",
+      "rf433-bridge-master-bedroom"
+    ],
+    [
+      "rf433-bridge-living-room",
+      "rf433-bridge-office"
+    ],
+    [
+      "rf433-bridge-living-room",
+      "rf433-bridge-starrys-office"
+    ],
+    [
+      "rf433-bridge-master-bedroom",
+      "rf433-bridge-office"
+    ],
+    [
+      "rf433-bridge-master-bedroom",
+      "rf433-bridge-sunroom"
+    ],
+    [
+      "rf433-bridge-office",
+      "rf433-bridge-starrys-office"
+    ],
+    [
+      "rf433-bridge-office",
+      "rf433-bridge-sunroom"
+    ]
+  ]
+}
