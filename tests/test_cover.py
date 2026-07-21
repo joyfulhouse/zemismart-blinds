@@ -4511,7 +4511,10 @@ async def test_broker_drop_rerenders_cover_availability(
     subscribers: list[Callable[[bool], None]] = []
     unsubscribed: list[Callable[[bool], None]] = []
 
-    def fake_subscribe(_hass: object, callback_fn: Callable[[bool], None]):
+    def fake_subscribe(
+        _hass: object,
+        callback_fn: Callable[[bool], None],
+    ) -> Callable[[], None]:
         subscribers.append(callback_fn)
         return lambda: unsubscribed.append(callback_fn)
 
