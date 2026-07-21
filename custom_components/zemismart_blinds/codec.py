@@ -34,6 +34,13 @@ DEFAULT_BUCKETS: Final = "1414026C01181414"
 _FRAME_BITS: Final = 64
 _MAX_PAYLOAD: Final = (1 << _FRAME_BITS) - 1
 _MAX_B0_FRAME_BYTES: Final = 260
+# Firmware dispatch constants, mirrored from rf433-mqtt-bridge.yaml and
+# rf433_scheduler.h. The whole fleet runs the package default gap with no
+# per-bridge override (verified 2026-07-20); a bridge configured otherwise is
+# outside this estimate and would need scheduler timing in its /info contract.
+FIRMWARE_REPEAT_GAP_MS: Final = 35
+FIRMWARE_UART_BAUD: Final = 19_200
+FIRMWARE_RF_MARGIN_MS: Final = 5
 # Mirrors the firmware's per-handoff limits so a frame the integration accepts
 # is never rejected at the bridge: embedded hardware repeat 1..16, and at most
 # two seconds of requested RF airtime (buckets are 16-bit microsecond values
@@ -332,8 +339,13 @@ def _bucket_data(
     return buckets, pulse_data
 
 
-def _b0_parts(frame: str) -> tuple[list[int], str]:
-    """Validate and extract one exact Portisch B0 envelope."""
+def _b0_parts(frame: str) -> tuple[list[int], str, int]:
+    """Validate and extract one exact Portisch B0 envelope.
+
+    Returns the bucket table, the pulse nibbles, and the embedded hardware
+    repeat count -- the last is needed to derive real airtime and is otherwise
+    only reachable by parsing the header a second time.
+    """
     if not frame.startswith("AAB0"):
         msg = "B0 frame must start with the AAB0 marker"
         raise ValueError(msg)
@@ -370,7 +382,7 @@ def _b0_parts(frame: str) -> tuple[list[int], str]:
     if airtime_us * embedded_repeat > _MAX_B0_AIRTIME_US:
         msg = "B0 frame requested airtime exceeds the limit"
         raise ValueError(msg)
-    return buckets, pulse_data
+    return buckets, pulse_data, embedded_repeat
 
 
 def validate_b0_frame(frame: str) -> str:
@@ -380,10 +392,38 @@ def validate_b0_frame(frame: str) -> str:
     return normalized
 
 
+def estimate_b0_slot_ms(frame: str, *, repeat_gap_ms: int = FIRMWARE_REPEAT_GAP_MS) -> int:
+    """Return how long one dispatch of this frame occupies the RF channel.
+
+    This mirrors the firmware exactly and must stay in step with it. The
+    bridge's TargetScheduler holds the next UART handoff for
+    ``max(repeat_gap_ms, serialize + airtime + margin)`` (``record_dispatch_``
+    in rf433_scheduler.h): the dispatch timestamp is taken BEFORE the ESP
+    serializes the frame, and the EFM8BB1 only keys RF once the trailer byte
+    arrives, so real occupancy is serialization plus airtime.
+
+    Raises ValueError for anything that is not a valid B0 frame rather than
+    guessing -- a wrong estimate here would silently mis-schedule the air.
+    """
+    normalized = _clean_hex(frame)
+    buckets, pulse_data, embedded_repeat = _b0_parts(normalized)
+    airtime_us = sum(buckets[int(nibble, 16) & 0x07] for nibble in pulse_data) * embedded_repeat
+    air_ms = -(-airtime_us // 1_000)
+    if air_ms == 0:
+        # Firmware charges serialization ONLY when the frame will actually key
+        # RF: a zero-airtime frame's bytes drain through the EFM8's ring
+        # without transmitting, so it occupies margin alone (record_dispatch_
+        # in rf433_scheduler.h). Charging UART here would overstate a
+        # maximum-length zero-duration frame as 140 ms against the real 35 ms.
+        return max(repeat_gap_ms, FIRMWARE_RF_MARGIN_MS)
+    uart_ms = -(-len(normalized) * 5_000 // FIRMWARE_UART_BAUD)
+    return max(repeat_gap_ms, uart_ms + air_ms + FIRMWARE_RF_MARGIN_MS)
+
+
 def _raw_parts(frame: str) -> tuple[list[int], str, bool]:
     """Extract Portisch bucket values and pulse nibbles from B0 or B1."""
     if frame.startswith("AAB0"):
-        buckets, pulse_data = _b0_parts(frame)
+        buckets, pulse_data, _embedded_repeat = _b0_parts(frame)
         return buckets, pulse_data, False
     if not frame.startswith("AAB1"):
         msg = "frame does not contain an AAB0 or AAB1 marker"

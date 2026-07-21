@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Literal, cast
 
+from .air import AirArbiter
 from .calibrations import KNOWN_CALIBRATIONS
 from .codec import (
     CommandBases,
@@ -1012,6 +1013,7 @@ class ZemismartHub:
         self._now = now
         self._bridge_clocks: dict[str, BridgeClock] = {}
         self._ledger = CommandLedger()
+        self._air = AirArbiter()
         self._rx_listeners: list[_RxListener] = []
         self._rx_bridge_ids: dict[str, bool] = {}
         self._recent_emission_proofs: dict[str, float] = {}
@@ -1082,6 +1084,14 @@ class ZemismartHub:
         """
         seen = self._recent_displaced.get(command_id)
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
+
+    def air_shadow_stats(self) -> dict[str, object]:
+        """Return what cross-bridge arbitration WOULD have done so far.
+
+        Shadow mode: nothing has been delayed. These counters are the evidence
+        for whether enforcement is worth its latency on this deployment.
+        """
+        return self._air.stats.as_dict()
 
     def command_takeover_live(self, command_id: str) -> bool:
         """Return whether a cover-owned command can still affect takeover."""
@@ -2298,7 +2308,34 @@ class ZemismartHub:
         body["command_id"] = command_id
         payload = json.dumps(body, separators=(",", ":"))
         self._register_command_ledger(command, bridge_id, command_id)
+        self._observe_air(command, bridge_id, body)
         await self._publisher(topic, payload)
+
+    def _observe_air(
+        self,
+        command: _QueuedCommand,
+        bridge_id: str,
+        body: Mapping[str, object],
+    ) -> None:
+        """Record predicted channel occupancy. SHADOW ONLY -- never delays.
+
+        Deliberately best-effort: arbitration is an optimization, and a fault
+        in it must never become a reason a blind fails to move.
+        """
+        try:
+            self._air.observe(
+                bridge_id=bridge_id,
+                body=body,
+                is_stop=command.is_stop,
+                online_bridges=sum(1 for bridge in self.registry.bridges if bridge.online),
+                # MONOTONIC, never self._now(): the hub's clock is wall time,
+                # and an NTP step would prematurely clear or extend the air
+                # horizon. Air scheduling only ever measures local elapsed
+                # time, so it must not be steppable.
+                now=time.monotonic(),
+            )
+        except TypeError, ValueError, AttributeError, KeyError:
+            _LOGGER.debug("air: shadow observation failed", exc_info=True)
 
     async def _enqueue_publish(
         self,
