@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+import voluptuous as vol
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt.models import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
@@ -22,6 +23,7 @@ from custom_components.zemismart_blinds import (
 )
 from custom_components.zemismart_blinds.codec import CommandBases, derive_bases_from_base
 from custom_components.zemismart_blinds.const import (
+    CONF_AIR_ARBITRATION_MODE,
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
@@ -130,6 +132,29 @@ def message(
         subscribed_topic=topic,
         timestamp=timestamp,
     )
+
+
+@pytest.mark.parametrize("mode", ("enforce", "shadow"))
+@pytest.mark.asyncio
+async def test_global_air_arbitration_mode_configures_domain_hub(
+    hass: HomeAssistant,
+    mode: str,
+) -> None:
+    """The one installation-wide YAML escape selects the shared hub mode."""
+    config = {DOMAIN: {CONF_AIR_ARBITRATION_MODE: mode}}
+    assert integration_module.CONFIG_SCHEMA(config) == config
+    assert await async_setup(hass, config)
+    runtime = integration_module._create_domain_runtime(hass)
+    try:
+        assert runtime.hub.air_shadow_stats()["mode"] == mode
+    finally:
+        runtime.hub.close()
+
+
+def test_global_air_arbitration_mode_rejects_unknown_policy() -> None:
+    """Invalid YAML cannot silently select a safety policy."""
+    with pytest.raises(vol.Invalid):
+        integration_module.CONFIG_SCHEMA({DOMAIN: {CONF_AIR_ARBITRATION_MODE: "off"}})
 
 
 @pytest.mark.asyncio
