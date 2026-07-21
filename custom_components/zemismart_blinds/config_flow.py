@@ -295,6 +295,21 @@ def _handle_flow_info(
         )
 
 
+def _is_own_emission(hass: HomeAssistant, frame: str) -> bool:
+    """Return whether any loaded remote is transmitting this frame right now.
+
+    Learning is a raw-RF capture, so a command published by an automation
+    while the wizard is armed comes back off the sniffing bridge looking
+    exactly like a human's remote press. Already-loaded hubs know what they
+    put on air; a first-ever setup has no hub and nothing to confuse.
+    """
+    return any(
+        isinstance(runtime := getattr(entry, "runtime_data", None), RemoteRuntime)
+        and runtime.hub.frame_is_own_emission(frame)
+        for entry in hass.config_entries.async_entries(DOMAIN)
+    )
+
+
 @callback
 def _handle_sniff_message(
     flow: ZemismartBlindsConfigFlow,
@@ -327,7 +342,7 @@ def _handle_sniff_message(
         button = infer_action_button(channels, decoded["cmd"])
     except TypeError, ValueError:
         return
-    if button not in {"UP", "DOWN", "STOP"}:
+    if button not in {"UP", "DOWN", "STOP"} or _is_own_emission(flow.hass, frame):
         return
     capture_future.set_result(
         _LearnCapture(

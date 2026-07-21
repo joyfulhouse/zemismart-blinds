@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from homeassistant import config_entries, loader
@@ -1815,3 +1815,111 @@ async def test_reconfigure_relearn_collision_aborts(
     assert result["reason"] == "already_configured"
     assert dict(entry.data) == original_data
     assert entry.unique_id == "a1b2c3:42"
+
+
+@pytest.mark.asyncio
+async def test_learn_ignores_our_own_transmission_echo(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command we are transmitting must not be learned as a remote press."""
+    from types import SimpleNamespace
+
+    from custom_components.zemismart_blinds.models import (
+        BridgeRegistry,
+        RemoteRuntime,
+        ZemismartHub,
+    )
+
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_availability("bridge-a", "online")
+
+    async def publish(topic: str, payload: str) -> None:
+        """Complete both firmware lifecycle statuses for the published command."""
+        body = json.loads(payload)
+        bridge_id = topic.split("/")[1]
+        for status in ("accepted", "started"):
+            hub.handle_status(
+                bridge_id,
+                bytearray(
+                    json.dumps({"status": status, "command_id": body["command_id"]}).encode()
+                ),
+            )
+
+    hub = ZemismartHub(registry, publish)
+    remote = RemoteConfig(
+        name="Living Room",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        area_id="living_room",
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    entry = SimpleNamespace(runtime_data=RemoteRuntime(remote=remote, hub=hub))
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_entries",
+        lambda _domain: [entry],
+    )
+    blind = BlindConfig(
+        name="Living Room",
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1, 2),
+        travel_up=14.0,
+        travel_down=13.0,
+        area_id="living_room",
+        repeats=2,
+    )
+
+    # Before we transmit, an identical capture is a genuine remote press.
+    assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is False
+
+    # Transmitting it makes the very same capture our own echo off the bridge.
+    await hub.async_transmit(blind, "UP", stop_after_ms=None)
+
+    assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is True
+
+
+@pytest.mark.asyncio
+async def test_sniff_handler_skips_our_echo_but_accepts_a_real_press(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wizard HANDLER itself must consult _is_own_emission, not just exist."""
+    from types import SimpleNamespace
+
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    session_id = "session-echo"
+    flow._sniff_session_id = session_id
+    topic = "rf433/rf433-bridge-office/rx"
+
+    def deliver(future: asyncio.Future[Any]) -> None:
+        config_flow_module._handle_sniff_message(
+            flow,
+            session_id,
+            topic,
+            future,
+            cast(
+                "ReceiveMessage",
+                SimpleNamespace(
+                    topic=topic,
+                    payload=json.dumps({"frame": TEST_CH12_UP_B0}),
+                    retain=False,
+                ),
+            ),
+        )
+
+    # Classified as our own echo -> the capture is dropped.
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: True)
+    echo_future: asyncio.Future[Any] = hass.loop.create_future()
+    deliver(echo_future)
+    assert not echo_future.done(), "our own transmission must not be learned"
+
+    # Classified as foreign -> it is a real remote press and gets captured.
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
+    press_future: asyncio.Future[Any] = hass.loop.create_future()
+    deliver(press_future)
+    assert press_future.done()
+    assert press_future.result().button == "UP"
+    echo_future.cancel()

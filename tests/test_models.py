@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final
 
@@ -4203,3 +4204,149 @@ def test_ledger_disarm_deadline_extends_to_window_end() -> None:
     assert deadline > 140.0
     # Unknown commands keep the fallback.
     assert ledger.disarm_deadline("cmd-unknown", fallback=7.0) == 7.0
+
+
+def _online_registry(bridge_id: str = "bridge-a") -> BridgeRegistry:
+    """Return one same-area online bridge."""
+    registry = BridgeRegistry()
+    registry.update_info(bridge_id, {"area": "living_room"})
+    registry.update_availability(bridge_id, "online")
+    return registry
+
+
+async def _noop_publish(_topic: str, _payload: str) -> None:
+    """Accept a publish without a transport or a lifecycle response."""
+
+
+@pytest.mark.parametrize(
+    ("repeats", "expected_ms"),
+    [
+        (None, 2_000),
+        ("2", 2_000),
+        (True, 2_000),
+        (1, 2_000),
+        (2, 2_000),
+        (5, 5_000),
+        (20, 20_000),
+        (999, 20_000),
+        (-3, 2_000),
+    ],
+)
+def test_ledger_airtime_tracks_repeats_and_clamps(repeats: object, expected_ms: int) -> None:
+    """The emission envelope covers the whole repeat train, never less than 2 s."""
+    assert models_module._ledger_airtime_ms(repeats) == expected_ms
+
+
+def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
+    """A high-repeats command's tail echo stays recognized as our own emission."""
+    registry = _online_registry()
+    published: list[tuple[str, dict[str, Any]]] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        body = json.loads(payload)
+        published.append((topic, body))
+        accept_and_start(hub, "bridge-a", body)
+
+    # 20 repeats keeps the bridge on air for roughly 12 s; the ledger's old
+    # fixed 2 s envelope expired mid-train and reclassified our own remaining
+    # copies as a physical remote takeover.
+    config = replace(blind_config(), repeats=20)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "command-repeats",
+        now=lambda: clock["now"],
+    )
+    asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=None))
+    action_raw = published[0][1]["raw"]
+    assert isinstance(action_raw, str)
+
+    # Still inside the envelope 10 s after handoff.
+    clock["now"] = 1_010.0
+    assert hub.frame_is_own_emission(action_raw) is True
+    # Well past the whole train, a genuine press is no longer masked.
+    clock["now"] = 1_100.0
+    assert hub.frame_is_own_emission(action_raw) is False
+
+
+def test_frame_is_own_emission_ignores_undecodable_and_foreign_frames() -> None:
+    """Only frames this hub actually put on air count as its own emission."""
+    hub = ZemismartHub(_online_registry(), _noop_publish)
+
+    assert hub.frame_is_own_emission("not-a-frame") is False
+    assert (
+        hub.frame_is_own_emission(
+            encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
+        )
+        is False
+    )
+
+
+def test_timed_move_envelope_stops_at_the_preempting_stop_deadline() -> None:
+    """An armed timed STOP preempts action repeats, so the window must shrink."""
+    registry = _online_registry()
+    published: list[dict[str, Any]] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        body = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    # 20 repeats would nominally hold the UP/DOWN signature for 20 s, but the
+    # firmware promotes to STOP at 1 s and stops sending the action frame.
+    config = replace(blind_config(), repeats=20)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: "command-timed",
+        now=lambda: clock["now"],
+    )
+    asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=1_000))
+    action_raw = published[0]["raw"]
+    assert isinstance(action_raw, str)
+
+    # Shortly after the deadline the action frame is still plausibly ours.
+    clock["now"] = 1_001.5
+    assert hub.frame_is_own_emission(action_raw) is True
+    # Long after the preempting STOP, a same-direction press is a REAL press
+    # and must not be swallowed as our own echo.
+    clock["now"] = 1_010.0
+    assert hub.frame_is_own_emission(action_raw) is False
+
+
+def test_pending_command_is_not_proof_of_emission() -> None:
+    """An accepted-but-never-started command must not mask a real press.
+
+    The masking window is WHILE the command is pending, so the check has to
+    happen mid-flight -- after the timeout the entry is retired anyway and the
+    bug is invisible.
+    """
+    registry = _online_registry()
+    verdict: dict[str, bool] = {}
+    clock = {"now": 500.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        # Acknowledge admission but NEVER report `started`: published and
+        # pending, with no proof it ever keyed RF. Sample the classification
+        # right here, inside the pending window.
+        body = json.loads(payload)
+        hub.handle_status("bridge-a", bytearray(json.dumps(accepted(body)).encode()))
+        raw = body["raw"]
+        assert isinstance(raw, str)
+        verdict["pending_masks"] = hub.frame_is_own_emission(raw)
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        ack_timeout=0.05,
+        started_timeout=0.05,
+        command_id_factory=lambda: "command-pending",
+        now=lambda: clock["now"],
+    )
+    with suppress(CommandStartedTimeoutError, CommandAckTimeoutError):
+        asyncio.run(hub.async_transmit(blind_config(), "UP", stop_after_ms=None))
+
+    assert verdict, "publish should have run"
+    assert verdict["pending_masks"] is False
