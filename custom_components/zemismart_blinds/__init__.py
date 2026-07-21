@@ -8,14 +8,17 @@ import secrets
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+import voluptuous as vol
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryError
 
+from .air import AirMode
 from .codec import CommandBases, synthesize_bases
 from .const import (
     ATTR_BRIDGE,
     ATTR_RAW,
     ATTR_REPEATS,
+    CONF_AIR_ARBITRATION_MODE,
     CONF_BASE_DOWN,
     CONF_BASE_STOP,
     CONF_BASE_UP,
@@ -47,6 +50,22 @@ if TYPE_CHECKING:
     from homeassistant.helpers.typing import ConfigType
 
     type ZemismartConfigEntry = ConfigEntry[RemoteRuntime]
+
+
+_AIR_MODE_DATA_KEY = f"{DOMAIN}_air_arbitration_mode"
+CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional(DOMAIN): vol.Schema(
+            {
+                vol.Optional(
+                    CONF_AIR_ARBITRATION_MODE,
+                    default=AirMode.ENFORCE.value,
+                ): vol.In(tuple(mode.value for mode in AirMode)),
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 
 def _bridge_id(topic: str, leaf: str) -> str | None:
@@ -144,7 +163,11 @@ def _create_domain_runtime(hass: HomeAssistant) -> DomainRuntime:
         await mqtt.async_publish(hass, topic, payload, qos=1, retain=False)
 
     return DomainRuntime(
-        hub=ZemismartHub(BridgeRegistry(), async_publish),
+        hub=ZemismartHub(
+            BridgeRegistry(),
+            async_publish,
+            air_mode=cast("AirMode", hass.data.get(_AIR_MODE_DATA_KEY, AirMode.ENFORCE)),
+        ),
         unsubscribers=[],
     )
 
@@ -223,8 +246,13 @@ def _whole_repeats(value: object) -> int:
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register domain services for the lifetime of the integration."""
-    del config
-    import voluptuous as vol
+    domain_config = config.get(DOMAIN)
+    raw_mode = (
+        domain_config.get(CONF_AIR_ARBITRATION_MODE, AirMode.ENFORCE.value)
+        if isinstance(domain_config, Mapping)
+        else AirMode.ENFORCE.value
+    )
+    hass.data[_AIR_MODE_DATA_KEY] = AirMode(str(raw_mode))
     from homeassistant.core import SupportsResponse
     from homeassistant.exceptions import HomeAssistantError
     from homeassistant.helpers.service import async_register_admin_service

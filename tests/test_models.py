@@ -4,11 +4,12 @@ import asyncio
 import json
 from contextlib import suppress
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
 
 from custom_components.zemismart_blinds import models as models_module
+from custom_components.zemismart_blinds.air import AIR_STATE_CAP, AirMode, AirPlan
 from custom_components.zemismart_blinds.codec import (
     CommandBases,
     decode_b0,
@@ -39,6 +40,7 @@ from custom_components.zemismart_blinds.state_sync import (
 )
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
+    TEST_ACTION_BASES,
     TEST_BASES,
     TEST_PREFIX,
     TEST_REMOTE_ID,
@@ -300,6 +302,16 @@ def blind_config(*, area_id: str = "living_room") -> BlindConfig:
         travel_down=13.0,
         area_id=area_id,
         repeats=5,
+    )
+
+
+def action_only_config(*, area_id: str = "living_room") -> BlindConfig:
+    """Return the production three-repeat shape without a trailer family."""
+    return replace(
+        blind_config(area_id=area_id),
+        remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
+        repeats=3,
+        coalesce_window_ms=0,
     )
 
 
@@ -650,6 +662,7 @@ def test_matching_rejection_is_raised() -> None:
 
     with pytest.raises(CommandRejectedError, match="invalid stop_raw"):
         asyncio.run(hub.async_transmit(blind_config(), "UP"))
+    assert hub.air_shadow_stats()["pending_starts"] == 0
 
 
 def test_unmatched_and_malformed_statuses_cannot_acknowledge_a_command() -> None:
@@ -713,6 +726,9 @@ def test_started_timeout_after_acceptance_is_reported_as_ambiguous() -> None:
 
     with pytest.raises(CommandStartedTimeoutError, match="not-started"):
         asyncio.run(hub.async_transmit(blind_config(), "UP"))
+    stats = hub.air_shadow_stats()
+    assert stats["pending_starts"] == 0
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["started_timeout"] == 1
 
 
 def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2435,6 +2451,7 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
         publish,
         command_id_factory=lambda: "displaced-confirmed",
         now=lambda: clock["now"],
+        monotonic_now=lambda: clock["now"],
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2445,12 +2462,15 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     )
     assert isinstance(result, CommandAck)
     body = published[0]
+    assert len(hub._air.reservation_snapshot(now=clock["now"])) == 1
 
     clock["now"] = _DISPLACED_AT
     assert hub.handle_status(
         "bridge-a",
         {"status": "displaced", "command_id": "displaced-confirmed"},
     )
+    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
+    assert hub._air.drain_until("bridge-a", now=clock["now"]) == pytest.approx(143.145)
     clock["now"] = _DISPLACED_FLUSH_AT
     hub.handle_rx(
         "bridge-b",
@@ -2496,6 +2516,7 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         publish,
         command_id_factory=lambda: "displaced-disarmed",
         now=lambda: clock["now"],
+        monotonic_now=lambda: clock["now"],
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2512,6 +2533,7 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         "bridge-a",
         {"status": "displaced", "command_id": "displaced-disarmed"},
     )
+    displaced_drain = hub._air.drain_until("bridge-a", now=clock["now"])
     hub._start_disarm_request(
         "bridge-a",
         "displaced-disarmed",
@@ -2521,6 +2543,8 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         "bridge-a",
         {"status": "disarmed", "command_id": "displaced-disarmed"},
     )
+    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
+    assert hub._air.drain_until("bridge-a", now=clock["now"]) == displaced_drain
 
     clock["now"] = _DISPLACED_FLUSH_AT
     hub.handle_rx(
@@ -2569,6 +2593,7 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
         publish,
         command_id_factory=lambda: "displaced-race",
         now=lambda: clock["now"],
+        monotonic_now=lambda: clock["now"],
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2579,6 +2604,8 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
     )
     assert isinstance(result, CommandAck)
     body = published[0]
+    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
+    assert hub._air.drain_until("bridge-a", now=clock["now"]) == pytest.approx(106.19)
 
     clock["now"] = _STATE_SYNC_RECV_TIME + 0.1
     hub.handle_rx(
@@ -2898,17 +2925,23 @@ async def test_affinity_is_partitioned_by_area() -> None:
     registry.update_info("bridge-b", {"area": "bedroom"})
     registry.update_availability("bridge-b", "online")
     topics: list[str] = []
+    monotonic = {"now": 100.0}
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         topics.append(topic)
         accept_and_start(hub, topic.split("/")[1], json.loads(payload))
 
-    hub = ZemismartHub(registry, publish)
-    living = replace(blind_config(), channels=(1,))
-    bedroom = replace(blind_config(area_id="bedroom"), channels=(2,))
+    hub = ZemismartHub(registry, publish, monotonic_now=lambda: monotonic["now"])
+    living = replace(action_only_config(), channels=(1,))
+    bedroom = replace(action_only_config(area_id="bedroom"), channels=(2,))
     await hub.async_transmit(living, "UP")
-    await hub.async_transmit(bedroom, "UP")
+    second = asyncio.create_task(hub.async_transmit(bedroom, "UP"))
+    await asyncio.sleep(0)
+    assert topics == ["rf433/bridge-a/tx"]
+    monotonic["now"] = 101.927
+    hub.notify_bridge_change()
+    await second
 
     assert topics == ["rf433/bridge-a/tx", "rf433/bridge-b/tx"]
 
@@ -3482,6 +3515,54 @@ async def test_scheduled_heard_press_supersedes_full_move_before_publisher_enque
 
 
 @pytest.mark.asyncio
+async def test_chained_scheduled_press_is_rechecked_inside_publisher_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A press queued during the pre-check drain still wins before paho enqueue."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    hub = ZemismartHub(registry, publish)
+    config = blind_config()
+    event = HeardEvent(
+        button="UP",
+        chans=frozenset(config.channels),
+        remote_key=config.remote.key,
+        heard_at=_STATE_SYNC_RECV_TIME,
+        bridge_id="bridge-b",
+    )
+    hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
+    original_register_pending = hub._register_pending
+
+    def register_and_chain_press(
+        bridge: Any,
+        command_id: str,
+        remote_key: str | None,
+        channels: frozenset[int],
+    ) -> Any:
+        pending = original_register_pending(bridge, command_id, remote_key, channels)
+        loop = asyncio.get_running_loop()
+        loop.call_soon(loop.call_soon, hub._dispatch_heard, event)
+        return pending
+
+    monkeypatch.setattr(hub, "_register_pending", register_and_chain_press)
+
+    result = await hub.async_transmit(config, "DOWN")
+
+    assert result == "superseded"
+    assert published == []
+    assert hub.air_shadow_stats()["pending_starts"] == 0
+    hub.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduled_cancellation_prevents_publisher_wrapper_enqueue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3568,43 +3649,60 @@ async def test_cancelled_contributor_channel_is_dropped_from_the_batch() -> None
 
 
 @pytest.mark.asyncio
-async def test_cancelled_contributor_is_rechecked_after_publish_lock(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancellation while waiting to publish removes that caller's channel."""
-    registry = BridgeRegistry()
-    registry.update_availability("bridge-a", "online")
+async def test_cancelled_contributor_is_rechecked_after_publish_lock() -> None:
+    """Every air retry rebuilds payload, ledger, and plan from live callers."""
+    registry = _two_area_registry()
+    monotonic = {"now": 1_200.0}
     published: list[dict[str, Any]] = []
+    committed: list[tuple[int, int, tuple[int, ...]]] = []
+    ids = iter(("owner", "coalesced"))
     hub: ZemismartHub
 
-    async def publish(_topic: str, payload: str) -> None:
+    async def publish(topic: str, payload: str) -> None:
         body: dict[str, Any] = json.loads(payload)
         published.append(body)
-        accept_and_start(hub, "bridge-a", body)
+        command_id = str(body["command_id"])
+        if command_id == "coalesced":
+            pending_plan = hub._air._pending[("bridge-b", command_id)].plan
+            ledger = hub._ledger._entries[command_id]
+            committed.append(
+                (
+                    pending_plan.action_ms,
+                    ledger.frames[0].airtime_ms,
+                    ledger.channels,
+                )
+            )
+        accept_and_start(hub, topic.split("/")[1], body)
 
-    hub = ZemismartHub(registry, publish)
-    rebuilt = asyncio.Event()
-    original_rebuild = hub._rebuild_from_live_contributors
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(replace(action_only_config(), channels=(4,)), "DOWN")
+    low = replace(
+        action_only_config(area_id="office"),
+        channels=(1,),
+        repeats=2,
+        coalesce_window_ms=0,
+    )
+    high = replace(low, channels=(2,), repeats=7)
+    first = asyncio.create_task(hub.async_transmit(low, "UP"))
+    second = asyncio.create_task(hub.async_transmit(high, "UP"))
+    await _wait_for_air_hold(hub)
 
-    def record_rebuild(command: Any) -> None:
-        original_rebuild(command)
-        rebuilt.set()
-
-    monkeypatch.setattr(hub, "_rebuild_from_live_contributors", record_rebuild)
-    first_config = config_with_window(replace(blind_config(), channels=(1,)), 10)
-    second_config = config_with_window(replace(blind_config(), channels=(2,)), 10)
-
-    async with hub._publish_lock:
-        first = asyncio.create_task(hub.async_transmit(first_config, "UP"))
-        second = asyncio.create_task(hub.async_transmit(second_config, "UP"))
-        await rebuilt.wait()
-        second.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await second
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    monotonic["now"] = 1_201.927
+    hub.notify_bridge_change()
 
     assert isinstance(await first, CommandAck)
-    assert len(published) == 1
-    assert published[0]["target"] == "a1b2c3:42:1"
+    assert len(published) == 2
+    assert published[1]["target"] == "a1b2c3:42:1"
+    assert published[1]["repeats"] == 2
+    assert committed == [(2 * 609, 2_000, (1,))]
 
 
 @pytest.mark.asyncio
@@ -3834,6 +3932,36 @@ async def test_publish_transport_error_pops_pending() -> None:
     with pytest.raises(OSError, match="broker unavailable"):
         await hub.async_transmit(blind_config(), "UP")
     assert hub._pending == {}
+    assert hub.air_shadow_stats()["pending_starts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_air_calendar_commit_exception_publishes_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected provisional-calendar fault cannot suppress valid RF."""
+    registry = BridgeRegistry()
+    registry.update_availability("bridge-a", "online")
+    published: list[dict[str, Any]] = []
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, "bridge-a", body)
+
+    def fail_commit(_arbiter: object, **_kwargs: object) -> bool:
+        msg = "calendar fault"
+        raise RuntimeError(msg)
+
+    hub = ZemismartHub(registry, publish)
+    monkeypatch.setattr(type(hub._air), "provision", fail_commit)
+    result = await hub.async_transmit(action_only_config(), "UP")
+
+    assert isinstance(result, CommandAck)
+    assert len(published) == 1
+    stats = hub.air_shadow_stats()
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["internal_error"] == 1
 
 
 @pytest.mark.asyncio
@@ -3856,6 +3984,7 @@ async def test_close_cancels_background_publish_tasks() -> None:
     hub.close()
     await asyncio.sleep(0)
     assert all(publish_task.cancelled() for publish_task in background)
+    assert hub.air_shadow_stats()["pending_starts"] == 0
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -4361,83 +4490,786 @@ def _two_area_registry() -> BridgeRegistry:
     return registry
 
 
-def test_shadow_arbiter_observes_cross_bridge_without_delaying() -> None:
-    """Two bridges keying the air together is the case worth measuring."""
+async def _wait_for_air_hold(hub: ZemismartHub) -> None:
+    """Yield until the worker has reached its event-backed calendar wait."""
+    for _attempt in range(20):
+        if hub._inflight is not None and hub._inflight.air_waiting:
+            return
+        await asyncio.sleep(0)
+    pytest.fail("command did not enter the air wait")
+
+
+@pytest.mark.asyncio
+async def test_first_cross_bridge_command_publishes_immediately_and_completes_on_started() -> None:
+    """An empty two-bridge calendar adds no latency to its first command."""
     published: list[tuple[str, float]] = []
-    clock = {"now": 1_000.0}
+    monotonic = {"now": 100.0}
+    hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
-        published.append((topic, clock["now"]))
+        published.append((topic, monotonic["now"]))
         accept_and_start(hub, topic.split("/")[1], json.loads(payload))
 
-    ids = iter(["cmd-1", "cmd-2"])
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        monotonic_now=lambda: monotonic["now"],
+    )
+    result = await hub.async_transmit(action_only_config(), "DOWN")
+
+    assert isinstance(result, CommandAck)
+    assert published == [("rf433/bridge-a/tx", 100.0)]
+    assert hub.air_shadow_stats()["commands_held"] == 0
+
+
+@pytest.mark.asyncio
+async def test_second_cross_bridge_publish_waits_from_actual_started_anchor() -> None:
+    """The enforced horizon starts at monotonic receipt minus status age."""
+    published: list[tuple[str, float]] = []
+    monotonic = {"now": 100.250}
+    ids = iter(("cmd-a", "cmd-b"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        bridge_id = topic.split("/")[1]
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, monotonic["now"]))
+        assert hub.handle_status(bridge_id, accepted(body))
+        status = started(body)
+        if body["command_id"] == "cmd-a":
+            status["age_ms"] = 250
+        assert hub.handle_status(bridge_id, status)
+
     hub = ZemismartHub(
         _two_area_registry(),
         publish,
         command_id_factory=lambda: next(ids),
-        now=lambda: clock["now"],
+        monotonic_now=lambda: monotonic["now"],
     )
+    await hub.async_transmit(action_only_config(), "DOWN")
+    second = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(3,)), "UP")
+    )
+    await _wait_for_air_hold(hub)
+    assert len(published) == 1
 
-    async def scenario() -> None:
-        await hub.async_transmit(blind_config(area_id="living_room"), "DOWN", stop_after_ms=None)
-        clock["now"] = 1_000.2
-        await hub.async_transmit(
-            replace(blind_config(area_id="office"), channels=(3,)), "UP", stop_after_ms=None
+    monotonic["now"] = 101.926
+    hub.notify_bridge_change()
+    await asyncio.sleep(0)
+    assert len(published) == 1
+    monotonic["now"] = 101.927
+    hub.notify_bridge_change()
+    assert isinstance(await second, CommandAck)
+
+    assert published == [
+        ("rf433/bridge-a/tx", 100.250),
+        ("rf433/bridge-b/tx", 101.927),
+    ]
+    stats = hub.air_shadow_stats()
+    assert stats["commands_held"] == 1
+    assert stats["held_total_ms"] == 1_677
+
+
+@pytest.mark.asyncio
+async def test_trailer_charges_all_three_repeats_before_cross_bridge_publish() -> None:
+    """A trailer-bearing command holds peers for 3,654 ms plus the guard."""
+    published: list[tuple[str, float]] = []
+    monotonic = {"now": 200.250}
+    ids = iter(("trailer", "peer"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        bridge_id = topic.split("/")[1]
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, monotonic["now"]))
+        assert hub.handle_status(bridge_id, accepted(body))
+        status = started(body)
+        if body["command_id"] == "trailer":
+            status["age_ms"] = 250
+        assert hub.handle_status(bridge_id, status)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    trailer_config = replace(blind_config(), repeats=3)
+    await hub.async_transmit(trailer_config, "DOWN")
+    second = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(3,)), "UP")
+    )
+    await _wait_for_air_hold(hub)
+    monotonic["now"] = 203.753
+    hub.notify_bridge_change()
+    await asyncio.sleep(0)
+    assert len(published) == 1
+    monotonic["now"] = 203.754
+    hub.notify_bridge_change()
+    await second
+
+    assert published[-1] == ("rf433/bridge-b/tx", 203.754)
+
+
+@pytest.mark.asyncio
+async def test_stop_preempts_an_air_held_movement() -> None:
+    """An unpublished held movement cannot turn its STOP barrier into a wait."""
+    published: list[tuple[str, str]] = []
+    monotonic = {"now": 300.0}
+    ids = iter(("owner", "held-move", "stop"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, str(body["command_id"])))
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(replace(action_only_config(), channels=(3,)), "UP")
+    monotonic["now"] = 300.1
+    held = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(1,)), "DOWN")
+    )
+    await _wait_for_air_hold(hub)
+
+    stop = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(1,)), "STOP")
+    )
+    assert await held == "superseded"
+    assert isinstance(await stop, CommandAck)
+
+    assert published == [
+        ("rf433/bridge-a/tx", "owner"),
+        ("rf433/bridge-b/tx", "stop"),
+    ]
+    stats = hub.air_shadow_stats()
+    assert stats["commands_held"] == 1
+    assert stats["stop_bypasses"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_preempts_movement_between_air_wait_generations() -> None:
+    """A STOP cannot inherit a calendar wait during the transient flag gap."""
+    published: list[str] = []
+    monotonic = {"now": 350.0}
+    ids = iter(("owner", "held-move", "stop"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(str(body["command_id"]))
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(replace(action_only_config(), channels=(3,)), "UP")
+    monotonic["now"] = 350.1
+    held = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(1,)), "DOWN")
+    )
+    await _wait_for_air_hold(hub)
+
+    async with hub._publish_lock:
+        hub.notify_bridge_change()
+        await asyncio.sleep(0)
+        inflight = hub._inflight
+        assert inflight is not None
+        assert not inflight.air_waiting
+        stop = asyncio.create_task(
+            hub.async_transmit(
+                replace(action_only_config(area_id="office"), channels=(1,)),
+                "STOP",
+            )
+        )
+        await asyncio.sleep(0)
+
+    assert isinstance(await asyncio.wait_for(stop, timeout=0.1), CommandAck)
+    assert await held == "superseded"
+    assert published == ["owner", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_stop_forces_held_raw_to_fail_open_then_follows_its_publish_barrier() -> None:
+    """Raw cannot be superseded, so it publishes now and STOP follows in order."""
+    published: list[tuple[str, str]] = []
+    monotonic = {"now": 400.0}
+    ids = iter(("owner", "held-raw", "stop"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((topic, str(body["command_id"])))
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(replace(action_only_config(), channels=(3,)), "UP")
+    monotonic["now"] = 400.1
+    raw_frame = encode_b0(
+        make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "DOWN", bases=TEST_ACTION_BASES)
+    )
+    raw = asyncio.create_task(hub.async_send_raw("bridge-b", raw_frame, 3))
+    await _wait_for_air_hold(hub)
+
+    stop = asyncio.create_task(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(1,)), "STOP")
+    )
+    assert isinstance(await raw, CommandAck)
+    assert isinstance(await stop, CommandAck)
+
+    assert published == [
+        ("rf433/bridge-a/tx", "owner"),
+        ("rf433/bridge-b/tx", "held-raw"),
+        ("rf433/bridge-b/tx", "stop"),
+    ]
+    stats = hub.air_shadow_stats()
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["stop_preemption"] == 1
+
+
+@pytest.mark.asyncio
+async def test_normal_train_is_shifted_past_known_future_stop() -> None:
+    """A peer train cannot begin through an actual reserved STOP window."""
+    published: list[tuple[str, float]] = []
+    monotonic = {"now": 500.0}
+    ids = iter(("timed", "normal"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append((str(body["command_id"]), monotonic["now"]))
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    monotonic["now"] = 504.8
+    normal = asyncio.create_task(hub.async_transmit(action_only_config(area_id="office"), "UP"))
+    await _wait_for_air_hold(hub)
+    monotonic["now"] = 506.926
+    hub.notify_bridge_change()
+    await asyncio.sleep(0)
+    assert len(published) == 1
+    monotonic["now"] = 506.927
+    hub.notify_bridge_change()
+    await normal
+
+    assert published == [("timed", 500.0), ("normal", 506.927)]
+
+
+@pytest.mark.asyncio
+async def test_two_ha_timed_commands_get_non_overlapping_stop_reservations() -> None:
+    """The second timed start shifts until its guarded STOP is adjacent."""
+    monotonic = {"now": 600.0}
+    ids = iter(("timed-a", "timed-b"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    second = asyncio.create_task(
+        hub.async_transmit(
+            action_only_config(area_id="office"),
+            "UP",
+            stop_after_ms=5_000,
+        )
+    )
+    await _wait_for_air_hold(hub)
+    monotonic["now"] = 602.027
+    hub.notify_bridge_change()
+    await second
+
+    reservations = hub._air.reservation_snapshot(now=monotonic["now"])
+    assert len(reservations) == 2
+    assert reservations[0].ends_at == pytest.approx(reservations[1].starts_at)
+    assert hub.air_shadow_stats()["stop_window_conflicts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_offline_retains_reservation_but_changed_boot_removes_it() -> None:
+    """Registry notifications retire state only on positive reboot evidence."""
+    registry = _two_area_registry()
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 1})
+    monotonic = {"now": 700.0}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish, monotonic_now=lambda: monotonic["now"])
+    await hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+
+    registry.update_availability("bridge-a", "offline")
+    hub.notify_bridge_change()
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+    registry.update_info("bridge-a", {})
+    hub.notify_bridge_change()
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 2})
+    hub.notify_bridge_change()
+    assert hub._air.reservation_snapshot(now=monotonic["now"]) == ()
+
+
+@pytest.mark.asyncio
+async def test_disarm_ack_removes_future_air_reservation_without_shortening_drain() -> None:
+    """Disarm retires the fail-safe window, not an action already handed to RF."""
+    monotonic = {"now": 750.0}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: "armed",
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    drain = hub._air.drain_until("bridge-a", now=monotonic["now"])
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+
+    assert hub.handle_status("bridge-a", {"status": "disarmed", "command_id": "armed"})
+    assert hub._air.reservation_snapshot(now=monotonic["now"]) == ()
+    assert hub._air.drain_until("bridge-a", now=monotonic["now"]) == drain
+
+
+@pytest.mark.asyncio
+async def test_online_count_drop_wakes_air_waiter_and_publishes_off() -> None:
+    """Dropping to one online bridge releases every hold without deleting state."""
+    registry = _two_area_registry()
+    registry.update_info("bridge-c", {"area": "garage"})
+    registry.update_availability("bridge-c", "online")
+    monotonic = {"now": 800.0}
+    published: list[str] = []
+    ids = iter(("timed", "waiting"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(str(body["command_id"]))
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: next(ids),
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    monotonic["now"] = 800.1
+    waiting = asyncio.create_task(hub.async_transmit(action_only_config(area_id="garage"), "UP"))
+    await _wait_for_air_hold(hub)
+
+    registry.update_availability("bridge-a", "offline")
+    registry.update_availability("bridge-b", "offline")
+    hub.notify_bridge_change()
+    assert isinstance(await waiting, CommandAck)
+
+    assert published == ["timed", "waiting"]
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+    stats = hub.air_shadow_stats()
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["online_below_two"] == 1
+
+
+@pytest.mark.asyncio
+async def test_air_started_anchor_uses_monotonic_receipt_minus_age_only() -> None:
+    """Wall steps and bridge-clock projection cannot move the RF calendar."""
+    registry = _two_area_registry()
+    registry.update_info("bridge-a", {"area": "living_room", "boot": _STATE_SYNC_BOOT})
+    wall = {"now": 5_000.0}
+    monotonic = {"now": 900.250}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status("bridge-a", accepted(body))
+        assert hub.handle_status(
+            "bridge-a",
+            {
+                "status": "started",
+                "command_id": body["command_id"],
+                "age_ms": 250,
+                "t": 90_000,
+                "boot": _STATE_SYNC_BOOT,
+            },
         )
 
-    asyncio.run(scenario())
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: wall["now"],
+        monotonic_now=lambda: monotonic["now"],
+    )
+    seed = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_ACTION_BASES))
+    hub.handle_rx(
+        "bridge-a",
+        {"frame": seed, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
+    )
+    await hub.async_transmit(action_only_config(), "DOWN")
 
-    # Genuinely different bridges...
-    assert [topic for topic, _ in published] == [
-        "rf433/bridge-a/tx",
-        "rf433/bridge-b/tx",
-    ]
-    # ...both published immediately: shadow mode delays nothing.
-    assert [when for _, when in published] == [1_000.0, 1_000.2]
+    wall["now"] = -10_000.0
+    assert hub._air.drain_until("bridge-a", now=monotonic["now"]) == pytest.approx(901.927)
+    wall["now"] = 50_000.0
+    assert hub._air.drain_until("bridge-a", now=monotonic["now"]) == pytest.approx(901.927)
+
+
+@pytest.mark.asyncio
+async def test_air_hold_ceiling_publishes_and_counts_fail_open() -> None:
+    """A pathological reservation chain cannot hold a command past 130 seconds."""
+    registry = _two_area_registry()
+    monotonic = {"now": 1_000.0}
+    published: list[float] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(monotonic["now"])
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish, monotonic_now=lambda: monotonic["now"])
+    reservation_plan = AirPlan(action_ms=100, stop_offset_ms=1_000, stop_ms=1_000)
+    for index in range(111):
+        command_id = f"reservation-{index}"
+        reservation_start = monotonic["now"] + index * 1.2
+        actual_start = reservation_start - 0.9
+        assert hub._air.provision(
+            bridge_id="bridge-a",
+            command_id=command_id,
+            boot=None,
+            plan=reservation_plan,
+            published_at=monotonic["now"],
+            expires_at=monotonic["now"] + 32.0,
+            is_stop=False,
+        )
+        assert hub._air.started(
+            "bridge-a",
+            command_id,
+            started_at=actual_start,
+            boot=None,
+            now=monotonic["now"],
+        )
+
+    command = asyncio.create_task(hub.async_transmit(action_only_config(area_id="office"), "UP"))
+    await _wait_for_air_hold(hub)
+    monotonic["now"] = 1_130.0
+    hub.notify_bridge_change()
+    assert isinstance(await command, CommandAck)
+
+    assert published == [1_130.0]
+    stats = hub.air_shadow_stats()
+    assert stats["ceiling_hits"] == 1
+    assert stats["held_total_ms"] == 130_000
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["ceiling"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reservation_cap_degradation_does_not_reject_transmission() -> None:
+    """A full future calendar keeps nearest windows and still returns an ack."""
+    monotonic = {"now": 1_150.0}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        monotonic_now=lambda: monotonic["now"],
+    )
+    for index in range(AIR_STATE_CAP):
+        command_id = f"full-{index}"
+        plan = AirPlan(
+            action_ms=1,
+            stop_offset_ms=100_000 + index * 1_000,
+            stop_ms=1,
+        )
+        assert hub._air.provision(
+            bridge_id="bridge-a",
+            command_id=command_id,
+            boot=None,
+            plan=plan,
+            published_at=monotonic["now"],
+            expires_at=monotonic["now"] + 32.0,
+            is_stop=False,
+        )
+        assert hub._air.started(
+            "bridge-a",
+            command_id,
+            started_at=monotonic["now"],
+            boot=None,
+            now=monotonic["now"],
+        )
+
+    result = await hub.async_transmit(
+        action_only_config(),
+        "DOWN",
+        stop_after_ms=5_000,
+    )
+
+    assert isinstance(result, CommandAck)
+    stats = hub.air_shadow_stats()
+    assert stats["reservation_evictions"] == 1
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["reservation_cap"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_task_cancellation_releases_provisional_air_plan() -> None:
+    """Cancelling the owning worker after enqueue fails open uncertain state."""
+    registry = _two_area_registry()
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(registry, publish, ack_timeout=30.0)
+    caller = asyncio.create_task(hub.async_transmit(action_only_config(), "UP"))
+    await published.wait()
+    assert hub.air_shadow_stats()["pending_starts"] == 1
+    worker = hub._worker_task
+    assert worker is not None
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await asyncio.sleep(0)
 
     stats = hub.air_shadow_stats()
-    assert stats["planned"] == 2
-    assert stats["would_wait"] == 1
-    assert stats["waits_by_bridge"] == {"bridge-b": 1}
+    assert stats["pending_starts"] == 0
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["cancelled_after_publish"] == 1
 
 
-def test_shadow_arbiter_ignores_same_bridge_back_to_back_commands() -> None:
-    """The bridge's own scheduler already serializes these -- not contention."""
+@pytest.mark.asyncio
+async def test_started_timeout_releases_pending_blocker_and_wakes_air_waiter() -> None:
+    """A missing started status cannot strand work behind provisional state."""
+    first_published = asyncio.Event()
+    bodies: dict[str, dict[str, Any]] = {}
+    ids = iter(("orphan-stop", "waiting-normal"))
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        command_id = str(body["command_id"])
+        bodies[command_id] = body
+        if command_id == "orphan-stop":
+            first_published.set()
+            return
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        started_timeout=0.01,
+        command_id_factory=lambda: next(ids),
+    )
+    orphan = asyncio.create_task(hub.async_transmit(action_only_config(), "STOP"))
+    await first_published.wait()
+    waiting = asyncio.create_task(hub.async_transmit(action_only_config(area_id="office"), "UP"))
+    await _wait_for_air_hold(hub)
+    assert hub.handle_status("bridge-a", accepted(bodies["orphan-stop"]))
+
+    with pytest.raises(CommandStartedTimeoutError):
+        await orphan
+    assert isinstance(await waiting, CommandAck)
+    stats = hub.air_shadow_stats()
+    assert cast("dict[str, int]", stats["fail_open_reasons"])["started_timeout"] == 1
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_while_air_held_prevents_publish() -> None:
+    """A cancelled unpublished caller wakes the gate and fails the live check."""
+    monotonic = {"now": 1_300.0}
     published: list[str] = []
-    clock = {"now": 1_000.0}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(topic)
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        monotonic_now=lambda: monotonic["now"],
+    )
+    await hub.async_transmit(action_only_config(), "UP")
+    caller = asyncio.create_task(hub.async_transmit(action_only_config(area_id="office"), "DOWN"))
+    await _wait_for_air_hold(hub)
+    monotonic["now"] = 1_300.5
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert published == ["rf433/bridge-a/tx"]
+    stats = hub.air_shadow_stats()
+    assert stats["pending_starts"] == 0
+    assert stats["held_total_ms"] == 500
+
+
+@pytest.mark.asyncio
+async def test_selective_unload_wakes_and_supersedes_air_held_command() -> None:
+    """Entry drain cancels unpublished held work without erasing hardware state."""
+    monotonic = {"now": 1_350.0}
+    published: list[str] = []
+    hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         published.append(topic)
         accept_and_start(hub, topic.split("/")[1], json.loads(payload))
 
-    ids = iter(["cmd-1", "cmd-2"])
     hub = ZemismartHub(
         _two_area_registry(),
         publish,
-        command_id_factory=lambda: next(ids),
-        now=lambda: clock["now"],
+        monotonic_now=lambda: monotonic["now"],
     )
-    config = blind_config(area_id="living_room")
+    await hub.async_transmit(
+        action_only_config(),
+        "UP",
+        stop_after_ms=5_000,
+        owner="staying",
+    )
+    held = asyncio.create_task(
+        hub.async_transmit(
+            action_only_config(area_id="office"),
+            "DOWN",
+            owner="departing",
+        )
+    )
+    await _wait_for_air_hold(hub)
+    hub.drain_owner("departing")
 
-    async def scenario() -> None:
-        await hub.async_transmit(config, "DOWN", stop_after_ms=None)
-        clock["now"] = 1_000.2
-        await hub.async_transmit(replace(config, channels=(3,)), "UP", stop_after_ms=None)
-
-    asyncio.run(scenario())
-
-    assert published == ["rf433/bridge-a/tx", "rf433/bridge-a/tx"]
-    stats = hub.air_shadow_stats()
-    assert stats["planned"] == 2
-    # Same bridge, back to back, INSIDE the first train: still not contention.
-    assert stats["would_wait"] == 0
-    assert stats["waits_by_bridge"] == {}
+    assert await held == "superseded"
+    assert published == ["rf433/bridge-a/tx"]
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
 
 
-def test_shadow_arbiter_stays_off_for_a_single_bridge_install() -> None:
-    """One online bridge must leave the hub's behavior entirely unchanged."""
+@pytest.mark.asyncio
+async def test_caller_cancellation_after_publish_keeps_air_lifecycle_owned_by_worker() -> None:
+    """Caller cancellation cannot retract a payload already handed to MQTT."""
+    registry = _two_area_registry()
+    monotonic = {"now": 1_400.0}
+    body_ready = asyncio.Event()
+    published_body: dict[str, Any] = {}
+    hub: ZemismartHub
+
+    async def publish(_topic: str, payload: str) -> None:
+        published_body.update(json.loads(payload))
+        assert hub.handle_status("bridge-a", accepted(published_body))
+        body_ready.set()
+
+    hub = ZemismartHub(
+        registry,
+        publish,
+        started_timeout=30.0,
+        monotonic_now=lambda: monotonic["now"],
+    )
+    caller = asyncio.create_task(
+        hub.async_transmit(action_only_config(), "DOWN", stop_after_ms=5_000)
+    )
+    await body_ready.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert hub.air_shadow_stats()["pending_starts"] == 1
+
+    assert hub.handle_status("bridge-a", started(published_body))
+    await asyncio.sleep(0)
+    assert hub.air_shadow_stats()["pending_starts"] == 0
+    assert len(hub._air.reservation_snapshot(now=monotonic["now"])) == 1
+
+
+@pytest.mark.parametrize(
+    ("area_id", "topic"),
+    (("living_room", "rf433/bridge-a/tx"), ("office", "rf433/bridge-b/tx")),
+)
+@pytest.mark.asyncio
+async def test_enforcement_ignores_same_bridge_back_to_back_commands(
+    area_id: str,
+    topic: str,
+) -> None:
+    """Each bridge's own firmware, in either area, owns same-bridge pacing."""
     published: list[str] = []
-    clock = {"now": 1.0}
+    monotonic = {"now": 1_000.0}
+    hub: ZemismartHub
+
+    async def publish(published_topic: str, payload: str) -> None:
+        published.append(published_topic)
+        accept_and_start(hub, published_topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        monotonic_now=lambda: monotonic["now"],
+    )
+    config = action_only_config(area_id=area_id)
+    await hub.async_transmit(config, "DOWN")
+    await hub.async_transmit(replace(config, channels=(3,)), "UP")
+
+    assert published == [topic, topic]
+    assert hub.air_shadow_stats()["commands_held"] == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_shadow_mode_observes_cross_bridge_without_delaying() -> None:
+    """The YAML rollback mode computes evidence but never holds a command."""
+    published: list[tuple[str, float]] = []
+    monotonic = {"now": 1_000.0}
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append((topic, monotonic["now"]))
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        monotonic_now=lambda: monotonic["now"],
+        air_mode=AirMode.SHADOW,
+    )
+    await hub.async_transmit(action_only_config(), "DOWN")
+    monotonic["now"] = 1_000.2
+    await hub.async_transmit(
+        replace(action_only_config(area_id="office"), channels=(3,)),
+        "UP",
+    )
+
+    assert [when for _topic, when in published] == [1_000.0, 1_000.2]
+    stats = hub.air_shadow_stats()
+    assert stats["would_wait"] == 1
+    assert stats["commands_held"] == 0
+
+
+@pytest.mark.asyncio
+async def test_enforcement_is_off_for_one_online_bridge() -> None:
+    """One online bridge retains immediate publication and result timing."""
+    published: list[str] = []
+    monotonic = {"now": 1.0}
+    hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         published.append(topic)
@@ -4447,11 +5279,12 @@ def test_shadow_arbiter_stays_off_for_a_single_bridge_install() -> None:
         _online_registry(),
         publish,
         command_id_factory=lambda: "cmd-solo",
-        now=lambda: clock["now"],
+        monotonic_now=lambda: monotonic["now"],
     )
-    asyncio.run(hub.async_transmit(blind_config(), "DOWN", stop_after_ms=None))
+    result = await hub.async_transmit(action_only_config(), "DOWN")
 
+    assert isinstance(result, CommandAck)
     assert published == ["rf433/bridge-a/tx"]
     stats = hub.air_shadow_stats()
     assert stats["disabled_single_bridge"] == 1
-    assert stats["planned"] == 0
+    assert stats["commands_held"] == 0

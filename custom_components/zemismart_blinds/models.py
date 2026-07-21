@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Literal, cast
 
-from .air import AirArbiter
+from .air import MAX_AIR_HOLD_MS, AirArbiter, AirMode, plan_for_body
 from .calibrations import KNOWN_CALIBRATIONS
 from .codec import (
     CommandBases,
@@ -961,6 +961,13 @@ class _QueuedCommand:
     # Set only after the final under-lock frame is registered immediately
     # before enqueue; execute cleanup uses it to confirm or retire the entry.
     ledger_registered: bool = False
+    # A fast-lane STOP may wake an unpublished overlapping command without
+    # relaxing the existing paho publication-order barrier.
+    air_waiting: bool = False
+    air_bypass_requested: bool = False
+    # Persistent across retry generations: a STOP that observed this movement
+    # unpublished must not inherit any later calendar wait through its barrier.
+    air_preempted: bool = False
 
     @property
     def coalesce_key(self) -> tuple[str, Button, str] | None:
@@ -1000,6 +1007,8 @@ class ZemismartHub:
         started_timeout: float = DEFAULT_STARTED_TIMEOUT_SECONDS,
         command_id_factory: CommandIdFactory | None = None,
         now: Clock = time.time,
+        monotonic_now: Clock = time.monotonic,
+        air_mode: AirMode = AirMode.ENFORCE,
     ) -> None:
         """Initialize the global command queue and correlated status transport."""
         if ack_timeout <= 0 or started_timeout <= 0:
@@ -1011,9 +1020,11 @@ class ZemismartHub:
         self._started_timeout = started_timeout
         self._command_id_factory = command_id_factory or (lambda: uuid.uuid4().hex)
         self._now = now
+        self._monotonic_now = monotonic_now
         self._bridge_clocks: dict[str, BridgeClock] = {}
         self._ledger = CommandLedger()
-        self._air = AirArbiter()
+        self._air = AirArbiter(mode=air_mode, monotonic_now=monotonic_now)
+        self._air.update_bridges(self._air_bridge_snapshot(), now=self._monotonic_now())
         self._rx_listeners: list[_RxListener] = []
         self._rx_bridge_ids: dict[str, bool] = {}
         self._recent_emission_proofs: dict[str, float] = {}
@@ -1049,8 +1060,16 @@ class ZemismartHub:
 
     def notify_bridge_change(self) -> None:
         """Tell registered entities that retained bridge state changed."""
+        self._air.update_bridges(self._air_bridge_snapshot(), now=self._monotonic_now())
         for listener in self.bridge_listeners:
             listener()
+
+    def _air_bridge_snapshot(self) -> dict[str, tuple[bool, int | None]]:
+        """Return immutable availability and valid boot evidence for the calendar."""
+        return {
+            bridge.bridge_id: (bridge.online, _strict_uint32(bridge.boot))
+            for bridge in self.registry.bridges
+        }
 
     def _remember_displaced(self, command_id: str) -> None:
         """Keep a short, bounded displaced-id memory for late motion models.
@@ -1086,12 +1105,8 @@ class ZemismartHub:
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
     def air_shadow_stats(self) -> dict[str, object]:
-        """Return what cross-bridge arbitration WOULD have done so far.
-
-        Shadow mode: nothing has been delayed. These counters are the evidence
-        for whether enforcement is worth its latency on this deployment.
-        """
-        return self._air.stats.as_dict()
+        """Return current shadow and enforcement arbitration statistics."""
+        return self._air.stats_snapshot(now=self._monotonic_now())
 
     def command_takeover_live(self, command_id: str) -> bool:
         """Return whether a cover-owned command can still affect takeover."""
@@ -1436,7 +1451,7 @@ class ZemismartHub:
         if pending is None:
             return False
         if raw_status == "started":
-            return self._handle_started_status(bridge_id, pending, decoded)
+            return self._handle_started_status(bridge_id, command_id, pending, decoded)
         if pending.admission.done():
             return False
         raw_reason = decoded.get("reason")
@@ -1451,6 +1466,11 @@ class ZemismartHub:
 
     def _handle_displaced_status(self, bridge_id: str, command_id: str) -> bool:
         """Resolve queue and cover state for one displaced command."""
+        self._air.displaced(
+            bridge_id,
+            command_id,
+            now=self._monotonic_now(),
+        )
         # Latest-command-wins on the bridge retired this command's RF state.
         displaced_pending = self._pending.get((bridge_id, command_id))
         if displaced_pending is not None:
@@ -1489,6 +1509,7 @@ class ZemismartHub:
     def _handle_started_status(
         self,
         bridge_id: str,
+        command_id: str,
         pending: _PendingStatuses,
         decoded: Mapping[str, object],
     ) -> bool:
@@ -1496,6 +1517,7 @@ class ZemismartHub:
         if pending.started.done():
             return False
         recv_time = self._now()
+        monotonic_receipt = self._monotonic_now()
         t = _strict_uint32(decoded.get("t"))
         boot = _strict_uint32(decoded.get("boot"))
         raw_age = decoded.get("age_ms")
@@ -1503,8 +1525,15 @@ class ZemismartHub:
             raw_age
             if isinstance(raw_age, int)
             and not isinstance(raw_age, bool)
-            and 0 < raw_age <= _MAX_STARTED_AGE_MS
+            and 0 <= raw_age <= _MAX_STARTED_AGE_MS
             else 0
+        )
+        self._air.started(
+            bridge_id,
+            command_id,
+            started_at=monotonic_receipt - age_ms / _MILLISECONDS_PER_SECOND,
+            boot=boot,
+            now=monotonic_receipt,
         )
         started_at = recv_time - age_ms / _MILLISECONDS_PER_SECOND
         if t is not None and boot is not None:
@@ -1540,6 +1569,11 @@ class ZemismartHub:
 
     def on_disarmed(self, bridge_id: str, command_id: str) -> None:
         """Resolve the separate waiter for an ack received before its deadline."""
+        self._air.disarmed(
+            bridge_id,
+            command_id,
+            now=self._monotonic_now(),
+        )
         request = self._disarm_requests.get((bridge_id, command_id))
         if (
             request is None
@@ -1707,6 +1741,18 @@ class ZemismartHub:
         if command.press_token != self._press_generation(command.remote, command.channels):
             raise CommandDisplacedError(command.target)
 
+    @staticmethod
+    def _raise_if_air_preempted(command: _QueuedCommand) -> None:
+        """Retire an unpublished movement observed by a later safety STOP."""
+        if not command.air_preempted:
+            return
+        for future in command.futures:
+            if not future.done():
+                future.set_result("superseded")
+        if command.published is not None:
+            command.published.set()
+        raise CommandDisplacedError(command.target)
+
     def overlap_token(self, config: BlindConfig) -> int:
         """Snapshot the publish state of a config's channels.
 
@@ -1755,7 +1801,7 @@ class ZemismartHub:
             # Only single-cover, single-channel commands are coalescible.
             press_tokens[next(iter(contributor.channels))] = contributor.press_token
         command.press_token = sum(press_tokens.values())
-        if frozenset(channels) == command.channels:
+        if frozenset(channels) == command.channels and command.body.get("repeats") == repeats:
             return
         config = replace(
             command.coalesce_config,
@@ -1822,6 +1868,24 @@ class ZemismartHub:
                     else:
                         retained.append(queued)
                 self._queue = retained
+                inflight = self._inflight
+                if (
+                    inflight is not None
+                    and inflight.overlaps(command)
+                    and inflight.published is not None
+                    and not inflight.published.is_set()
+                ):
+                    if inflight.is_movement:
+                        inflight.air_preempted = True
+                        if inflight.air_waiting:
+                            for inflight_future in inflight.futures:
+                                if not inflight_future.done():
+                                    inflight_future.set_result("superseded")
+                            inflight.published.set()
+                    elif not inflight.air_bypass_requested:
+                        inflight.air_bypass_requested = True
+                        self._air.record_stop_preemption()
+                    self._air.wake()
                 # Safety fast lane: a STOP skips the global one-at-a-time
                 # lane so it can never sit behind another command's slow
                 # acknowledgement. Publication ORDER against earlier
@@ -1835,7 +1899,7 @@ class ZemismartHub:
                 # first would let the raw frame displace it on the bridge
                 # and re-drive the just-stopped motor, so the STOP queues
                 # directly behind it instead of taking the fast lane.
-                last_overlap = None
+                last_overlap: int | None = None
                 for index, queued in enumerate(self._queue):
                     if queued.overlaps(command) and any(
                         not queued_future.done() for queued_future in queued.futures
@@ -1846,6 +1910,7 @@ class ZemismartHub:
                 # needs the barrier against an earlier unpublished fast STOP.
                 command.publish_barriers = self._overlap_publish_barriers(command)
                 if last_overlap is not None:
+                    self._queue[last_overlap].air_bypass_requested = True
                     # Behind the queued overlap (and therefore also behind
                     # any overlapping in-flight command).
                     self._queue.insert(last_overlap + 1, command)
@@ -1876,6 +1941,7 @@ class ZemismartHub:
         try:
             return await future
         except asyncio.CancelledError:
+            self._air.wake()
             async with self._queue_ready:
                 self._queue_ready.notify()
             raise
@@ -2253,40 +2319,133 @@ class ZemismartHub:
         bridge_id: str,
         command_id: str,
     ) -> None:
-        """Enqueue one tx message in request order without blocking on its ack.
+        """Wait for feasible air, then atomically finalize and enqueue one tx."""
+        hold_started: float | None = None
+        hold_finished = False
+        shadow_recorded = False
+        transport_error: BaseException | None = None
+        try:
+            while True:
+                wait_event: asyncio.Event | None = None
+                wait_seconds = 0.0
+                async with self._publish_lock:
+                    if all(future.done() for future in command.futures):
+                        raise CommandDisplacedError(command.target)
+                    # A ready cancellation or physical-press callback must run
+                    # before the authoritative final-body and validity checks.
+                    await asyncio.sleep(0)
+                    if all(future.done() for future in command.futures):
+                        raise CommandDisplacedError(command.target)
+                    self._raise_if_air_preempted(command)
+                    self._rebuild_from_live_contributors(command)
+                    self._raise_if_overlap_displaced(command)
+                    self._raise_if_press_displaced(command)
+                    body = dict(command.body)
+                    body["command_id"] = command_id
+                    now = self._monotonic_now()
+                    plan = None
+                    arbiter_failed = False
+                    try:
+                        plan = plan_for_body(body)
+                        if plan is not None and command.is_stop:
+                            self._air.probe_stop(bridge_id, plan, now=now)
+                        elif plan is not None and not command.air_bypass_requested:
+                            decision = self._air.decide(bridge_id, plan, now=now)
+                            if decision.disabled:
+                                self._air.record_disabled()
+                                if hold_started is not None:
+                                    self._air.record_online_fail_open()
+                            elif self._air.mode is AirMode.SHADOW:
+                                if decision.would_wait and not shadow_recorded:
+                                    self._air.record_shadow_wait(
+                                        bridge_id,
+                                        decision.earliest - now,
+                                    )
+                                    shadow_recorded = True
+                            elif decision.should_wait:
+                                if hold_started is None:
+                                    hold_started = now
+                                    self._air.record_hold_started(bridge_id)
+                                ceiling = hold_started + MAX_AIR_HOLD_MS / 1_000
+                                if now < ceiling:
+                                    wait_event = decision.event
+                                    wait_seconds = min(decision.earliest, ceiling) - now
+                                    command.air_waiting = True
+                                else:
+                                    self._air.record_ceiling_hit()
+                    except Exception:
+                        arbiter_failed = True
+                        plan = None
+                        self._record_air_internal_failure("air: planning failed open")
 
-        paho preserves publish()-call order to the broker, and HA's
-        ``async_publish`` hands the message to paho synchronously before it
-        awaits the QoS-1 PUBACK. Serializing only that synchronous enqueue
-        (one scheduling yield, under the publish lock) fixes bridge-receipt
-        order; the PUBACK then completes in the background, so a later
-        overlapping command — a fast-lane STOP — is never held behind an
-        earlier command's broker acknowledgment. QoS-1 reliability is
-        unaffected: paho retries the already-buffered message on its own.
-        """
-        async with self._publish_lock:
-            if all(future.done() for future in command.futures):
-                raise CommandDisplacedError(command.target)
-            publisher_wrapper = self._finalize_and_publish(
-                command,
-                topic,
-                bridge_id,
-                command_id,
-            )
-            _, transport_error = await self._enqueue_publish(publisher_wrapper)
-        if isinstance(transport_error, CommandDisplacedError):
-            # A ready physical-press callback ran before the publisher task.
-            # Preserve displacement semantics instead of wrapping it as a
-            # transport failure.
-            raise transport_error
-        if transport_error is not None:
-            # An immediate transport failure (e.g. broker down) surfaces
-            # fast instead of waiting out the admission timeout. The order
-            # barrier is still released by _async_run_direct's finally.
-            raise transport_error
-        self._record_publish(command)
-        if command.published is not None:
-            command.published.set()
+                    if wait_event is None:
+                        if hold_started is not None and not hold_finished:
+                            hold_finished = True
+                            try:
+                                self._air.record_hold_finished(
+                                    bridge_id,
+                                    now - hold_started,
+                                )
+                            except Exception:
+                                self._record_air_internal_failure(
+                                    "air: hold accounting failed open"
+                                )
+                        commit_air_plan = not arbiter_failed
+                        if commit_air_plan and plan is not None:
+                            try:
+                                commit_air_plan = self._air.provision(
+                                    bridge_id=bridge_id,
+                                    command_id=command_id,
+                                    boot=self._air_bridge_boot(bridge_id),
+                                    plan=plan,
+                                    published_at=now,
+                                    expires_at=now + self._ack_timeout + self._started_timeout,
+                                    is_stop=command.is_stop,
+                                )
+                            except Exception:
+                                commit_air_plan = False
+                                self._record_air_internal_failure(
+                                    "air: calendar commit failed open"
+                                )
+                        publisher_wrapper = self._finalize_and_publish(
+                            command,
+                            topic,
+                            bridge_id,
+                            command_id,
+                            count_air_plan=not arbiter_failed,
+                            commit_air_plan=commit_air_plan,
+                        )
+                        _, transport_error = await self._enqueue_publish(publisher_wrapper)
+                if wait_event is None:
+                    break
+                try:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(wait_event.wait(), timeout=wait_seconds)
+                finally:
+                    command.air_waiting = False
+            if isinstance(transport_error, CommandDisplacedError):
+                # A ready physical-press callback ran before the publisher task.
+                # Preserve displacement semantics instead of wrapping it as a
+                # transport failure.
+                raise transport_error
+            if transport_error is not None:
+                # An immediate transport failure (e.g. broker down) surfaces
+                # fast instead of waiting out the admission timeout. The order
+                # barrier is still released by _async_run_direct's finally.
+                raise transport_error
+            self._record_publish(command)
+            if command.published is not None:
+                command.published.set()
+        finally:
+            command.air_waiting = False
+            if hold_started is not None and not hold_finished:
+                try:
+                    self._air.record_hold_finished(
+                        bridge_id,
+                        self._monotonic_now() - hold_started,
+                    )
+                except Exception:
+                    self._record_air_internal_failure("air: hold accounting failed open")
 
     async def _finalize_and_publish(
         self,
@@ -2294,48 +2453,64 @@ class ZemismartHub:
         topic: str,
         bridge_id: str,
         command_id: str,
+        *,
+        count_air_plan: bool,
+        commit_air_plan: bool,
     ) -> None:
-        """Finalize synchronously in the publisher task, then enqueue to paho."""
+        """Revalidate inside the scheduled task, then commit and enqueue to paho."""
         if all(future.done() for future in command.futures):
             raise CommandDisplacedError(command.target)
+        self._raise_if_air_preempted(command)
         self._rebuild_from_live_contributors(command)
         self._raise_if_overlap_displaced(command)
         self._raise_if_press_displaced(command)
+        body = dict(command.body)
+        body["command_id"] = command_id
+        if count_air_plan:
+            try:
+                final_plan = plan_for_body(body)
+                self._air.record_plan(plannable=final_plan is not None)
+                if final_plan is None:
+                    self._air.release_pending(bridge_id, command_id)
+                elif commit_air_plan:
+                    now = self._monotonic_now()
+                    self._air.provision(
+                        bridge_id=bridge_id,
+                        command_id=command_id,
+                        boot=self._air_bridge_boot(bridge_id),
+                        plan=final_plan,
+                        published_at=now,
+                        expires_at=now + self._ack_timeout + self._started_timeout,
+                        is_stop=command.is_stop,
+                    )
+            except Exception:
+                self._air.release_pending(bridge_id, command_id)
+                self._record_air_internal_failure("air: final calendar commit failed open")
         pending = self._pending.get((bridge_id, command_id))
         if pending is not None:
             pending.channels = command.channels
-        body = dict(command.body)
-        body["command_id"] = command_id
         payload = json.dumps(body, separators=(",", ":"))
         self._register_command_ledger(command, bridge_id, command_id)
-        self._observe_air(command, bridge_id, body)
         await self._publisher(topic, payload)
 
-    def _observe_air(
-        self,
-        command: _QueuedCommand,
-        bridge_id: str,
-        body: Mapping[str, object],
-    ) -> None:
-        """Record predicted channel occupancy. SHADOW ONLY -- never delays.
+    def _air_bridge_boot(self, bridge_id: str) -> int | None:
+        """Return the selected bridge's current strict boot snapshot."""
+        return next(
+            (
+                _strict_uint32(bridge.boot)
+                for bridge in self.registry.bridges
+                if bridge.bridge_id == bridge_id
+            ),
+            None,
+        )
 
-        Deliberately best-effort: arbitration is an optimization, and a fault
-        in it must never become a reason a blind fails to move.
-        """
+    def _record_air_internal_failure(self, message: str) -> None:
+        """Count a calendar fault when possible without blocking publication."""
         try:
-            self._air.observe(
-                bridge_id=bridge_id,
-                body=body,
-                is_stop=command.is_stop,
-                online_bridges=sum(1 for bridge in self.registry.bridges if bridge.online),
-                # MONOTONIC, never self._now(): the hub's clock is wall time,
-                # and an NTP step would prematurely clear or extend the air
-                # horizon. Air scheduling only ever measures local elapsed
-                # time, so it must not be steppable.
-                now=time.monotonic(),
-            )
-        except TypeError, ValueError, AttributeError, KeyError:
-            _LOGGER.debug("air: shadow observation failed", exc_info=True)
+            self._air.record_internal_error()
+        except Exception:
+            _LOGGER.warning("air: internal-error accounting failed", exc_info=True)
+        _LOGGER.warning(message, exc_info=True)
 
     async def _enqueue_publish(
         self,
@@ -2409,6 +2584,7 @@ class ZemismartHub:
         )
         key = (bridge.bridge_id, command_id)
         ledger_confirmed = False
+        air_failure_reason: Literal["started_timeout", "cancelled_after_publish"] | None = None
         _LOGGER.debug(
             "Publishing command %s (target %s) via bridge %s (area %s)",
             command_id,
@@ -2429,10 +2605,21 @@ class ZemismartHub:
                 self._ledger.confirm(command_id, started_at)
                 ledger_confirmed = True
                 self._state_sync.resume_holds(command_id)
+        except CommandStartedTimeoutError:
+            air_failure_reason = "started_timeout"
+            raise
+        except asyncio.CancelledError:
+            air_failure_reason = "cancelled_after_publish"
+            raise
         finally:
             # Pop on EVERY exit, including an immediate publish transport
             # error, so a failed command never leaks its pending entry.
             self._pending.pop(key, None)
+            self._air.release_pending(
+                bridge.bridge_id,
+                command_id,
+                fail_open_reason=air_failure_reason,
+            )
             if pending.started.done() and not pending.started.cancelled():
                 pending.started.exception()
             if command.ledger_registered and not ledger_confirmed:
@@ -2634,6 +2821,19 @@ class ZemismartHub:
                 for future in fast.futures:
                     if not future.done():
                         future.set_result("superseded")
+        inflight = self._inflight
+        if (
+            inflight is not None
+            and inflight.owner == owner
+            and inflight.air_waiting
+            and inflight.published is not None
+            and not inflight.published.is_set()
+        ):
+            for future in inflight.futures:
+                if not future.done():
+                    future.set_result("superseded")
+            inflight.published.set()
+            self._air.wake()
 
     async def async_disarm_remote(
         self,
@@ -2689,6 +2889,7 @@ class ZemismartHub:
     def close(self) -> None:
         """Cancel the worker and all queued or in-flight waiters on final unload."""
         self._closed = True
+        self._air.close()
         self._on_disarms_idle = None
         self._state_sync.close()
         for clock in self._bridge_clocks.values():

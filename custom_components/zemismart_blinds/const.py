@@ -22,6 +22,7 @@ CONF_TRAVEL_DOWN: Final = "travel_down"
 CONF_AREA_ID: Final = "area_id"
 CONF_REPEATS: Final = "repeats"
 CONF_COALESCE_WINDOW_MS: Final = "coalesce_window_ms"
+CONF_AIR_ARBITRATION_MODE: Final = "air_arbitration_mode"
 
 DEFAULT_TRAVEL_UP: Final = 15.0
 DEFAULT_TRAVEL_DOWN: Final = 15.0
