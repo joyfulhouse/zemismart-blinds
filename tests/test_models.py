@@ -4350,3 +4350,65 @@ def test_pending_command_is_not_proof_of_emission() -> None:
 
     assert verdict, "publish should have run"
     assert verdict["pending_masks"] is False
+
+
+def test_shadow_arbiter_observes_without_delaying_publication() -> None:
+    """Shadow mode must record contention and change no timing at all."""
+    registry = _online_registry()
+    registry.update_info("bridge-b", {"area": "office"})
+    registry.update_availability("bridge-b", "online")
+    published: list[float] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(clock["now"])
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    ids = iter(["cmd-1", "cmd-2"])
+    hub = ZemismartHub(
+        registry,
+        publish,
+        command_id_factory=lambda: next(ids),
+        now=lambda: clock["now"],
+    )
+    config = blind_config()
+
+    async def scenario() -> None:
+        await hub.async_transmit(config, "DOWN", stop_after_ms=None)
+        # A second command 200 ms later, while the first train is still on air.
+        clock["now"] = 1_000.2
+        await hub.async_transmit(replace(config, channels=(3,)), "UP", stop_after_ms=None)
+
+    asyncio.run(scenario())
+
+    # Shadow mode: BOTH published, and the second was not held back.
+    assert published == [1_000.0, 1_000.2]
+
+    stats = hub.air_shadow_stats()
+    assert stats["planned"] == 2
+    assert stats["would_wait"] == 1
+    assert isinstance(stats["would_wait_max_ms"], int)
+    assert stats["would_wait_max_ms"] > 0
+
+
+def test_shadow_arbiter_stays_off_for_a_single_bridge_install() -> None:
+    """One online bridge must leave the hub's behavior entirely unchanged."""
+    published: list[str] = []
+    clock = {"now": 1.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        _online_registry(),
+        publish,
+        command_id_factory=lambda: "cmd-solo",
+        now=lambda: clock["now"],
+    )
+    asyncio.run(hub.async_transmit(blind_config(), "DOWN", stop_after_ms=None))
+
+    assert published == ["rf433/bridge-a/tx"]
+    stats = hub.air_shadow_stats()
+    assert stats["disabled_single_bridge"] == 1
+    assert stats["planned"] == 0
