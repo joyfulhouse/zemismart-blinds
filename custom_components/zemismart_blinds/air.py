@@ -48,6 +48,10 @@ class AirPlan:
     """One command's predicted occupancy of the shared channel."""
 
     action_ms: int
+    # Carried for Phase 2, which must reserve the future fail-safe STOP window
+    # so later normal work does not collide with it. Phase 1 does NOT model it:
+    # the shadow horizon covers only the immediate train, so a STOP whose
+    # deadline lands inside another command's train is not yet measured.
     stop_offset_ms: int | None
     stop_ms: int
 
@@ -157,7 +161,16 @@ class AirArbiter:
         self.stats.planned += 1
 
         wait_ms = 0
-        if self._busy_until is not None and now < self._busy_until:
+        if (
+            self._busy_until is not None
+            and now < self._busy_until
+            # SAME-bridge work is already serialized by that bridge's own
+            # TargetScheduler, which paces every handoff by real airtime.
+            # Counting it as cross-bridge contention inflates the shadow
+            # numbers this phase exists to produce, and would add pointless
+            # latency in Phase 2.
+            and bridge_id != self._busy_owner
+        ):
             wait_ms = int((self._busy_until - now) * 1_000)
 
         if is_stop:

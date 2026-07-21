@@ -409,6 +409,13 @@ def estimate_b0_slot_ms(frame: str, *, repeat_gap_ms: int = FIRMWARE_REPEAT_GAP_
     buckets, pulse_data, embedded_repeat = _b0_parts(normalized)
     airtime_us = sum(buckets[int(nibble, 16) & 0x07] for nibble in pulse_data) * embedded_repeat
     air_ms = -(-airtime_us // 1_000)
+    if air_ms == 0:
+        # Firmware charges serialization ONLY when the frame will actually key
+        # RF: a zero-airtime frame's bytes drain through the EFM8's ring
+        # without transmitting, so it occupies margin alone (record_dispatch_
+        # in rf433_scheduler.h). Charging UART here would overstate a
+        # maximum-length zero-duration frame as 140 ms against the real 35 ms.
+        return max(repeat_gap_ms, FIRMWARE_RF_MARGIN_MS)
     uart_ms = -(-len(normalized) * 5_000 // FIRMWARE_UART_BAUD)
     return max(repeat_gap_ms, uart_ms + air_ms + FIRMWARE_RF_MARGIN_MS)
 

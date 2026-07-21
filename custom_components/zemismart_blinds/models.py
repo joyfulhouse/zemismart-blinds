@@ -2328,7 +2328,11 @@ class ZemismartHub:
                 body=body,
                 is_stop=command.is_stop,
                 online_bridges=sum(1 for bridge in self.registry.bridges if bridge.online),
-                now=self._now(),
+                # MONOTONIC, never self._now(): the hub's clock is wall time,
+                # and an NTP step would prematurely clear or extend the air
+                # horizon. Air scheduling only ever measures local elapsed
+                # time, so it must not be steppable.
+                now=time.monotonic(),
             )
         except TypeError, ValueError, AttributeError, KeyError:
             _LOGGER.debug("air: shadow observation failed", exc_info=True)

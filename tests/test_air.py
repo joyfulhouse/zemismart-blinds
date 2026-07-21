@@ -167,3 +167,36 @@ def test_stop_never_accrues_a_wait_only_a_bypass() -> None:
     # Critically: a STOP is never counted as something that WOULD have waited.
     assert stats["would_wait"] == 0
     assert stats["waits_by_bridge"] == {}
+
+
+def test_same_bridge_is_not_cross_bridge_contention() -> None:
+    """A bridge's own scheduler serializes its work; do not double-count it."""
+    arbiter = AirArbiter()
+    body = {"raw": _frame(), "repeats": 2}
+    arbiter.observe(bridge_id="bridge-a", body=body, is_stop=False, online_bridges=7, now=1_000.0)
+    # Same bridge, well inside the first train.
+    assert (
+        arbiter.observe(
+            bridge_id="bridge-a", body=body, is_stop=False, online_bridges=7, now=1_000.2
+        )
+        == 0
+    )
+    assert arbiter.stats.as_dict()["would_wait"] == 0
+    # A DIFFERENT bridge in the same window is real contention.
+    assert (
+        arbiter.observe(
+            bridge_id="bridge-b", body=body, is_stop=False, online_bridges=7, now=1_000.4
+        )
+        > 0
+    )
+    assert arbiter.stats.as_dict()["would_wait"] == 1
+
+
+def test_zero_airtime_frame_matches_firmware_margin_only_hold() -> None:
+    """Firmware charges serialization only when the frame will key RF."""
+    # One bucket of duration 0; both pulse nibbles (0 and 8) mask to bucket 0,
+    # so the frame is structurally legal and contributes no airtime at all.
+    zero_airtime = "AAB005" + "01" + "08" + "0000" + "08" + "55"
+    assert estimate_b0_slot_ms(zero_airtime, repeat_gap_ms=0) == 5
+    # The pacing gap still dominates at the production setting.
+    assert estimate_b0_slot_ms(zero_airtime) == 35

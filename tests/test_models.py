@@ -4352,43 +4352,86 @@ def test_pending_command_is_not_proof_of_emission() -> None:
     assert verdict["pending_masks"] is False
 
 
-def test_shadow_arbiter_observes_without_delaying_publication() -> None:
-    """Shadow mode must record contention and change no timing at all."""
-    registry = _online_registry()
-    registry.update_info("bridge-b", {"area": "office"})
-    registry.update_availability("bridge-b", "online")
-    published: list[float] = []
+def _two_area_registry() -> BridgeRegistry:
+    """Return two online bridges in DIFFERENT areas so routing really differs."""
+    registry = BridgeRegistry()
+    for bridge_id, area in (("bridge-a", "living_room"), ("bridge-b", "office")):
+        registry.update_info(bridge_id, {"area": area})
+        registry.update_availability(bridge_id, "online")
+    return registry
+
+
+def test_shadow_arbiter_observes_cross_bridge_without_delaying() -> None:
+    """Two bridges keying the air together is the case worth measuring."""
+    published: list[tuple[str, float]] = []
     clock = {"now": 1_000.0}
 
     async def publish(topic: str, payload: str) -> None:
-        published.append(clock["now"])
+        published.append((topic, clock["now"]))
         accept_and_start(hub, topic.split("/")[1], json.loads(payload))
 
     ids = iter(["cmd-1", "cmd-2"])
     hub = ZemismartHub(
-        registry,
+        _two_area_registry(),
         publish,
         command_id_factory=lambda: next(ids),
         now=lambda: clock["now"],
     )
-    config = blind_config()
+
+    async def scenario() -> None:
+        await hub.async_transmit(blind_config(area_id="living_room"), "DOWN", stop_after_ms=None)
+        clock["now"] = 1_000.2
+        await hub.async_transmit(
+            replace(blind_config(area_id="office"), channels=(3,)), "UP", stop_after_ms=None
+        )
+
+    asyncio.run(scenario())
+
+    # Genuinely different bridges...
+    assert [topic for topic, _ in published] == [
+        "rf433/bridge-a/tx",
+        "rf433/bridge-b/tx",
+    ]
+    # ...both published immediately: shadow mode delays nothing.
+    assert [when for _, when in published] == [1_000.0, 1_000.2]
+
+    stats = hub.air_shadow_stats()
+    assert stats["planned"] == 2
+    assert stats["would_wait"] == 1
+    assert stats["waits_by_bridge"] == {"bridge-b": 1}
+
+
+def test_shadow_arbiter_ignores_same_bridge_back_to_back_commands() -> None:
+    """The bridge's own scheduler already serializes these -- not contention."""
+    published: list[str] = []
+    clock = {"now": 1_000.0}
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    ids = iter(["cmd-1", "cmd-2"])
+    hub = ZemismartHub(
+        _two_area_registry(),
+        publish,
+        command_id_factory=lambda: next(ids),
+        now=lambda: clock["now"],
+    )
+    config = blind_config(area_id="living_room")
 
     async def scenario() -> None:
         await hub.async_transmit(config, "DOWN", stop_after_ms=None)
-        # A second command 200 ms later, while the first train is still on air.
         clock["now"] = 1_000.2
         await hub.async_transmit(replace(config, channels=(3,)), "UP", stop_after_ms=None)
 
     asyncio.run(scenario())
 
-    # Shadow mode: BOTH published, and the second was not held back.
-    assert published == [1_000.0, 1_000.2]
-
+    assert published == ["rf433/bridge-a/tx", "rf433/bridge-a/tx"]
     stats = hub.air_shadow_stats()
     assert stats["planned"] == 2
-    assert stats["would_wait"] == 1
-    assert isinstance(stats["would_wait_max_ms"], int)
-    assert stats["would_wait_max_ms"] > 0
+    # Same bridge, back to back, INSIDE the first train: still not contention.
+    assert stats["would_wait"] == 0
+    assert stats["waits_by_bridge"] == {}
 
 
 def test_shadow_arbiter_stays_off_for_a_single_bridge_install() -> None:
