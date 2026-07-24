@@ -709,7 +709,7 @@ class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
-    VERSION = 1
+    VERSION = 2
 
     @classmethod
     @callback

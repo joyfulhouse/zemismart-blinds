@@ -12,11 +12,12 @@ import pytest
 import voluptuous as vol
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt.models import ReceiveMessage
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentryDataWithId
 from homeassistant.exceptions import HomeAssistantError
 
 import custom_components.zemismart_blinds as integration_module
 from custom_components.zemismart_blinds import (
+    async_migrate_entry,
     async_setup,
     async_setup_entry,
     async_unload_entry,
@@ -24,8 +25,10 @@ from custom_components.zemismart_blinds import (
 from custom_components.zemismart_blinds.codec import CommandBases, derive_bases_from_base
 from custom_components.zemismart_blinds.const import (
     CONF_AIR_ARBITRATION_MODE,
+    CONF_CHANNELS,
     CONF_COVER_ID,
     CONF_COVERS,
+    CONF_NAME,
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
@@ -53,7 +56,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.device_registry import DeviceEntry
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+    from homeassistant.helpers.entity_registry import RegistryEntry
 
 
 def config_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
@@ -116,6 +121,125 @@ def legacy_config_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
 def add_to_manager(hass: HomeAssistant, entry: ConfigEntry[RemoteRuntime]) -> None:
     """Register a hand-built entry so registries can link devices to it."""
     hass.config_entries._entries[entry.entry_id] = entry
+
+
+def migration_config_entry(
+    entry_id: str,
+    *,
+    subentries: list[tuple[str, str, dict[str, Any]]],
+    covers: list[dict[str, Any]] | None = None,
+    version: int = 1,
+) -> ConfigEntry[RemoteRuntime]:
+    """Build a remote entry with stable cover subentry ids for migration tests."""
+    data = dict(config_entry("migration-template").data)
+    if covers is not None:
+        data[CONF_COVERS] = covers
+    return ConfigEntry(
+        data=data,
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=1,
+        options={},
+        source="user",
+        subentries_data=[
+            ConfigSubentryDataWithId(
+                data=subentry_data,
+                subentry_id=cover_id,
+                subentry_type="cover",
+                title=title,
+                unique_id=cover_id,
+            )
+            for cover_id, title, subentry_data in subentries
+        ],
+        title=f"Remote {entry_id}",
+        unique_id=f"a1b2c3:42:{entry_id}",
+        version=version,
+    )
+
+
+def stub_entry_setup(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub MQTT transport and platform forwarding for entry setup tests."""
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        return
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+
+
+def register_migration_state(
+    hass: HomeAssistant,
+    entry: ConfigEntry[RemoteRuntime],
+    cover_ids: list[str],
+    *,
+    disabled_id: str | None = None,
+) -> tuple[DeviceEntry, dict[str, RegistryEntry]]:
+    """Register the shared device and pre-migration entity rows."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    device_registry = dr.async_get(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=None,
+        identifiers={(DOMAIN, entry.entry_id)},
+        name=entry.title,
+    )
+    entity_registry = er.async_get(hass)
+    entities: dict[str, RegistryEntry] = {}
+    for cover_id in cover_ids:
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            config_subentry_id=cover_id,
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+        )
+        entity = entity_registry.async_get_or_create(
+            "cover",
+            DOMAIN,
+            cover_id,
+            config_entry=entry,
+            config_subentry_id=cover_id,
+            device_id=device.id,
+            disabled_by=(er.RegistryEntryDisabler.USER if cover_id == disabled_id else None),
+            original_name=cover_id,
+        )
+        entities[cover_id] = entity_registry.async_update_entity(
+            entity.entity_id,
+            area_id=f"area-{cover_id}",
+            icon=f"mdi:{cover_id}",
+            labels={f"label-{cover_id}"},
+            name=f"Custom {cover_id}",
+        )
+    return device, entities
+
+
+def entity_identity(entry: RegistryEntry) -> tuple[object, ...]:
+    """Return registry fields migration must preserve byte-identically."""
+    return (
+        entry.id,
+        entry.entity_id,
+        entry.unique_id,
+        entry.area_id,
+        entry.labels,
+        entry.options,
+        entry.name,
+        entry.icon,
+        entry.disabled_by,
+    )
 
 
 def message(
@@ -716,6 +840,250 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
         )
 
     assert published == []
+
+
+@pytest.mark.asyncio
+async def test_migration_folds_subentries_into_data_preserving_identity(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Migration stages every cover and re-homes registry rows without recreation."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    first_data = {
+        CONF_CHANNELS: [1],
+        "travel_up": 14.0,
+        "travel_down": 13.0,
+        "future_calibration": {"offset": 7},
+    }
+    second_data = {
+        CONF_CHANNELS: [2, 3],
+        "travel_up": 16.0,
+        "travel_down": 15.0,
+    }
+    entry = migration_config_entry(
+        "migration-full",
+        subentries=[
+            ("cover-one", "Living room", first_data),
+            ("cover-two", "Dining room", second_data),
+        ],
+    )
+    add_to_manager(hass, entry)
+    device, before_entities = register_migration_state(
+        hass,
+        entry,
+        ["cover-one", "cover-two"],
+        disabled_id="cover-two",
+    )
+    before_identity = {
+        cover_id: entity_identity(reg_entry) for cover_id, reg_entry in before_entities.items()
+    }
+    expected_covers = [
+        {CONF_COVER_ID: "cover-one", CONF_NAME: "Living room", **first_data},
+        {CONF_COVER_ID: "cover-two", CONF_NAME: "Dining room", **second_data},
+    ]
+    stub_entry_setup(hass, monkeypatch)
+
+    assert await async_migrate_entry(hass, entry)
+    assert await async_setup_entry(hass, entry)
+
+    assert entry.version == 2
+    assert entry.data[CONF_COVERS] == expected_covers
+    assert not entry.subentries
+    entity_registry = er.async_get(hass)
+    for cover_id, before in before_entities.items():
+        after = entity_registry.async_get(before.entity_id)
+        assert after is not None
+        assert entity_identity(after) == before_identity[cover_id]
+        assert after.config_subentry_id is None
+    migrated_device = dr.async_get(hass).async_get(device.id)
+    assert migrated_device is not None
+    assert migrated_device.config_entries_subentries[entry.entry_id] == {None}
+
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_migration_is_idempotent_on_v2(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second migration and setup leave the converged v2 state unchanged."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    cover_data = {
+        CONF_CHANNELS: [4],
+        "travel_up": 11.0,
+        "travel_down": 10.0,
+    }
+    entry = migration_config_entry(
+        "migration-idempotent",
+        subentries=[("cover-four", "Office", cover_data)],
+    )
+    add_to_manager(hass, entry)
+    device, entities = register_migration_state(hass, entry, ["cover-four"])
+    stub_entry_setup(hass, monkeypatch)
+    assert await async_migrate_entry(hass, entry)
+    assert await async_setup_entry(hass, entry)
+
+    registry_entry = er.async_get(hass).async_get(entities["cover-four"].entity_id)
+    assert registry_entry is not None
+    migrated_device = dr.async_get(hass).async_get(device.id)
+    assert migrated_device is not None
+    before = (
+        entry.data,
+        entry.subentries,
+        entity_identity(registry_entry),
+        registry_entry.config_subentry_id,
+        migrated_device.config_entries_subentries,
+    )
+
+    assert await async_migrate_entry(hass, entry)
+    assert await async_setup_entry(hass, entry)
+
+    registry_entry = er.async_get(hass).async_get(entities["cover-four"].entity_id)
+    assert registry_entry is not None
+    migrated_device = dr.async_get(hass).async_get(device.id)
+    assert migrated_device is not None
+    assert (
+        entry.data,
+        entry.subentries,
+        entity_identity(registry_entry),
+        registry_entry.config_subentry_id,
+        migrated_device.config_entries_subentries,
+    ) == before
+
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_migration_resumes_after_partial_cleanup(hass: HomeAssistant) -> None:
+    """A retry uses the staged list after one subentry was already removed."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    first_data = {
+        CONF_CHANNELS: [5],
+        "travel_up": 12.0,
+        "travel_down": 11.0,
+    }
+    second_data = {
+        CONF_CHANNELS: [6],
+        "travel_up": 13.0,
+        "travel_down": 12.0,
+    }
+    staged_covers = [
+        {CONF_COVER_ID: "cover-five", CONF_NAME: "Bedroom", **first_data},
+        {CONF_COVER_ID: "cover-six", CONF_NAME: "Guest room", **second_data},
+    ]
+    entry = migration_config_entry(
+        "migration-partial",
+        covers=staged_covers,
+        subentries=[
+            ("cover-five", "Bedroom", first_data),
+            ("cover-six", "Guest room", second_data),
+        ],
+    )
+    add_to_manager(hass, entry)
+    device, entities = register_migration_state(
+        hass,
+        entry,
+        ["cover-five", "cover-six"],
+    )
+    entity_registry = er.async_get(hass)
+    entity_registry.async_update_entity(
+        entities["cover-five"].entity_id,
+        config_subentry_id=None,
+    )
+    assert hass.config_entries.async_remove_subentry(entry, "cover-five")
+    assert list(entry.subentries) == ["cover-six"]
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 2
+    assert entry.data[CONF_COVERS] == staged_covers
+    assert not entry.subentries
+    for entity in entities.values():
+        after = entity_registry.async_get(entity.entity_id)
+        assert after is not None
+        assert after.config_subentry_id is None
+    migrated_device = dr.async_get(hass).async_get(device.id)
+    assert migrated_device is not None
+    assert migrated_device.config_entries_subentries[entry.entry_id] == {None}
+
+
+@pytest.mark.asyncio
+async def test_migration_passes_legacy_entries_through_untouched(
+    hass: HomeAssistant,
+) -> None:
+    """Legacy entry data remains the setup refusal's byte-identical reference."""
+    from homeassistant.exceptions import ConfigEntryError
+
+    entry = legacy_config_entry("migration-legacy")
+    add_to_manager(hass, entry)
+    original_data = entry.data
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 2
+    assert entry.data is original_data
+    assert CONF_COVERS not in entry.data
+    with pytest.raises(ConfigEntryError, match="retired per-blind format"):
+        await async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_v2_setup_repair_converges_registry_skew(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V2 setup repairs registry links even when the subentry no longer exists."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    cover_id = "cover-stale"
+    cover_data = {
+        CONF_CHANNELS: [7],
+        "travel_up": 9.0,
+        "travel_down": 8.0,
+    }
+    entry = migration_config_entry(
+        "migration-dirty-v2",
+        covers=[{CONF_COVER_ID: cover_id, CONF_NAME: "Nursery", **cover_data}],
+        subentries=[(cover_id, "Nursery", cover_data)],
+        version=2,
+    )
+    add_to_manager(hass, entry)
+    device, entities = register_migration_state(hass, entry, [cover_id])
+    object.__setattr__(entry, "subentries", MappingProxyType({}))
+    before_identity = entity_identity(entities[cover_id])
+    stub_entry_setup(hass, monkeypatch)
+
+    def forbidden_remove_subentry(
+        _entry: ConfigEntry[RemoteRuntime],
+        _subentry_id: str,
+    ) -> bool:
+        raise AssertionError("v2 setup repair must not remove config subentries")
+
+    monkeypatch.setattr(
+        hass.config_entries,
+        "async_remove_subentry",
+        forbidden_remove_subentry,
+    )
+
+    assert await async_setup_entry(hass, entry)
+
+    repaired_entity = er.async_get(hass).async_get(entities[cover_id].entity_id)
+    assert repaired_entity is not None
+    assert entity_identity(repaired_entity) == before_identity
+    assert repaired_entity.config_subentry_id is None
+    repaired_device = dr.async_get(hass).async_get(device.id)
+    assert repaired_device is not None
+    assert repaired_device.config_entries_subentries[entry.entry_id] == {None}
+
+    await async_unload_entry(hass, entry)
 
 
 @pytest.mark.asyncio
