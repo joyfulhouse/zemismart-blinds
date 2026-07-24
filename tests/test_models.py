@@ -102,7 +102,11 @@ def test_cover_config_normalizes_and_exposes_channel_key() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig
 
     cover = CoverConfig(
-        name="  Kitchen sink  ", channels=(3, 1, 2), travel_up=12.0, travel_down=10.0
+        name="  Kitchen sink  ",
+        channels=(3, 1, 2),
+        travel_up=12.0,
+        travel_down=10.0,
+        cover_id="cover-kitchen-sink",
     )
     assert cover.name == "Kitchen sink"
     assert cover.channels == (1, 2, 3)
@@ -113,7 +117,11 @@ def test_cover_config_normalizes_and_exposes_channel_key() -> None:
 def test_cover_config_allows_missing_travel_times() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig
 
-    cover = CoverConfig(name="All shades", channels=(1, 2, 3, 4, 5, 6))
+    cover = CoverConfig(
+        name="All shades",
+        channels=(1, 2, 3, 4, 5, 6),
+        cover_id="cover-all-shades",
+    )
     assert cover.travel_up is None
     assert cover.travel_down is None
     assert cover.has_travel is False
@@ -123,29 +131,60 @@ def test_cover_config_rejects_partial_travel_times() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig
 
     with pytest.raises(ValueError, match="together"):
-        CoverConfig(name="x", channels=(1,), travel_up=12.0)
+        CoverConfig(name="x", channels=(1,), travel_up=12.0, cover_id="cover-x")
 
 
 def test_cover_config_rejects_empty_name_and_bad_travel() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig
 
     with pytest.raises(ValueError, match="name"):
-        CoverConfig(name="   ", channels=(1,), travel_up=5.0, travel_down=5.0)
+        CoverConfig(
+            name="   ",
+            channels=(1,),
+            travel_up=5.0,
+            travel_down=5.0,
+            cover_id="cover-x",
+        )
     with pytest.raises(ValueError):
-        CoverConfig(name="x", channels=(1,), travel_up=0.0, travel_down=5.0)
+        CoverConfig(
+            name="x",
+            channels=(1,),
+            travel_up=0.0,
+            travel_down=5.0,
+            cover_id="cover-x",
+        )
     with pytest.raises(ValueError):
-        CoverConfig(name="x", channels=(1,), travel_up=5.0, travel_down=999_999.0)
+        CoverConfig(
+            name="x",
+            channels=(1,),
+            travel_up=5.0,
+            travel_down=999_999.0,
+            cover_id="cover-x",
+        )
+
+
+def test_cover_config_requires_cover_id() -> None:
+    from custom_components.zemismart_blinds.models import CoverConfig
+
+    with pytest.raises(ValueError, match="cover_id"):
+        CoverConfig(name="Counter", channels=(4,), cover_id="   ")
 
 
 def test_cover_config_roundtrips_through_mapping() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig
 
-    cover = CoverConfig(name="Counter", channels=(4,), travel_up=8.5, travel_down=9.5)
-    restored = CoverConfig.from_subentry(cover.as_dict())
+    cover = CoverConfig(
+        name="Counter",
+        channels=(4,),
+        travel_up=8.5,
+        travel_down=9.5,
+        cover_id="cover-counter",
+    )
+    restored = CoverConfig.from_stored(cover.cover_id, cover.as_dict())
     assert restored == cover
 
-    aggregate = CoverConfig(name="All", channels=(1, 2, 3))
-    restored_aggregate = CoverConfig.from_subentry(aggregate.as_dict())
+    aggregate = CoverConfig(name="All", channels=(1, 2, 3), cover_id="cover-all")
+    restored_aggregate = CoverConfig.from_stored(aggregate.cover_id, aggregate.as_dict())
     assert restored_aggregate == aggregate
     assert restored_aggregate.travel_up is None
 
@@ -210,6 +249,74 @@ def test_remote_config_roundtrips_through_mapping() -> None:
     assert restored.remote.bases == TEST_BASES
 
 
+def test_remote_config_round_trips_cover_rows_verbatim() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    rows: list[dict[str, object]] = [
+        {
+            "cover_id": "cover-counter",
+            "name": "Counter",
+            "channels": [4],
+            "travel_up": 8.5,
+            "travel_down": 9.5,
+            "calibration_blob": "xyz",
+        },
+        {
+            "cover_id": "cover-all",
+            "name": "All",
+            "channels": [1, 2, 3, 4, 5, 6],
+        },
+    ]
+    data = {
+        **RemoteConfig(
+            name="Kitchen remote",
+            remote=_remote_identity(),
+            area_id="kitchen",
+            repeats=7,
+        ).as_dict(),
+        "covers": rows,
+    }
+
+    assert RemoteConfig.from_entry(data).as_dict()["covers"] == rows
+
+
+def test_remote_config_rejects_duplicate_cover_ids() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    data = {
+        **RemoteConfig(
+            name="Kitchen remote",
+            remote=_remote_identity(),
+            area_id="kitchen",
+            repeats=7,
+        ).as_dict(),
+        "covers": [
+            {"cover_id": "duplicate", "name": "Counter", "channels": [4]},
+            {"cover_id": "duplicate", "name": "Sink", "channels": [5]},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="duplicate"):
+        RemoteConfig.from_entry(data)
+
+
+def test_remote_config_rejects_malformed_cover_row() -> None:
+    from custom_components.zemismart_blinds.models import RemoteConfig
+
+    data = {
+        **RemoteConfig(
+            name="Kitchen remote",
+            remote=_remote_identity(),
+            area_id="kitchen",
+            repeats=7,
+        ).as_dict(),
+        "covers": [{"cover_id": "broken-cover", "name": "Broken"}],
+    }
+
+    with pytest.raises(ValueError, match="broken-cover"):
+        RemoteConfig.from_entry(data)
+
+
 def test_laminar_conflict_accepts_disjoint_and_nested() -> None:
     from custom_components.zemismart_blinds.models import laminar_conflict
 
@@ -243,10 +350,32 @@ def test_laminar_conflict_normalizes_before_comparing() -> None:
 def _kitchen_covers() -> list[CoverConfig]:
     from custom_components.zemismart_blinds.models import CoverConfig
 
-    slider = CoverConfig(name="Slider", channels=(1, 2, 3), travel_up=12.0, travel_down=12.0)
-    counter = CoverConfig(name="Counter", channels=(4,), travel_up=8.0, travel_down=8.0)
-    sink = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
-    allshades = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    slider = CoverConfig(
+        name="Slider",
+        channels=(1, 2, 3),
+        travel_up=12.0,
+        travel_down=12.0,
+        cover_id="cover-slider",
+    )
+    counter = CoverConfig(
+        name="Counter",
+        channels=(4,),
+        travel_up=8.0,
+        travel_down=8.0,
+        cover_id="cover-counter",
+    )
+    sink = CoverConfig(
+        name="Sink",
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        cover_id="cover-sink",
+    )
+    allshades = CoverConfig(
+        name="All",
+        channels=(1, 2, 3, 4, 5, 6),
+        cover_id="cover-all",
+    )
     return [slider, counter, sink, allshades]
 
 
@@ -274,11 +403,37 @@ def test_member_covers_are_leaves_only() -> None:
 def test_member_covers_excludes_nested_aggregates() -> None:
     from custom_components.zemismart_blinds.models import CoverConfig, member_covers
 
-    leaf1 = CoverConfig(name="1", channels=(1,), travel_up=5.0, travel_down=5.0)
-    inner = CoverConfig(name="inner", channels=(1, 2))  # aggregate over leaf1
-    leaf2 = CoverConfig(name="2", channels=(2,), travel_up=5.0, travel_down=5.0)
-    outer = CoverConfig(name="outer", channels=(1, 2, 3))  # aggregate
-    leaf3 = CoverConfig(name="3", channels=(3,), travel_up=5.0, travel_down=5.0)
+    leaf1 = CoverConfig(
+        name="1",
+        channels=(1,),
+        travel_up=5.0,
+        travel_down=5.0,
+        cover_id="cover-1",
+    )
+    inner = CoverConfig(
+        name="inner",
+        channels=(1, 2),
+        cover_id="cover-inner",
+    )  # aggregate over leaf1
+    leaf2 = CoverConfig(
+        name="2",
+        channels=(2,),
+        travel_up=5.0,
+        travel_down=5.0,
+        cover_id="cover-2",
+    )
+    outer = CoverConfig(
+        name="outer",
+        channels=(1, 2, 3),
+        cover_id="cover-outer",
+    )  # aggregate
+    leaf3 = CoverConfig(
+        name="3",
+        channels=(3,),
+        travel_up=5.0,
+        travel_down=5.0,
+        cover_id="cover-3",
+    )
     covers = [leaf1, inner, leaf2, outer, leaf3]
     members = member_covers(outer, covers)
     assert [m.channel_key for m in members] == ["1", "2", "3"]  # inner (1-2) excluded
@@ -4078,7 +4233,13 @@ def test_blindconfig_derive_from_remote_and_cover() -> None:
         repeats=7,
         coalesce_window_ms=200,
     )
-    leaf = CoverConfig(name="Sink", channels=(5,), travel_up=9.0, travel_down=9.0)
+    leaf = CoverConfig(
+        name="Sink",
+        channels=(5,),
+        travel_up=9.0,
+        travel_down=9.0,
+        cover_id="cover-sink",
+    )
     derived = BlindConfig.derive(remote, leaf, Role.LEAF)
     assert derived.name == "Sink"
     assert derived.channels == (5,)
@@ -4089,7 +4250,11 @@ def test_blindconfig_derive_from_remote_and_cover() -> None:
     assert derived.role is Role.LEAF
     assert derived.remote.key == remote.key
 
-    aggregate_cover = CoverConfig(name="All", channels=(1, 2, 3, 4, 5, 6))
+    aggregate_cover = CoverConfig(
+        name="All",
+        channels=(1, 2, 3, 4, 5, 6),
+        cover_id="cover-all",
+    )
     aggregate = BlindConfig.derive(remote, aggregate_cover, Role.AGGREGATE)
     assert aggregate.is_aggregate is True
     assert aggregate.travel_up is None

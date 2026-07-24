@@ -33,6 +33,8 @@ from .const import (
     CONF_BASE_UP,
     CONF_CHANNELS,
     CONF_COALESCE_WINDOW_MS,
+    CONF_COVER_ID,
+    CONF_COVERS,
     CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
@@ -292,19 +294,24 @@ def _optional_travel(value: object, field: str) -> float | None:
 
 @dataclass(frozen=True, slots=True)
 class CoverConfig:
-    """One cover subentry: a named channel set with optional travel timing."""
+    """One stored cover: a stable identity and optional travel timing."""
 
     name: str
     channels: tuple[int, ...]
     travel_up: float | None = None
     travel_down: float | None = None
+    cover_id: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
-        """Normalize and validate at the subentry-storage boundary."""
+        """Normalize and validate at the cover-storage boundary."""
         name = self.name.strip()
+        cover_id = self.cover_id.strip()
         channels = tuple(sorted(validate_channels(self.channels)))
         if not name:
             msg = "cover name must not be empty"
+            raise ValueError(msg)
+        if not cover_id:
+            msg = "cover_id must not be empty"
             raise ValueError(msg)
         if (self.travel_up is None) != (self.travel_down is None):
             msg = "travel_up and travel_down must be set together"
@@ -314,11 +321,12 @@ class CoverConfig:
                 msg = f"travel times must be finite, >0, at most {MAX_TRAVEL_SECONDS}"
                 raise ValueError(msg)
         object.__setattr__(self, "name", name)
+        object.__setattr__(self, "cover_id", cover_id)
         object.__setattr__(self, "channels", channels)
 
     @property
     def channel_key(self) -> str:
-        """Return the subentry-identity key, e.g. ``1-2-3``."""
+        """Return the canonical channel-set validation key, e.g. ``1-2-3``."""
         return "-".join(str(channel) for channel in self.channels)
 
     @property
@@ -327,17 +335,18 @@ class CoverConfig:
         return self.travel_up is not None
 
     @classmethod
-    def from_subentry(cls, data: Mapping[str, object]) -> CoverConfig:
-        """Build one cover from HA subentry data."""
+    def from_stored(cls, cover_id: str, data: Mapping[str, object]) -> CoverConfig:
+        """Build one cover from a stored entry-data row."""
         return cls(
             name=str(_required(data, CONF_NAME)),
             channels=parse_channels(_required(data, CONF_CHANNELS)),
             travel_up=_optional_travel(data.get(CONF_TRAVEL_UP), CONF_TRAVEL_UP),
             travel_down=_optional_travel(data.get(CONF_TRAVEL_DOWN), CONF_TRAVEL_DOWN),
+            cover_id=cover_id,
         )
 
     def as_dict(self) -> dict[str, object]:
-        """Return JSON-safe subentry storage values."""
+        """Return JSON-safe cover fields, excluding stable row identity."""
         values: dict[str, object] = {
             CONF_NAME: self.name,
             CONF_CHANNELS: list(self.channels),
@@ -358,11 +367,31 @@ class RemoteConfig:
     area_id: str
     repeats: int
     coalesce_window_ms: int = DEFAULT_COALESCE_WINDOW_MS
+    cover_rows: tuple[dict[str, object], ...] = ()
+    covers: tuple[CoverConfig, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         """Normalize and validate at the entry-storage boundary."""
         name = self.name.strip()
         area_id = self.area_id.strip()
+        cover_rows = tuple(dict(row) for row in self.cover_rows)
+        covers: list[CoverConfig] = []
+        seen_cover_ids: set[str] = set()
+        for row in cover_rows:
+            raw_cover_id = row.get(CONF_COVER_ID)
+            cover_id = raw_cover_id if isinstance(raw_cover_id, str) else ""
+            normalized_cover_id = cover_id.strip()
+            if normalized_cover_id in seen_cover_ids:
+                msg = f"duplicate cover_id: {normalized_cover_id}"
+                raise ValueError(msg)
+            try:
+                cover = CoverConfig.from_stored(cover_id, row)
+            except (TypeError, ValueError) as err:
+                row_id = normalized_cover_id or repr(raw_cover_id)
+                msg = f"invalid cover row {row_id}: {err}"
+                raise ValueError(msg) from err
+            seen_cover_ids.add(cover.cover_id)
+            covers.append(cover)
         if not name:
             msg = "remote name must not be empty"
             raise ValueError(msg)
@@ -384,6 +413,8 @@ class RemoteConfig:
             raise ValueError(msg)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "area_id", area_id)
+        object.__setattr__(self, "cover_rows", cover_rows)
+        object.__setattr__(self, "covers", tuple(covers))
 
     @property
     def key(self) -> str:
@@ -414,6 +445,19 @@ class RemoteConfig:
             else None
         )
         remote = RemoteIdentity(prefix=prefix, remote_id=remote_id, bases=bases)
+        raw_cover_rows = data.get(CONF_COVERS, ())
+        if not isinstance(raw_cover_rows, list | tuple):
+            msg = "covers must be a list"
+            raise ValueError(msg)
+        cover_rows: list[dict[str, object]] = []
+        for index, raw_row in enumerate(raw_cover_rows):
+            if not isinstance(raw_row, Mapping):
+                msg = f"cover row {index} must be a mapping"
+                raise ValueError(msg)
+            if not all(isinstance(key, str) for key in raw_row):
+                msg = f"cover row {index} keys must be strings"
+                raise ValueError(msg)
+            cover_rows.append(dict(cast("Mapping[str, object]", raw_row)))
         return cls(
             name=str(_required(data, CONF_NAME)),
             remote=remote,
@@ -423,6 +467,7 @@ class RemoteConfig:
                 data.get(CONF_COALESCE_WINDOW_MS, DEFAULT_COALESCE_WINDOW_MS),
                 CONF_COALESCE_WINDOW_MS,
             ),
+            cover_rows=tuple(cover_rows),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -442,6 +487,7 @@ class RemoteConfig:
         values[CONF_BASE_TRAILER] = (
             f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
         )
+        values[CONF_COVERS] = [dict(row) for row in self.cover_rows]
         return values
 
 
