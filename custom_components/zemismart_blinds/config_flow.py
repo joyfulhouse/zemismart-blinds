@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigSubentryData
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers import selector
+from homeassistant.util.ulid import ulid_now
 
 from .codec import (
     CommandBases,
@@ -39,6 +40,8 @@ from .const import (
     CONF_CALIBRATION_FRAME,
     CONF_CHANNELS,
     CONF_COALESCE_WINDOW_MS,
+    CONF_COVER_ID,
+    CONF_COVERS,
     CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
@@ -92,6 +95,9 @@ _BRIDGE_DISCOVERY_SECONDS = 0.25
 _MQTT_BOOTSTRAP_TIMEOUT_SECONDS = 5.0
 _CAPTURE_TIMEOUT_SECONDS = float(DEFAULT_SNIFF_WINDOW_SECONDS)
 _CAPTURE_OWNERS: dict[tuple[int, str], str] = {}
+# Subentry-era validation drafts do not receive HA's persisted ID; finish()
+# replaces this sentinel with fresh entry-data cover IDs.
+_PENDING_COVER_ID = "pending"
 
 
 def _float_value(value: object, fallback: float) -> float:
@@ -505,12 +511,13 @@ def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
 
 
 def _cover_display_values(
+    cover_id: str,
     data: Mapping[str, object],
     title: str,
 ) -> dict[str, object]:
     """Convert stored cover data to values suitable for form suggestions."""
     try:
-        cover = CoverConfig.from_subentry(data)
+        cover = CoverConfig.from_stored(cover_id, data)
     except TypeError, ValueError:
         suggested: dict[str, object] = {CONF_NAME: title}
         if (raw_channels := data.get(CONF_CHANNELS)) is not None:
@@ -558,6 +565,7 @@ def _validate_cover_input(
             channels=channels,
             travel_up=float(raw_up) if raw_up is not None else None,
             travel_down=float(raw_down) if raw_down is not None else None,
+            cover_id=_PENDING_COVER_ID,
         )
     except TypeError, ValueError:
         return None, {"base": "invalid_config"}
@@ -612,7 +620,7 @@ def _sibling_channel_sets(
         if exclude_subentry_id is not None and subentry.subentry_id == exclude_subentry_id:
             continue
         try:
-            channels = CoverConfig.from_subentry(subentry.data).channels
+            channels = CoverConfig.from_stored(subentry.subentry_id, subentry.data).channels
         except TypeError, ValueError:
             try:
                 channels = parse_channels(subentry.data.get(CONF_CHANNELS, ""))
@@ -660,6 +668,7 @@ class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
         subentry = self._get_reconfigure_subentry()
         errors: dict[str, str] = {}
         suggested: Mapping[str, object] = _cover_display_values(
+            subentry.subentry_id,
             subentry.data,
             subentry.title,
         )
@@ -768,6 +777,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             area_id=(self._learn_area_id if self._learn_area_id is not None else current.area_id),
             repeats=current.repeats,
             coalesce_window_ms=current.coalesce_window_ms,
+            cover_rows=current.cover_rows,
         )
         if any(
             other.entry_id != entry.entry_id and other.unique_id == updated.key
@@ -829,6 +839,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         ),
                         CONF_COALESCE_WINDOW_MS,
                     ),
+                    cover_rows=current.cover_rows,
                 )
             except TypeError, ValueError:
                 errors["base"] = "invalid_config"
@@ -1132,7 +1143,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Create the remote entry with every collected cover subentry."""
+        """Create the remote entry with interim dual-written covers."""
         del user_input
         remote = self._remote
         covers = self._covers
@@ -1147,9 +1158,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_abort(reason="channel_conflict")
         await self.async_set_unique_id(remote.key)
         self._abort_if_unique_id_configured()
+        cover_rows = [{CONF_COVER_ID: ulid_now(), **cover.as_dict()} for cover in covers]
         return self.async_create_entry(
             title=remote.name,
-            data=remote.as_dict(),
+            data={**remote.as_dict(), CONF_COVERS: cover_rows},
+            # Task 4 removes the subentry side.
             subentries=[
                 ConfigSubentryData(
                     data=cover.as_dict(),

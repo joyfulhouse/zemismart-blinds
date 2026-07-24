@@ -34,6 +34,8 @@ from custom_components.zemismart_blinds.const import (
     CONF_CALIBRATION_FRAME,
     CONF_CHANNELS,
     CONF_COALESCE_WINDOW_MS,
+    CONF_COVER_ID,
+    CONF_COVERS,
     CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
@@ -624,11 +626,11 @@ async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
 
 
 @pytest.mark.asyncio
-async def test_learn_wizard_creates_remote_entry_with_cover_subentries(
+async def test_learn_wizard_dual_writes_data_covers_and_cover_subentries(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The wizard captures a remote, then collects covers into subentries."""
+    """The interim wizard writes data covers while retaining subentries."""
     prepare_config_flow(hass, monkeypatch)
     fake = FakeMqtt()
     install_mqtt(monkeypatch, fake)
@@ -805,7 +807,28 @@ async def test_learn_wizard_creates_remote_entry_with_cover_subentries(
         repeats=5,
         coalesce_window_ms=150,
     )
-    assert result["data"] == expected_remote.as_dict()
+    cover_rows = result["data"][CONF_COVERS]
+    assert isinstance(cover_rows, list)
+    assert [
+        {key: value for key, value in row.items() if key != CONF_COVER_ID} for row in cover_rows
+    ] == [
+        {
+            CONF_NAME: "Slider",
+            CONF_CHANNELS: [1, 2],
+            CONF_TRAVEL_UP: 12.0,
+            CONF_TRAVEL_DOWN: 12.0,
+        },
+        {
+            CONF_NAME: "Kitchen shades",
+            CONF_CHANNELS: [1, 2, 3],
+            CONF_TRAVEL_UP: "",
+            CONF_TRAVEL_DOWN: "",
+        },
+    ]
+    cover_ids = [row[CONF_COVER_ID] for row in cover_rows]
+    assert len(set(cover_ids)) == 2
+    assert all(isinstance(cover_id, str) and len(cover_id) == 26 for cover_id in cover_ids)
+    assert result["data"] == {**expected_remote.as_dict(), CONF_COVERS: cover_rows}
     entry = result["result"]
     assert entry.unique_id == "a1b2c3:42"
     subentries = list(entry.subentries.values())
@@ -813,10 +836,10 @@ async def test_learn_wizard_creates_remote_entry_with_cover_subentries(
         ("cover", "Slider", "1-2"),
         ("cover", "Kitchen shades", "1-2-3"),
     ]
-    slider = CoverConfig.from_subentry(subentries[0].data)
+    slider = CoverConfig.from_stored(subentries[0].subentry_id, subentries[0].data)
     assert slider.channels == (1, 2)
     assert slider.travel_up == 12.0
-    aggregate = CoverConfig.from_subentry(subentries[1].data)
+    aggregate = CoverConfig.from_stored(subentries[1].subentry_id, subentries[1].data)
     assert aggregate.travel_up is None
 
 
@@ -1522,7 +1545,7 @@ async def test_subentry_reconfigure_prefills_display_values(
 
     assert result["type"] is FlowResultType.ABORT
     updated = next(iter(entry.subentries.values()))
-    restored = CoverConfig.from_subentry(updated.data)
+    restored = CoverConfig.from_stored(updated.subentry_id, updated.data)
     assert updated.title == "Renamed slider"
     assert restored.channels == (1, 2, 3)
     assert restored.travel_up == 12.0
@@ -1573,7 +1596,7 @@ async def test_subentry_reconfigure_carries_hidden_travel_forward(
     )
     assert updated.unique_id == "1-2-3-5"
     assert updated.title == "Kitchen shades"
-    restored = CoverConfig.from_subentry(updated.data)
+    restored = CoverConfig.from_stored(updated.subentry_id, updated.data)
     assert restored.travel_up == 9.0
 
 

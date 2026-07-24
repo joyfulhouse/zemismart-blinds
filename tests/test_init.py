@@ -24,6 +24,8 @@ from custom_components.zemismart_blinds import (
 from custom_components.zemismart_blinds.codec import CommandBases, derive_bases_from_base
 from custom_components.zemismart_blinds.const import (
     CONF_AIR_ARBITRATION_MODE,
+    CONF_COVER_ID,
+    CONF_COVERS,
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
@@ -744,53 +746,49 @@ async def test_legacy_entry_fails_setup_and_keeps_data(
 
 
 @pytest.mark.asyncio
-async def test_remote_entry_builds_leaf_entities_and_devices(
+async def test_remote_entry_data_builds_leaf_entities_and_devices(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Leaf subentries become subentry-bound covers sharing the remote's device."""
+    """Entry-data rows become cover-id entities sharing the remote's device."""
     from homeassistant.helpers import device_registry as dr
 
     from custom_components.zemismart_blinds import cover as cover_module
 
     entry = ConfigEntry(
-        data=config_entry("ignored").data,
+        data={
+            **config_entry("ignored").data,
+            CONF_COVERS: [
+                {
+                    CONF_COVER_ID: "cover-slider",
+                    "name": "Slider",
+                    "channels": [1, 2, 3],
+                    "travel_up": 12.0,
+                    "travel_down": 12.0,
+                },
+                {
+                    CONF_COVER_ID: "cover-sink",
+                    "name": "Sink",
+                    "channels": [5],
+                    "travel_up": 9.0,
+                    "travel_down": 9.0,
+                },
+                {
+                    CONF_COVER_ID: "cover-all",
+                    "name": "Kitchen shades",
+                    "channels": [1, 2, 3, 4, 5, 6],
+                    "travel_up": "",
+                    "travel_down": "",
+                },
+            ],
+        },
         discovery_keys=MappingProxyType({}),
         domain=DOMAIN,
         entry_id="remote-topology",
         minor_version=1,
         options={},
         source="user",
-        subentries_data=[
-            {
-                "data": {
-                    "name": "Slider",
-                    "channels": [1, 2, 3],
-                    "travel_up": 12.0,
-                    "travel_down": 12.0,
-                },
-                "subentry_type": "cover",
-                "title": "Slider",
-                "unique_id": "1-2-3",
-            },
-            {
-                "data": {"name": "Sink", "channels": [5], "travel_up": 9.0, "travel_down": 9.0},
-                "subentry_type": "cover",
-                "title": "Sink",
-                "unique_id": "5",
-            },
-            {
-                "data": {
-                    "name": "Kitchen shades",
-                    "channels": [1, 2, 3, 4, 5, 6],
-                    "travel_up": "",
-                    "travel_down": "",
-                },
-                "subentry_type": "cover",
-                "title": "Kitchen shades",
-                "unique_id": "1-2-3-4-5-6",
-            },
-        ],
+        subentries_data=None,
         title="Kitchen remote",
         unique_id="a1b2c3:42",
         version=1,
@@ -806,16 +804,15 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         assert qos == 1
         return lambda: None
 
-    added: list[tuple[list[Any], str | None]] = []
+    added: list[tuple[list[Any], dict[str, Any]]] = []
 
     def record_add(
         entities: list[Any],
         update_before_add: bool = False,
-        *,
-        config_subentry_id: str | None = None,
+        **kwargs: Any,
     ) -> None:
         del update_before_add
-        added.append((list(entities), config_subentry_id))
+        added.append((list(entities), kwargs))
 
     async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         await cover_module.async_setup_entry(
@@ -837,22 +834,17 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
 
     assert await async_setup_entry(hass, entry)
 
-    # One entity per subentry, each bound to its own subentry id.
-    by_subentry = {subentry.unique_id: subentry for subentry in entry.subentries.values()}
+    # One entity per data row, all attached directly to the remote entry.
     assert len(added) == 3
-    bound_ids = {config_subentry_id for _entities, config_subentry_id in added}
-    assert bound_ids == {
-        by_subentry["1-2-3"].subentry_id,
-        by_subentry["5"].subentry_id,
-        by_subentry["1-2-3-4-5-6"].subentry_id,
-    }
+    assert all(kwargs == {} for _entities, kwargs in added)
     from custom_components.zemismart_blinds.cover import ZemismartAggregateCover
 
-    aggregate_subentry_id = by_subentry["1-2-3-4-5-6"].subentry_id
-    for entities, config_subentry_id in added:
+    aggregate_cover_id = "cover-all"
+    entities_by_id: dict[str, Any] = {}
+    for entities, _kwargs in added:
         assert len(entities) == 1
         entity = entities[0]
-        assert entity.unique_id == config_subentry_id
+        entities_by_id[entity.unique_id] = entity
         assert entity._config.area_id == "living_room"  # inherited from remote
         assert entity._config.repeats == 5
         # Covers are entities INSIDE the remote's device, carrying their own
@@ -860,18 +852,14 @@ async def test_remote_entry_builds_leaf_entities_and_devices(
         assert entity.device_info == {"identifiers": {(DOMAIN, entry.entry_id)}}
         assert entity.has_entity_name is False
         assert entity.name == entity._config.name
-        if config_subentry_id == aggregate_subentry_id:
+        if entity.unique_id == aggregate_cover_id:
             assert isinstance(entity, ZemismartAggregateCover)
         else:
             assert not isinstance(entity, ZemismartAggregateCover)
+    assert set(entities_by_id) == {"cover-slider", "cover-sink", "cover-all"}
     runtime_data = entry.runtime_data
     assert runtime_data.coordinator is not None
-    assert runtime_data.coordinator.members == {
-        aggregate_subentry_id: (
-            by_subentry["1-2-3"].subentry_id,
-            by_subentry["5"].subentry_id,
-        )
-    }
+    assert runtime_data.coordinator.members == {aggregate_cover_id: ("cover-slider", "cover-sink")}
 
     # The stale pre-0.3.1 child device was pruned; only the remote remains.
     assert registry.async_get(stale.id) is None
@@ -960,29 +948,34 @@ async def test_underivable_cover_skips_without_failing_entry(
     from custom_components.zemismart_blinds import cover as cover_module
 
     entry = ConfigEntry(
-        data=config_entry("ignored").data,
+        data={
+            **config_entry("ignored").data,
+            CONF_COVERS: [
+                {
+                    # Former aggregate, members deleted: no travel stored,
+                    # and no contained cover left to make it an aggregate.
+                    CONF_COVER_ID: "cover-orphan",
+                    "name": "Orphan",
+                    "channels": [1, 2],
+                    "travel_up": "",
+                    "travel_down": "",
+                },
+                {
+                    CONF_COVER_ID: "cover-solo",
+                    "name": "Solo",
+                    "channels": [5],
+                    "travel_up": 9.0,
+                    "travel_down": 9.0,
+                },
+            ],
+        },
         discovery_keys=MappingProxyType({}),
         domain=DOMAIN,
         entry_id="remote-demoted",
         minor_version=1,
         options={},
         source="user",
-        subentries_data=[
-            {
-                # Former aggregate, members deleted: no travel stored, and no
-                # contained cover left to make it an aggregate again.
-                "data": {"name": "Orphan", "channels": [1, 2], "travel_up": "", "travel_down": ""},
-                "subentry_type": "cover",
-                "title": "Orphan",
-                "unique_id": "1-2",
-            },
-            {
-                "data": {"name": "Solo", "channels": [5], "travel_up": 9.0, "travel_down": 9.0},
-                "subentry_type": "cover",
-                "title": "Solo",
-                "unique_id": "5",
-            },
-        ],
+        subentries_data=None,
         title="Kitchen remote",
         unique_id="a1b2c3:42",
         version=1,
@@ -996,25 +989,19 @@ async def test_underivable_cover_skips_without_failing_entry(
     from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers import entity_registry as er
 
-    orphan_subentry_id = next(
-        subentry.subentry_id
-        for subentry in entry.subentries.values()
-        if subentry.unique_id == "1-2"
-    )
+    orphan_cover_id = "cover-orphan"
     device_registry = dr.async_get(hass)
     legacy_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        config_subentry_id=orphan_subentry_id,
-        identifiers={(DOMAIN, orphan_subentry_id)},
+        identifiers={(DOMAIN, orphan_cover_id)},
         name="Orphan",
     )
     entity_registry = er.async_get(hass)
     orphan_entity = entity_registry.async_get_or_create(
         "cover",
         DOMAIN,
-        orphan_subentry_id,
+        orphan_cover_id,
         config_entry=entry,
-        config_subentry_id=orphan_subentry_id,
         device_id=legacy_device.id,
         original_name="Orphan",
     )
