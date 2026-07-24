@@ -692,7 +692,7 @@ class BlindConfig:
         cover: CoverConfig,
         role: Role,
     ) -> BlindConfig:
-        """Build the runtime config for one cover from its remote and subentry."""
+        """Build the runtime config for one cover from its remote and data row."""
         return cls(
             name=cover.name,
             remote=remote.remote,

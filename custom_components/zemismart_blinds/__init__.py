@@ -317,11 +317,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def _async_entry_updated(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
-    """Reload once for any entry or subentry mutation.
+    """Reload once for any entry-data mutation.
 
     The sole reload scheduler: every flow terminator uses non-reloading
-    update helpers, and native subentry add/update/delete notifies this
-    listener, so each mutation produces exactly one reload.
+    update helpers, so each mutation produces exactly one reload.
     """
     hass.config_entries.async_schedule_reload(entry.entry_id)
 
