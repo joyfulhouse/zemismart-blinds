@@ -14,10 +14,11 @@ hub app, just MQTT and a flashed Sonoff RF Bridge.
 ## What Does This Integration Do?
 
 Many roller blinds sold under the **Zemismart** brand (and other resellers of **AOK** OEM tubular
-motors) are RF-only: a 433.92 MHz remote is the sole way to control them. This integration gives
-each blind — or an arbitrary group of blinds on the same remote — a first-class Home Assistant
-`cover` entity by generating the motors' native RF protocol from scratch, transmitted through one
-or more inexpensive Sonoff RF Bridge R2 units.
+motors) are RF-only: a 433.92 MHz remote is the sole way to control them. This integration models
+your hardware the way it actually works: **one device per physical remote**, with each blind — or
+an arbitrary group of blinds on the same remote — as a `cover` entity of that device, driven by
+generating the motors' native RF protocol from scratch through one or more inexpensive Sonoff RF
+Bridge R2 units.
 
 - **Open, close, stop, and set position** with assumed-state travel-time position modeling.
 - **True group commands**: a group is one RF transmission, not several colliding commands.
@@ -26,6 +27,9 @@ or more inexpensive Sonoff RF Bridge R2 units.
 - **Virtual remotes**: mint identities that never existed as hardware and pair motors to them.
 - **Reliable delivery**: correlated bridge acknowledgements, bridge-side STOP deadlines for
   partial movement, and area-aware multi-bridge failover.
+- **Cross-bridge air arbitration**: with several bridges, normal commands are scheduled onto the
+  shared 433 MHz channel so simultaneous scenes stop talking over each other — while STOP
+  commands are never delayed.
 - **Guided remote learning**: a time-boxed bridge capture identifies the remote, action, and
   channels automatically during onboarding or reconfiguration.
 
@@ -69,24 +73,33 @@ calibration.
 
 ## Configuration
 
-Each run of the add-integration flow creates exactly one device with one cover entity. The guided
-**Learn** path is the default:
+You add **remotes**, and each remote owns its covers: one run of the add-integration flow creates
+one remote device, then walks you through adding that remote's blinds and groups as cover
+entities. The guided **Learn** path is the default:
 
-1. Enter a **name** and Home Assistant **area**, then use the automatically selected online bridge
-   or choose another one.
+1. Enter the remote's **name** and Home Assistant **area**, then use the automatically selected
+   online bridge or choose another one.
 2. Press **Up**, **Down**, or **Stop** on the physical remote during the 30-second capture window.
    The flow decodes the first valid action frame and detects its prefix, remote ID, channels, and
    button automatically.
-3. Confirm the detected identity, then edit the captured **channels** if needed (`1` for one blind,
-   or `1,2,3` for a group) and enter the full up/down **travel times**.
+3. Confirm the detected identity and the remote's transport settings, then add the remote's
+   covers one at a time: a **cover name**, its **channels** (`1` for one blind, or `1,2,3` for a
+   group), and the full up/down **travel times**. Add as many covers as the remote controls, then
+   finish.
 
-**Advanced** setup can reuse an already-calibrated remote, enter a remote manually from one labeled
-B0/B1 reference or direct 16-bit action base, or allocate a virtual remote. The optional OEM
-TRAILER base should be left blank unless captured.
+**Advanced** setup can enter a remote manually from one labeled B0/B1 reference or direct 16-bit
+action base, or allocate a virtual remote. The optional OEM TRAILER base should be left blank
+unless captured.
 
-Use **Configure** on an existing entry to edit channels, timing, area, or RF settings while keeping
-the current remote identity. To change the identity or calibration, use **Reconfigure → Relearn from
-remote**. The flow accepts hex with or without the `0x` prefix.
+Everything about an existing remote is managed from its entry's **Reconfigure** menu:
+
+- **Relearn from remote** — replace the identity or calibration with a fresh capture.
+- **Edit remote settings** — name, area, RF repeats, coalescing.
+- **Add cover / Edit cover / Remove cover** — manage the remote's covers; edits keep each
+  cover's identity (entity IDs, history, and automations survive), and removal deletes exactly
+  that cover's entity.
+
+The flow accepts hex with or without the `0x` prefix.
 
 ### Position behavior
 
@@ -103,6 +116,21 @@ bridge, then any online bridge, and exposes `degraded_bridge: true`. One shared 
 one command at a time and waits for the bridge's acknowledgement before the next — with
 intelligent coalescing that merges near-simultaneous commands for blinds on the same remote into
 a single group frame.
+
+With two or more online bridges, **cross-bridge air arbitration** additionally schedules normal
+commands so different bridges do not transmit over each other on the shared 433 MHz channel: the
+calendar anchors on each command's actual RF start, reserves known future fail-safe STOP windows,
+and delays only normal work — an explicit STOP is never held, arbitration switches off below two
+online bridges, and every failure path publishes rather than blocks (a hard 130 s ceiling
+guarantees it). Scenes that fan out across the house therefore start their blinds staggered a
+couple of seconds apart instead of colliding on air. Arbitration counters are included in any
+entry's diagnostics download. To measure without delaying (or as a rollback), an
+installation-wide YAML escape selects shadow mode:
+
+```yaml
+zemismart_blinds:
+  air_arbitration_mode: shadow
+```
 
 ## Services
 

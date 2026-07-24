@@ -43,25 +43,27 @@ A healthy bridge shows retained `rf433/<bridge_id>/availability` = `online` on t
    directory.
 2. Restart Home Assistant.
 
-## Step 4 — Calibrate and add your first blind
+## Step 4 — Calibrate and add your first remote
 
-Each run of the add-integration flow creates exactly one device and one cover entity.
+Each run of the add-integration flow creates one **remote** device; the remote's blinds and
+groups are added as its cover entities in the same run.
 
 1. Open **Settings → Devices & services → Add integration → Zemismart Blinds**, then choose
    **Learn from remote**.
-2. Name the blind, select its Home Assistant area, and accept the automatically selected online RF
-   bridge or choose another one.
+2. Name the remote, select its Home Assistant area, and accept the automatically selected online
+   RF bridge or choose another one.
 3. During the 30-second capture window, press **Up**, **Down**, or **Stop** on the physical remote.
    The flow detects the remote prefix, remote ID, channels, and button automatically.
-4. Confirm the detected identity, then enter one channel (`1`) or an arbitrary group (`1,2,3`) and
-   the up/down full-travel seconds. Channels 1–16 are supported.
-5. Repeat for the next blind. Under **Advanced**, additional blinds on the same remote can reuse the
-   calibrated identity without another capture; manual capture entry and virtual remotes remain
-   available there too.
+4. Confirm the detected identity and the remote's transport settings, then add covers one at a
+   time: a cover name, one channel (`1`) or an arbitrary group (`1,2,3`), and the up/down
+   full-travel seconds. Channels 1–16 are supported. Add every blind and group the remote
+   controls, then finish.
+5. Repeat for the next remote. Under **Advanced**, manual capture entry and virtual remotes are
+   available.
 
-Use **Configure** on an existing entry to edit channels, timing, area, or RF settings while keeping
-its remote identity. Use **Reconfigure → Relearn from remote** to replace the identity or
-calibration.
+Everything about an existing remote lives in its entry's **Reconfigure** menu: **Relearn from
+remote** replaces the identity or calibration, **Edit remote settings** covers name/area/RF
+options, and **Add / Edit / Remove cover** manage its covers without touching their entity IDs.
 
 ## Verify
 
