@@ -23,6 +23,9 @@ from .const import (
     CONF_BASE_STOP,
     CONF_BASE_UP,
     CONF_CHANNELS,
+    CONF_COVER_ID,
+    CONF_COVERS,
+    CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
     DEFAULT_REPEATS,
@@ -314,13 +317,83 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 async def _async_entry_updated(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
-    """Reload once for any entry or subentry mutation.
+    """Reload once for any entry-data mutation.
 
     The sole reload scheduler: every flow terminator uses non-reloading
-    update helpers, and native subentry add/update/delete notifies this
-    listener, so each mutation produces exactly one reload.
+    update helpers, so each mutation produces exactly one reload.
     """
     hass.config_entries.async_schedule_reload(entry.entry_id)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Fold cover subentries into entry data (spec 2026-07-24, staged phases)."""
+    from homeassistant.helpers import entity_registry as er
+
+    if entry.version != 1:
+        return True
+    # Phase 0: legacy per-blind reference entries pass through byte-for-byte.
+    if CONF_CHANNELS in entry.data:
+        hass.config_entries.async_update_entry(entry, version=2)
+        return True
+    # Phase A: stage the covers list while subentries are still intact.
+    if CONF_COVERS not in entry.data:
+        covers = [
+            {CONF_COVER_ID: subentry_id, CONF_NAME: subentry.title, **subentry.data}
+            for subentry_id, subentry in entry.subentries.items()
+            if subentry.subentry_type == "cover"
+        ]
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_COVERS: covers},
+        )
+    # Phase B: resumable cleanup driven by the STAGED list, never live subentries.
+    ent_reg = er.async_get(hass)
+    for row in entry.data[CONF_COVERS]:
+        cover_id = row[CONF_COVER_ID]
+        for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+            if reg_entry.config_subentry_id == cover_id:
+                ent_reg.async_update_entity(
+                    reg_entry.entity_id,
+                    config_subentry_id=None,
+                )
+        if cover_id in entry.subentries:
+            hass.config_entries.async_remove_subentry(entry, cover_id)
+    # Phase C: commit.
+    if entry.subentries:
+        msg = f"unstaged subentries survived migration of {entry.entry_id}"
+        raise ValueError(msg)
+    hass.config_entries.async_update_entry(entry, version=2)
+    return True
+
+
+def _repair_v2_registry_skew(
+    hass: HomeAssistant,
+    entry: ZemismartConfigEntry,
+) -> None:
+    """Re-home registry rows left attached to removed v1 subentries."""
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    ent_reg = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if reg_entry.config_subentry_id is not None:
+            ent_reg.async_update_entity(
+                reg_entry.entity_id,
+                config_subentry_id=None,
+            )
+
+    dev_reg = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        stale_ids = {
+            subentry_id
+            for subentry_id in device.config_entries_subentries.get(
+                entry.entry_id,
+                set(),
+            )
+            if subentry_id is not None
+        }
+        for stale_id in stale_ids:
+            dev_reg.async_clear_config_subentry(entry.entry_id, stale_id)
 
 
 def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
@@ -425,6 +498,8 @@ async def async_setup_entry(
             "through the integration's new wizard, then delete this entry."
         )
         raise ConfigEntryError(msg)
+    if entry.version == 2:
+        _repair_v2_registry_skew(hass, entry)
     while True:
         candidate = _create_domain_runtime(hass)
         runtime = cast("DomainRuntime", hass.data.setdefault(DOMAIN, candidate))

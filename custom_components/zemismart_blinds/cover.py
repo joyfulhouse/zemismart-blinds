@@ -109,31 +109,20 @@ async def async_setup_entry(
     entry: ConfigEntry[RemoteRuntime],
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create one leaf cover entity per leaf subentry of this remote."""
+    """Create one entity per stored cover row of this remote."""
     runtime = entry.runtime_data
-    covers: dict[str, CoverConfig] = {}
-    for subentry in entry.subentries.values():
-        if subentry.subentry_type != "cover":
-            continue
-        try:
-            covers[subentry.subentry_id] = CoverConfig.from_subentry(subentry.data)
-        except TypeError, ValueError:
-            _LOGGER.warning(
-                "Skipping unreadable cover subentry %s of %s",
-                subentry.subentry_id,
-                entry.title,
-            )
+    covers: dict[str, CoverConfig] = {cover.cover_id: cover for cover in runtime.remote.covers}
     coordinator = RemoteCoordinator(hass, covers)
     runtime.coordinator = coordinator
     entry.async_on_unload(coordinator.detach)
-    for subentry_id, cover in covers.items():
-        role = coordinator.roles[subentry_id]
+    for cover_id, cover in covers.items():
+        role = coordinator.roles[cover_id]
         try:
             config = BlindConfig.derive(runtime.remote, cover, role)
         except ValueError as err:
             # A demoted aggregate without stored travel times must not take
             # the whole entry down; it just has no entity until the user
-            # adds travel times via subentry reconfigure.
+            # adds travel times via cover reconfigure.
             _LOGGER.warning(
                 "Cover %r of %s has no usable configuration (%s); "
                 "reconfigure the cover to add travel times",
@@ -145,7 +134,7 @@ async def async_setup_entry(
         entity: ZemismartCover | ZemismartAggregateCover
         if role is Role.LEAF:
             entity = ZemismartCover(
-                subentry_id,
+                cover_id,
                 entry.entry_id,
                 config,
                 runtime.hub,
@@ -153,13 +142,13 @@ async def async_setup_entry(
             )
         else:
             entity = ZemismartAggregateCover(
-                subentry_id,
+                cover_id,
                 entry.entry_id,
                 config,
                 runtime.hub,
                 coordinator,
             )
-        async_add_entities([entity], config_subentry_id=subentry_id)
+        async_add_entities([entity])
 
 
 def _number(value: object) -> float | None:
@@ -184,7 +173,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     def __init__(
         self,
-        subentry_id: str,
+        cover_id: str,
         remote_entry_id: str,
         config: BlindConfig,
         hub: ZemismartHub,
@@ -199,9 +188,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._config: BlindConfig = config
         self._hub = hub
         self._coordinator = coordinator
-        self._subentry_id = subentry_id
+        self._cover_id = cover_id
         self._remote_entry_id = remote_entry_id
-        self._attr_unique_id = subentry_id
+        self._attr_unique_id = cover_id
         # Full name, not a device-prefixed has_entity_name: deployed
         # friendly names predate the shared-device layout and must not gain
         # the remote's name as a prefix.
@@ -302,7 +291,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """Restore a stopped estimate or reconstruct complete started motion."""
         await super().async_added_to_hass()
         if self._coordinator is not None:
-            self._coordinator.register_leaf(self._subentry_id, self)
+            self._coordinator.register_leaf(self._cover_id, self)
         self._unsubscribe_rx_listener = self._hub.register_rx_listener(
             self._config.remote.key,
             frozenset(self._config.channels),
@@ -469,7 +458,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._unsubscribe_rx_listener()
             self._unsubscribe_rx_listener = None
         if self._coordinator is not None:
-            self._coordinator.unregister_leaf(self._subentry_id)
+            self._coordinator.unregister_leaf(self._cover_id)
         if self._on_displaced in self._hub.displaced_listeners:
             self._hub.displaced_listeners.remove(self._on_displaced)
         if self._on_emission_proof in self._hub.emission_proof_listeners:
@@ -1108,7 +1097,7 @@ class ZemismartAggregateCover(CoverEntity):
 
     def __init__(
         self,
-        subentry_id: str,
+        cover_id: str,
         remote_entry_id: str,
         config: BlindConfig,
         hub: ZemismartHub,
@@ -1118,9 +1107,9 @@ class ZemismartAggregateCover(CoverEntity):
         self._config = config
         self._hub = hub
         self._coordinator = coordinator
-        self._subentry_id = subentry_id
+        self._cover_id = cover_id
         self._remote_entry_id = remote_entry_id
-        self._attr_unique_id = subentry_id
+        self._attr_unique_id = cover_id
         # Full name, not a device-prefixed has_entity_name: deployed
         # friendly names predate the shared-device layout and must not gain
         # the remote's name as a prefix.
@@ -1151,7 +1140,7 @@ class ZemismartAggregateCover(CoverEntity):
     async def async_added_to_hass(self) -> None:
         """Register with the coordinator and the hub's takeover machinery."""
         await super().async_added_to_hass()
-        self._coordinator.register_aggregate(self._subentry_id, self)
+        self._coordinator.register_aggregate(self._cover_id, self)
         self._unsubscribe_rx_listener = self._hub.register_rx_listener(
             self._config.remote.key,
             frozenset(self._config.channels),
@@ -1169,7 +1158,7 @@ class ZemismartAggregateCover(CoverEntity):
         if self._unsubscribe_mqtt_status is not None:
             self._unsubscribe_mqtt_status()
             self._unsubscribe_mqtt_status = None
-        self._coordinator.unregister_aggregate(self._subentry_id)
+        self._coordinator.unregister_aggregate(self._cover_id)
         self._cancel_fanout()
         await super().async_will_remove_from_hass()
 
@@ -1177,7 +1166,7 @@ class ZemismartAggregateCover(CoverEntity):
         """Return the live leaf entities this aggregate derives from."""
         return cast(
             "tuple[ZemismartCover, ...]",
-            self._coordinator.members_of(self._subentry_id),
+            self._coordinator.members_of(self._cover_id),
         )
 
     @property

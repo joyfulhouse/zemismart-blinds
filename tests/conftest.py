@@ -43,9 +43,8 @@ async def hass(tmp_path: str) -> AsyncIterator[HomeAssistant]:
     instance = HomeAssistant(str(tmp_path))
     instance.config_entries = ConfigEntries(instance, {})
     await instance.async_start()
-    device_registry = dr.async_get(instance)
-    device_registry.async_setup()
-    await device_registry.async_load(load_empty=True)
+    dr.async_setup(instance)
+    await dr.async_load(instance, load_empty=True)
     await er.async_load(instance, load_empty=True)
     try:
         yield instance

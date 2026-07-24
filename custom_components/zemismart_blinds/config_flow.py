@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigSubentryData
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers import selector
+from homeassistant.util.ulid import ulid_now
 
 from .codec import (
     CommandBases,
@@ -39,6 +39,8 @@ from .const import (
     CONF_CALIBRATION_FRAME,
     CONF_CHANNELS,
     CONF_COALESCE_WINDOW_MS,
+    CONF_COVER_ID,
+    CONF_COVERS,
     CONF_NAME,
     CONF_PREFIX,
     CONF_REMOTE_ID,
@@ -75,7 +77,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
     from homeassistant.components.mqtt.models import ReceiveMessage
-    from homeassistant.config_entries import ConfigFlowResult, SubentryFlowResult
+    from homeassistant.config_entries import ConfigFlowResult
     from homeassistant.core import HomeAssistant
 
     type Unsubscriber = Callable[[], None]
@@ -92,6 +94,10 @@ _BRIDGE_DISCOVERY_SECONDS = 0.25
 _MQTT_BOOTSTRAP_TIMEOUT_SECONDS = 5.0
 _CAPTURE_TIMEOUT_SECONDS = float(DEFAULT_SNIFF_WINDOW_SECONDS)
 _CAPTURE_OWNERS: dict[tuple[int, str], str] = {}
+# CoverConfig enforces storage identity while this validation draft is not yet
+# stored. Every terminal add replaces the sentinel with a fresh ULID; edits
+# preserve the selected row's existing cover_id.
+_PENDING_COVER_ID = "pending"
 
 
 def _float_value(value: object, fallback: float) -> float:
@@ -505,12 +511,13 @@ def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
 
 
 def _cover_display_values(
+    cover_id: str,
     data: Mapping[str, object],
     title: str,
 ) -> dict[str, object]:
     """Convert stored cover data to values suitable for form suggestions."""
     try:
-        cover = CoverConfig.from_subentry(data)
+        cover = CoverConfig.from_stored(cover_id, data)
     except TypeError, ValueError:
         suggested: dict[str, object] = {CONF_NAME: title}
         if (raw_channels := data.get(CONF_CHANNELS)) is not None:
@@ -558,6 +565,7 @@ def _validate_cover_input(
             channels=channels,
             travel_up=float(raw_up) if raw_up is not None else None,
             travel_down=float(raw_down) if raw_down is not None else None,
+            cover_id=_PENDING_COVER_ID,
         )
     except TypeError, ValueError:
         return None, {"base": "invalid_config"}
@@ -602,118 +610,109 @@ def _learn_setup_schema(
 def _sibling_channel_sets(
     entry: config_entries.ConfigEntry,
     *,
-    exclude_subentry_id: str | None = None,
+    exclude_cover_id: str | None = None,
 ) -> list[tuple[int, ...]]:
     """Load every sibling channel set, failing closed on unreadable channels."""
     channel_sets: list[tuple[int, ...]] = []
-    for subentry in entry.subentries.values():
-        if subentry.subentry_type != "cover":
-            continue
-        if exclude_subentry_id is not None and subentry.subentry_id == exclude_subentry_id:
+    for row in _entry_cover_rows(entry):
+        cover_id = _row_cover_id(row)
+        if exclude_cover_id is not None and cover_id == exclude_cover_id:
             continue
         try:
-            channels = CoverConfig.from_subentry(subentry.data).channels
+            channels = CoverConfig.from_stored(cover_id, row).channels
         except TypeError, ValueError:
             try:
-                channels = parse_channels(subentry.data.get(CONF_CHANNELS, ""))
+                channels = parse_channels(row.get(CONF_CHANNELS, ""))
             except (TypeError, ValueError) as err:
-                msg = f"invalid sibling cover channels: {subentry.subentry_id}"
+                msg = f"invalid sibling cover channels: {cover_id}"
                 raise ValueError(msg) from err
         channel_sets.append(channels)
     return channel_sets
 
 
-class CoverSubentryFlow(config_entries.ConfigSubentryFlow):
-    """Add or reconfigure one cover on an existing remote entry."""
+def _entry_cover_rows(
+    entry: config_entries.ConfigEntry,
+) -> list[dict[str, object]]:
+    """Copy stored cover rows without dropping unknown keys."""
+    raw_rows = entry.data.get(CONF_COVERS)
+    if not isinstance(raw_rows, list | tuple):
+        msg = "covers must be a list"
+        raise ValueError(msg)
+    rows: list[dict[str, object]] = []
+    for index, raw_row in enumerate(raw_rows):
+        if not isinstance(raw_row, Mapping) or not all(isinstance(key, str) for key in raw_row):
+            msg = f"invalid cover row {index}"
+            raise ValueError(msg)
+        rows.append({str(key): value for key, value in raw_row.items()})
+    return rows
 
-    async def async_step_user(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> SubentryFlowResult:
-        """Add one cover subentry."""
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            try:
-                existing = _sibling_channel_sets(self._get_entry())
-            except ValueError:
-                errors = {"base": "invalid_config"}
-            else:
-                cover, errors = _validate_cover_input(user_input, existing)
-                if cover is not None:
-                    return self.async_create_entry(
-                        data=cover.as_dict(),
-                        title=cover.name,
-                        unique_id=cover.channel_key,
-                    )
-        return self.async_show_form(
-            step_id="user",
-            data_schema=_cover_schema(user_input or {}),
-            errors=errors,
-        )
 
-    async def async_step_reconfigure(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> SubentryFlowResult:
-        """Reconfigure one cover while preserving hidden travel calibration."""
-        entry = self._get_entry()
-        subentry = self._get_reconfigure_subentry()
-        errors: dict[str, str] = {}
-        suggested: Mapping[str, object] = _cover_display_values(
-            subentry.data,
-            subentry.title,
-        )
-        if user_input is not None:
-            merged = dict(user_input)
-            for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
-                stored = subentry.data.get(key)
-                if key not in merged and stored not in (None, ""):
-                    merged[key] = stored
-            try:
-                existing = _sibling_channel_sets(
-                    entry,
-                    exclude_subentry_id=subentry.subentry_id,
-                )
-            except ValueError:
-                errors = {"base": "invalid_config"}
-            else:
-                cover, errors = _validate_cover_input(merged, existing)
-                if cover is not None:
-                    return self.async_update_and_abort(
-                        entry,
-                        subentry,
-                        data=cover.as_dict(),
-                        title=cover.name,
-                        unique_id=cover.channel_key,
-                    )
-            suggested = user_input
-        return self.async_show_form(
-            step_id="reconfigure",
-            data_schema=self.add_suggested_values_to_schema(
-                _cover_schema(None),
-                suggested,
-            ),
-            errors=errors,
-        )
+def _row_cover_id(row: Mapping[str, object]) -> str:
+    """Return one non-empty stored cover identity."""
+    cover_id = row.get(CONF_COVER_ID)
+    if not isinstance(cover_id, str) or not cover_id.strip():
+        msg = "invalid cover_id"
+        raise ValueError(msg)
+    return cover_id
+
+
+def _find_cover_row(
+    rows: list[dict[str, object]],
+    cover_id: str,
+) -> tuple[int, dict[str, object]]:
+    """Find one stored row by stable identity."""
+    for index, row in enumerate(rows):
+        if _row_cover_id(row) == cover_id:
+            return index, row
+    msg = f"unknown cover_id: {cover_id}"
+    raise ValueError(msg)
+
+
+def _cover_picker_schema(rows: list[dict[str, object]]) -> vol.Schema:
+    """Build an identity-keyed picker with unambiguous duplicate names."""
+    names = [str(row.get(CONF_NAME, "")).strip() for row in rows]
+    duplicate_names = {name for name in names if names.count(name) > 1}
+    options: list[selector.SelectOptionDict] = []
+    for row, name in zip(rows, names, strict=True):
+        cover_id = _row_cover_id(row)
+        label = name or cover_id
+        if name in duplicate_names:
+            label = f"{label} — {cover_id}"
+        options.append({"value": cover_id, "label": label})
+    return vol.Schema(
+        {
+            vol.Required(CONF_COVER_ID): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=options)
+            )
+        }
+    )
+
+
+def _cover_removal_refusal(
+    entry: config_entries.ConfigEntry,
+    cover_id: str,
+) -> str | None:
+    """Return why a stored cover cannot safely be removed."""
+    rows = _entry_cover_rows(entry)
+    if len(rows) <= 1:
+        return "last_cover"
+    _index, selected_row = _find_cover_row(rows, cover_id)
+    selected = CoverConfig.from_stored(cover_id, selected_row)
+    siblings = _sibling_channel_sets(entry, exclude_cover_id=cover_id)
+    selected_channels = frozenset(selected.channels)
+    is_leaf = not any(frozenset(channels) < selected_channels for channels in siblings)
+    if is_leaf and any(selected_channels < frozenset(channels) for channels in siblings):
+        return "aggregate_dependency"
+    return None
 
 
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
-    VERSION = 1
-
-    @classmethod
-    @callback
-    def async_get_supported_subentry_types(
-        cls,
-        config_entry: config_entries.ConfigEntry,
-    ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
-        """Expose per-cover subentry management on remote entries."""
-        if CONF_CHANNELS in config_entry.data:
-            return {}
-        return {"cover": CoverSubentryFlow}
+    VERSION = 2
 
     _capture: _LearnCapture | None = None
+    _cover_id: str | None = None
     _covers: list[CoverConfig] | None = None
     _identity: RemoteIdentity | None = None
     _learn_area_id: str | None = None
@@ -729,13 +728,211 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Offer identity relearning or direct settings edits."""
+        """Offer remote and per-cover management."""
         if CONF_CHANNELS in self._get_reconfigure_entry().data:
             return self.async_abort(reason="legacy_not_supported")
         del user_input
         return self.async_show_menu(
             step_id="reconfigure",
-            menu_options=["reconfigure_learn", "reconfigure_edit"],
+            menu_options=[
+                "reconfigure_learn",
+                "reconfigure_edit",
+                "cover_add",
+                "cover_pick_edit",
+                "cover_pick_remove",
+            ],
+        )
+
+    def _update_covers_and_abort(
+        self,
+        rows: list[dict[str, object]],
+        reason: str,
+    ) -> ConfigFlowResult:
+        """Persist one cover-list mutation and let the update listener reload."""
+        entry = self._get_reconfigure_entry()
+        self.hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_COVERS: rows},
+        )
+        return self.async_abort(reason=reason)
+
+    async def async_step_cover_add(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Append one validated cover row with a fresh identity."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                rows = _entry_cover_rows(entry)
+                existing = _sibling_channel_sets(entry)
+            except ValueError:
+                errors = {"base": "invalid_config"}
+            else:
+                cover, errors = _validate_cover_input(user_input, existing)
+                if cover is not None:
+                    rows.append(
+                        {
+                            CONF_COVER_ID: ulid_now(),
+                            **cover.as_dict(),
+                        }
+                    )
+                    return self._update_covers_and_abort(rows, "cover_added")
+        return self.async_show_form(
+            step_id="cover_add",
+            data_schema=self.add_suggested_values_to_schema(
+                _cover_schema(None),
+                user_input or {},
+            ),
+            errors=errors,
+        )
+
+    async def async_step_cover_pick_edit(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose one cover row to edit by stable identity."""
+        try:
+            rows = _entry_cover_rows(self._get_reconfigure_entry())
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cover_id = str(user_input.get(CONF_COVER_ID, ""))
+            try:
+                _find_cover_row(rows, cover_id)
+            except ValueError:
+                errors[CONF_COVER_ID] = "cover_not_found"
+            else:
+                self._cover_id = cover_id
+                return await self.async_step_cover_edit()
+        return self.async_show_form(
+            step_id="cover_pick_edit",
+            data_schema=_cover_picker_schema(rows),
+            errors=errors,
+        )
+
+    async def async_step_cover_edit(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Merge validated cover fields into the selected stored row."""
+        if self._cover_id is None:
+            return await self.async_step_cover_pick_edit()
+        entry = self._get_reconfigure_entry()
+        try:
+            rows = _entry_cover_rows(entry)
+            index, stored = _find_cover_row(rows, self._cover_id)
+        except ValueError:
+            return self.async_abort(reason="cover_not_found")
+        errors: dict[str, str] = {}
+        suggested: Mapping[str, object] = _cover_display_values(
+            self._cover_id,
+            stored,
+            str(stored.get(CONF_NAME, "")),
+        )
+        if user_input is not None:
+            merged = dict(user_input)
+            for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
+                stored_value = stored.get(key)
+                if key not in merged and stored_value not in (None, ""):
+                    merged[key] = stored_value
+            try:
+                existing = _sibling_channel_sets(
+                    entry,
+                    exclude_cover_id=self._cover_id,
+                )
+            except ValueError:
+                errors = {"base": "invalid_config"}
+            else:
+                cover, errors = _validate_cover_input(merged, existing)
+                if cover is not None:
+                    rows[index] = {
+                        **stored,
+                        **cover.as_dict(),
+                        CONF_COVER_ID: self._cover_id,
+                    }
+                    return self._update_covers_and_abort(rows, "cover_updated")
+            suggested = user_input
+        return self.async_show_form(
+            step_id="cover_edit",
+            data_schema=self.add_suggested_values_to_schema(
+                _cover_schema(None),
+                suggested,
+            ),
+            errors=errors,
+        )
+
+    async def async_step_cover_pick_remove(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose one cover row to remove by stable identity."""
+        entry = self._get_reconfigure_entry()
+        try:
+            rows = _entry_cover_rows(entry)
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cover_id = str(user_input.get(CONF_COVER_ID, ""))
+            try:
+                _find_cover_row(rows, cover_id)
+                refusal = _cover_removal_refusal(entry, cover_id)
+            except TypeError, ValueError:
+                errors[CONF_COVER_ID] = "cover_not_found"
+            else:
+                if refusal is not None:
+                    return self.async_abort(reason=refusal)
+                self._cover_id = cover_id
+                return await self.async_step_cover_remove_confirm()
+        return self.async_show_form(
+            step_id="cover_pick_remove",
+            data_schema=_cover_picker_schema(rows),
+            errors=errors,
+        )
+
+    async def async_step_cover_remove_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Delete the selected entity row, then remove its stored cover row."""
+        if self._cover_id is None:
+            return await self.async_step_cover_pick_remove()
+        entry = self._get_reconfigure_entry()
+        try:
+            rows = _entry_cover_rows(entry)
+            index, stored = _find_cover_row(rows, self._cover_id)
+            refusal = _cover_removal_refusal(entry, self._cover_id)
+        except TypeError, ValueError:
+            return self.async_abort(reason="cover_not_found")
+        if refusal is not None:
+            return self.async_abort(reason=refusal)
+        if user_input is not None:
+            from homeassistant.helpers import entity_registry as er
+
+            ent_reg = er.async_get(self.hass)
+            entity_id = ent_reg.async_get_entity_id(
+                "cover",
+                DOMAIN,
+                self._cover_id,
+            )
+            if (
+                entity_id is not None
+                and (reg_entry := ent_reg.async_get(entity_id)) is not None
+                and reg_entry.config_entry_id == entry.entry_id
+            ):
+                ent_reg.async_remove(entity_id)
+            rows.pop(index)
+            return self._update_covers_and_abort(rows, "cover_removed")
+        return self.async_show_form(
+            step_id="cover_remove_confirm",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "name": str(stored.get(CONF_NAME, "")),
+                "cover_id": self._cover_id,
+            },
         )
 
     async def async_step_reconfigure_learn(
@@ -768,6 +965,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             area_id=(self._learn_area_id if self._learn_area_id is not None else current.area_id),
             repeats=current.repeats,
             coalesce_window_ms=current.coalesce_window_ms,
+            cover_rows=current.cover_rows,
         )
         if any(
             other.entry_id != entry.entry_id and other.unique_id == updated.key
@@ -829,6 +1027,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         ),
                         CONF_COALESCE_WINDOW_MS,
                     ),
+                    cover_rows=current.cover_rows,
                 )
             except TypeError, ValueError:
                 errors["base"] = "invalid_config"
@@ -1132,33 +1331,24 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Create the remote entry with every collected cover subentry."""
+        """Create the remote entry with data-backed covers."""
         del user_input
         remote = self._remote
         covers = self._covers
         if remote is None or not covers:
             return await self.async_step_user()
-        # Final whole-list backstop: HA does not validate subentry unique_ids
-        # at initial entry creation, and flow-state replay could bypass the
-        # per-iteration checks.
+        # Final whole-list backstop: flow-state replay could bypass the
+        # per-iteration channel checks.
         for index, cover in enumerate(covers):
             others = [c.channels for i, c in enumerate(covers) if i != index]
             if laminar_conflict(cover.channels, others) is not None:
                 return self.async_abort(reason="channel_conflict")
         await self.async_set_unique_id(remote.key)
         self._abort_if_unique_id_configured()
+        cover_rows = [{CONF_COVER_ID: ulid_now(), **cover.as_dict()} for cover in covers]
         return self.async_create_entry(
             title=remote.name,
-            data=remote.as_dict(),
-            subentries=[
-                ConfigSubentryData(
-                    data=cover.as_dict(),
-                    subentry_type="cover",
-                    title=cover.name,
-                    unique_id=cover.channel_key,
-                )
-                for cover in covers
-            ],
+            data={**remote.as_dict(), CONF_COVERS: cover_rows},
         )
 
     async def async_step_virtual(

@@ -42,22 +42,22 @@ class RemoteCoordinator:
     """
 
     def __init__(self, hass: HomeAssistant, covers: Mapping[str, CoverConfig]) -> None:
-        """Derive roles and leaves-only membership from one subentry snapshot."""
+        """Derive roles and leaves-only membership from entry-data covers."""
         self._hass = hass
         self.covers: dict[str, CoverConfig] = dict(covers)
         family = list(self.covers.values())
         self.roles: dict[str, Role] = {
-            subentry_id: derive_role(cover, family) for subentry_id, cover in self.covers.items()
+            cover_id: derive_role(cover, family) for cover_id, cover in self.covers.items()
         }
-        key_to_id = {cover.channel_key: subentry_id for subentry_id, cover in self.covers.items()}
+        key_to_id = {cover.channel_key: cover_id for cover_id, cover in self.covers.items()}
         self.members: dict[str, tuple[str, ...]] = {
-            subentry_id: tuple(
+            cover_id: tuple(
                 key_to_id[member.channel_key] for member in member_covers(cover, family)
             )
-            for subentry_id, cover in self.covers.items()
-            if self.roles[subentry_id] is Role.AGGREGATE
+            for cover_id, cover in self.covers.items()
+            if self.roles[cover_id] is Role.AGGREGATE
         }
-        # Reverse index: leaf subentry id -> aggregate subentry ids containing it.
+        # Reverse index: leaf cover id -> aggregate cover ids containing it.
         self._containers: dict[str, tuple[str, ...]] = {}
         for aggregate_id, member_ids in self.members.items():
             for member_id in member_ids:
@@ -67,7 +67,7 @@ class RemoteCoordinator:
                 )
         self._leaf_entities: dict[str, MemberCover] = {}
         self._aggregate_entities: dict[str, AggregateCover] = {}
-        self._entity_subentries: dict[str, str] = {}
+        self._entity_cover_ids: dict[str, str] = {}
         self._dirty: set[str] = set()
         self._flush_scheduled = False
         # Entity.async_write_ha_state is final, so member mutations are
@@ -84,41 +84,41 @@ class RemoteCoordinator:
         self._unsub_state_changed()
         self._leaf_entities.clear()
         self._aggregate_entities.clear()
-        self._entity_subentries.clear()
+        self._entity_cover_ids.clear()
         self._dirty.clear()
 
     @callback
     def _on_state_changed(self, event: Event[EventStateChangedData]) -> None:
         """Re-derive aggregates when one of their members wrote state."""
-        subentry_id = self._entity_subentries.get(event.data["entity_id"])
-        if subentry_id is not None:
-            self.member_changed(subentry_id)
+        cover_id = self._entity_cover_ids.get(event.data["entity_id"])
+        if cover_id is not None:
+            self.member_changed(cover_id)
 
     @callback
-    def register_leaf(self, subentry_id: str, entity: MemberCover) -> None:
+    def register_leaf(self, cover_id: str, entity: MemberCover) -> None:
         """Register one live leaf entity for fan-out and derivation."""
-        self._leaf_entities[subentry_id] = entity
-        self._entity_subentries[entity.entity_id] = subentry_id
-        self._mark_containers_dirty(subentry_id)
+        self._leaf_entities[cover_id] = entity
+        self._entity_cover_ids[entity.entity_id] = cover_id
+        self._mark_containers_dirty(cover_id)
 
     @callback
-    def unregister_leaf(self, subentry_id: str) -> None:
+    def unregister_leaf(self, cover_id: str) -> None:
         """Drop one leaf entity; containing aggregates re-derive without it."""
-        entity = self._leaf_entities.pop(subentry_id, None)
+        entity = self._leaf_entities.pop(cover_id, None)
         if entity is not None:
-            self._entity_subentries.pop(entity.entity_id, None)
-        self._mark_containers_dirty(subentry_id)
+            self._entity_cover_ids.pop(entity.entity_id, None)
+        self._mark_containers_dirty(cover_id)
 
     @callback
-    def register_aggregate(self, subentry_id: str, entity: AggregateCover) -> None:
+    def register_aggregate(self, cover_id: str, entity: AggregateCover) -> None:
         """Register one live aggregate entity for batched flushes."""
-        self._aggregate_entities[subentry_id] = entity
+        self._aggregate_entities[cover_id] = entity
 
     @callback
-    def unregister_aggregate(self, subentry_id: str) -> None:
+    def unregister_aggregate(self, cover_id: str) -> None:
         """Drop one aggregate entity."""
-        self._aggregate_entities.pop(subentry_id, None)
-        self._dirty.discard(subentry_id)
+        self._aggregate_entities.pop(cover_id, None)
+        self._dirty.discard(cover_id)
 
     def members_of(self, aggregate_id: str) -> tuple[MemberCover, ...]:
         """Return the live leaf entities inside one aggregate."""
@@ -129,18 +129,18 @@ class RemoteCoordinator:
         )
 
     @callback
-    def member_changed(self, subentry_id: str) -> None:
+    def member_changed(self, cover_id: str) -> None:
         """Mark aggregates containing this leaf dirty; flush once per iteration.
 
         Every member-model mutation funnels through the leaf's state write, so
         one RX event touching several members coalesces into a single state
         write per aggregate instead of intermediate partial recomputations.
         """
-        self._mark_containers_dirty(subentry_id)
+        self._mark_containers_dirty(cover_id)
 
     @callback
-    def _mark_containers_dirty(self, subentry_id: str) -> None:
-        containers = self._containers.get(subentry_id)
+    def _mark_containers_dirty(self, cover_id: str) -> None:
+        containers = self._containers.get(cover_id)
         if not containers:
             return
         self._dirty.update(containers)

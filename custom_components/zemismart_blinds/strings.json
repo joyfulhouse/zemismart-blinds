@@ -15,7 +15,7 @@
       },
       "learn_setup": {
         "title": "Set up remote learning",
-        "description": "Choose where this blind is located and which online RF bridge should capture the remote.",
+        "description": "Choose where this remote is located and which online RF bridge should capture it.",
         "data": {
           "name": "Device name",
           "area_id": "Home Assistant area",
@@ -102,7 +102,7 @@
         "title": "Add a cover",
         "description": "Cover {count} so far. Name this blind or group and enter its channels.",
         "data": {
-          "name": "Device name",
+          "name": "Cover name",
           "channels": "Channel or channel set",
           "travel_up": "Up travel time",
           "travel_down": "Down travel time"
@@ -125,7 +125,10 @@
         "title": "Reconfigure remote",
         "menu_options": {
           "reconfigure_learn": "Relearn from remote",
-          "reconfigure_edit": "Edit settings"
+          "reconfigure_edit": "Edit remote settings",
+          "cover_add": "Add cover",
+          "cover_pick_edit": "Edit cover",
+          "cover_pick_remove": "Remove cover"
         }
       },
       "reconfigure_edit": {
@@ -151,6 +154,50 @@
             }
           }
         }
+      },
+      "cover_add": {
+        "title": "Add a cover",
+        "data": {
+          "name": "Cover name",
+          "channels": "Channel or channel set",
+          "travel_up": "Up travel time",
+          "travel_down": "Down travel time"
+        },
+        "data_description": {
+          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
+          "travel_up": "Required for a blind; leave empty only for a group that contains existing covers.",
+          "travel_down": "Required for a blind; leave empty only for a group that contains existing covers."
+        }
+      },
+      "cover_pick_edit": {
+        "title": "Choose a cover to edit",
+        "data": {
+          "cover_id": "Cover"
+        }
+      },
+      "cover_edit": {
+        "title": "Edit cover",
+        "data": {
+          "name": "Cover name",
+          "channels": "Channel or channel set",
+          "travel_up": "Up travel time",
+          "travel_down": "Down travel time"
+        },
+        "data_description": {
+          "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
+          "travel_up": "Required for a blind; leave empty to preserve stored calibration.",
+          "travel_down": "Required for a blind; leave empty to preserve stored calibration."
+        }
+      },
+      "cover_pick_remove": {
+        "title": "Choose a cover to remove",
+        "data": {
+          "cover_id": "Cover"
+        }
+      },
+      "cover_remove_confirm": {
+        "title": "Remove cover",
+        "description": "Remove {name} ({cover_id})? Its entity registry row and stored configuration will be deleted."
       }
     },
     "error": {
@@ -159,62 +206,21 @@
       "already_configured": "This remote is already configured by another entry.",
       "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
       "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
-      "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
+      "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping.",
+      "cover_not_found": "Choose a cover that still exists."
     },
     "abort": {
       "already_configured": "This remote is already configured.",
       "reconfigure_successful": "The remote was reconfigured successfully.",
       "legacy_not_supported": "This entry uses the old per-blind format. Delete it and add its remote again instead of reconfiguring.",
-      "channel_conflict": "The collected covers conflict; start over."
-    }
-  },
-  "config_subentries": {
-    "cover": {
-      "entry_type": "Cover",
-      "initiate_flow": {
-        "user": "Add cover",
-        "reconfigure": "Reconfigure cover"
-      },
-      "step": {
-        "user": {
-          "title": "Add a cover",
-          "data": {
-            "name": "Device name",
-            "channels": "Channel or channel set",
-            "travel_up": "Up travel time",
-            "travel_down": "Down travel time"
-          },
-          "data_description": {
-            "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
-            "travel_up": "Required for a blind; leave empty only for a group that contains covers you already added.",
-            "travel_down": "Required for a blind; leave empty only for a group that contains covers you already added."
-          }
-        },
-        "reconfigure": {
-          "title": "Reconfigure cover",
-          "data": {
-            "name": "Device name",
-            "channels": "Channel or channel set",
-            "travel_up": "Up travel time",
-            "travel_down": "Down travel time"
-          },
-          "data_description": {
-            "channels": "Use 1 for one blind, or a comma-separated group such as 1,2,3.",
-            "travel_up": "Required for a blind; leave empty only for a group that contains covers you already added.",
-            "travel_down": "Required for a blind; leave empty only for a group that contains covers you already added."
-          }
-        }
-      },
-      "error": {
-        "invalid_config": "Check the cover name, channel set, and travel times.",
-        "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
-        "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
-        "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping."
-      },
-      "abort": {
-        "reconfigure_successful": "The cover was reconfigured successfully.",
-        "already_configured": "Another cover of this remote already uses exactly these channels."
-      }
+      "channel_conflict": "The collected covers conflict; start over.",
+      "invalid_config": "The stored cover configuration is invalid and cannot be managed.",
+      "cover_not_found": "The selected cover no longer exists.",
+      "cover_added": "The cover was added successfully.",
+      "cover_updated": "The cover was updated successfully.",
+      "cover_removed": "The cover was removed successfully.",
+      "last_cover": "The last cover cannot be removed. Delete the remote entry instead.",
+      "aggregate_dependency": "This cover cannot be removed because an aggregate cover depends on its channels."
     }
   },
   "selector": {

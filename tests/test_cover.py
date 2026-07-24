@@ -4202,9 +4202,21 @@ def aggregate_family(
 
     del hub  # the family shares the caller's hub; nothing to derive from it
     covers = {
-        "sub-1": CoverConfig(name="Channel 1", channels=(1,), travel_up=travel, travel_down=travel),
-        "sub-2": CoverConfig(name="Channel 2", channels=(2,), travel_up=travel, travel_down=travel),
-        "sub-agg": CoverConfig(name="Both", channels=(1, 2)),
+        "sub-1": CoverConfig(
+            name="Channel 1",
+            channels=(1,),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-1",
+        ),
+        "sub-2": CoverConfig(
+            name="Channel 2",
+            channels=(2,),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-2",
+        ),
+        "sub-agg": CoverConfig(name="Both", channels=(1, 2), cover_id="sub-agg"),
     }
     coordinator = RemoteCoordinator(hass, covers)
     remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
