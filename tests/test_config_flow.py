@@ -382,6 +382,28 @@ async def create_remote_entry(
     return result["result"]
 
 
+async def start_reconfigure_flow(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> ConfigFlowResult:
+    """Start the reconfigure menu for a stored remote entry."""
+    return await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+
+
+def stored_cover_rows(entry: ConfigEntry) -> list[dict[str, Any]]:
+    """Return the mutable-shape cover rows stored on one test entry."""
+    rows = entry.data[CONF_COVERS]
+    assert isinstance(rows, list)
+    assert all(isinstance(row, dict) for row in rows)
+    return cast("list[dict[str, Any]]", rows)
+
+
 def current_flow(hass: HomeAssistant, flow_id: str) -> ConfigFlowResult:
     """Return the current public flow result."""
     return hass.config_entries.flow.async_get(flow_id)
@@ -523,7 +545,7 @@ def test_validate_cover_input_born_aggregate_travel_optional() -> None:
 
 
 def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
-    """Remote and subentry copy stays exact in both English JSON files."""
+    """Remote and cover-management copy stays exact in both English JSON files."""
     integration_dir = Path(__file__).parents[1] / "custom_components" / DOMAIN
     strings_bytes = (integration_dir / "strings.json").read_bytes()
     translations_bytes = (integration_dir / "translations" / "en.json").read_bytes()
@@ -548,10 +570,17 @@ def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
         "This entry uses the old per-blind format. Delete it and add its remote "
         "again instead of reconfiguring."
     )
-    assert strings["config_subentries"]["cover"]["abort"] == {
-        "reconfigure_successful": "The cover was reconfigured successfully.",
-        "already_configured": ("Another cover of this remote already uses exactly these channels."),
+    assert "config_subentries" not in strings
+    assert strings["config"]["step"]["reconfigure"]["menu_options"] == {
+        "reconfigure_learn": "Relearn from remote",
+        "reconfigure_edit": "Edit remote settings",
+        "cover_add": "Add cover",
+        "cover_pick_edit": "Edit cover",
+        "cover_pick_remove": "Remove cover",
     }
+    assert strings["config"]["step"]["cover"]["data"][CONF_NAME] == "Cover name"
+    assert strings["config"]["step"]["cover_add"]["data"][CONF_NAME] == "Cover name"
+    assert "this blind" not in strings["config"]["step"]["learn_setup"]["description"]
 
 
 @pytest.mark.asyncio
@@ -570,7 +599,7 @@ async def test_user_starts_with_learn_and_advanced_menu(hass: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
+async def test_legacy_entry_cannot_reconfigure(
     hass: HomeAssistant,
 ) -> None:
     """Legacy per-blind entries stay outside remote-only management flows."""
@@ -590,29 +619,6 @@ async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
         title=legacy.name,
         unique_id=f"{legacy.remote.key}:1-2",
     )
-    remote = RemoteConfig(
-        name="Remote",
-        remote=legacy.remote,
-        area_id="kitchen",
-        repeats=5,
-    )
-    remote_entry = stored_config_entry(
-        remote.as_dict(),
-        entry_id="remote-entry",
-        title=remote.name,
-        unique_id=remote.key,
-    )
-
-    assert (
-        config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
-            legacy_entry
-        )
-        == {}
-    )
-    assert config_flow_module.ZemismartBlindsConfigFlow.async_get_supported_subentry_types(
-        remote_entry
-    ) == {"cover": config_flow_module.CoverSubentryFlow}
-
     await hass.config_entries.async_add(legacy_entry)
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -626,11 +632,11 @@ async def test_legacy_entry_cannot_reconfigure_or_manage_subentries(
 
 
 @pytest.mark.asyncio
-async def test_learn_wizard_dual_writes_data_covers_and_cover_subentries(
+async def test_wizard_creates_entry_with_data_covers_and_no_subentries(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The interim wizard writes data covers while retaining subentries."""
+    """The wizard writes fresh entry-data cover IDs without config subentries."""
     prepare_config_flow(hass, monkeypatch)
     fake = FakeMqtt()
     install_mqtt(monkeypatch, fake)
@@ -831,15 +837,11 @@ async def test_learn_wizard_dual_writes_data_covers_and_cover_subentries(
     assert result["data"] == {**expected_remote.as_dict(), CONF_COVERS: cover_rows}
     entry = result["result"]
     assert entry.unique_id == "a1b2c3:42"
-    subentries = list(entry.subentries.values())
-    assert [(s.subentry_type, s.title, s.unique_id) for s in subentries] == [
-        ("cover", "Slider", "1-2"),
-        ("cover", "Kitchen shades", "1-2-3"),
-    ]
-    slider = CoverConfig.from_stored(subentries[0].subentry_id, subentries[0].data)
+    assert not entry.subentries
+    slider = CoverConfig.from_stored(cover_ids[0], cover_rows[0])
     assert slider.channels == (1, 2)
     assert slider.travel_up == 12.0
-    aggregate = CoverConfig.from_stored(subentries[1].subentry_id, subentries[1].data)
+    aggregate = CoverConfig.from_stored(cover_ids[1], cover_rows[1])
     assert aggregate.travel_up is None
 
 
@@ -1331,11 +1333,11 @@ async def test_manual_wizard_and_duplicate_remote_abort(
 
 
 @pytest.mark.asyncio
-async def test_subentry_add_creates_cover(
+async def test_reconfigure_menu_adds_a_cover(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A remote entry exposes a flow that adds one cover subentry."""
+    """The reconfigure menu validates and appends a data-backed cover."""
     entry = await create_remote_entry(
         hass,
         monkeypatch,
@@ -1348,12 +1350,33 @@ async def test_subentry_add_creates_cover(
             }
         ],
     )
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={"source": config_entries.SOURCE_USER},
+    original_id = stored_cover_rows(entry)[0][CONF_COVER_ID]
+    result = await start_reconfigure_flow(hass, entry)
+    assert result["type"] is FlowResultType.MENU
+    assert result["menu_options"] == [
+        "reconfigure_learn",
+        "reconfigure_edit",
+        "cover_add",
+        "cover_pick_edit",
+        "cover_pick_remove",
+    ]
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_add"},
     )
     assert result["type"] is FlowResultType.FORM
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Overlap",
+            CONF_CHANNELS: "3,4",
+            CONF_TRAVEL_UP: 9,
+            CONF_TRAVEL_DOWN: 9,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
             CONF_NAME: "Sink",
@@ -1362,18 +1385,23 @@ async def test_subentry_add_creates_cover(
             CONF_TRAVEL_DOWN: 9,
         },
     )
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    subentries = {subentry.unique_id: subentry for subentry in entry.subentries.values()}
-    assert "5" in subentries
-    assert subentries["5"].title == "Sink"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cover_added"
+    rows = stored_cover_rows(entry)
+    assert [row[CONF_NAME] for row in rows] == ["Slider", "Sink"]
+    added_id = rows[1][CONF_COVER_ID]
+    assert isinstance(added_id, str)
+    assert len(added_id) == 26
+    assert added_id != original_id
+    assert not entry.subentries
 
 
 @pytest.mark.asyncio
-async def test_subentry_add_rejects_partial_overlap_and_duplicate(
+async def test_cover_add_rejects_duplicate_channels(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A new cover must remain laminar with existing sibling covers."""
+    """A new data row cannot duplicate an existing cover's channel set."""
     entry = await create_remote_entry(
         hass,
         monkeypatch,
@@ -1386,35 +1414,26 @@ async def test_subentry_add_rejects_partial_overlap_and_duplicate(
             }
         ],
     )
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={"source": config_entries.SOURCE_USER},
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_add"},
     )
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
-            CONF_NAME: "Bad",
-            CONF_CHANNELS: "3,4",
+            CONF_NAME: "Duplicate",
+            CONF_CHANNELS: "3,2,1",
             CONF_TRAVEL_UP: 9,
             CONF_TRAVEL_DOWN: 9,
         },
     )
     assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {CONF_CHANNELS: "overlapping_channels"}
-    result = await hass.config_entries.subentries.async_configure(
-        result["flow_id"],
-        {
-            CONF_NAME: "Dup",
-            CONF_CHANNELS: "1,2,3",
-            CONF_TRAVEL_UP: 9,
-            CONF_TRAVEL_DOWN: 9,
-        },
-    )
     assert result["errors"] == {CONF_CHANNELS: "duplicate_channels"}
 
 
 @pytest.mark.asyncio
-async def test_subentry_add_fails_closed_for_unparseable_sibling_channels(
+async def test_cover_add_fails_closed_for_unparseable_sibling_channels(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1431,18 +1450,25 @@ async def test_subentry_add_fails_closed_for_unparseable_sibling_channels(
             }
         ],
     )
-    sibling = next(iter(entry.subentries.values()))
-    hass.config_entries.async_update_subentry(
+    row = stored_cover_rows(entry)[0]
+    hass.config_entries.async_update_entry(
         entry,
-        sibling,
-        data={CONF_NAME: "x", CONF_CHANNELS: "not-a-channel"},
+        data={
+            **entry.data,
+            CONF_COVERS: [
+                {
+                    **row,
+                    CONF_CHANNELS: "not-a-channel",
+                }
+            ],
+        },
     )
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={"source": config_entries.SOURCE_USER},
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_add"},
     )
-
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
             CONF_NAME: "Sink",
@@ -1457,7 +1483,7 @@ async def test_subentry_add_fails_closed_for_unparseable_sibling_channels(
 
 
 @pytest.mark.asyncio
-async def test_subentry_add_validates_channels_from_malformed_travel_sibling(
+async def test_cover_add_validates_channels_from_malformed_travel_sibling(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1474,23 +1500,26 @@ async def test_subentry_add_validates_channels_from_malformed_travel_sibling(
             }
         ],
     )
-    sibling = next(iter(entry.subentries.values()))
-    hass.config_entries.async_update_subentry(
+    row = stored_cover_rows(entry)[0]
+    hass.config_entries.async_update_entry(
         entry,
-        sibling,
         data={
-            CONF_NAME: "x",
-            CONF_CHANNELS: "1,2",
-            CONF_TRAVEL_UP: "garbage",
-            CONF_TRAVEL_DOWN: "garbage",
+            **entry.data,
+            CONF_COVERS: [
+                {
+                    **row,
+                    CONF_TRAVEL_UP: "garbage",
+                    CONF_TRAVEL_DOWN: "garbage",
+                }
+            ],
         },
     )
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={"source": config_entries.SOURCE_USER},
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_add"},
     )
-
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {
             CONF_NAME: "Overlap",
@@ -1505,7 +1534,7 @@ async def test_subentry_add_validates_channels_from_malformed_travel_sibling(
 
 
 @pytest.mark.asyncio
-async def test_subentry_reconfigure_prefills_display_values(
+async def test_cover_edit_prefills_display_values(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1522,13 +1551,15 @@ async def test_subentry_reconfigure_prefills_display_values(
             }
         ],
     )
-    slider = next(iter(entry.subentries.values()))
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={
-            "source": config_entries.SOURCE_RECONFIGURE,
-            "subentry_id": slider.subentry_id,
-        },
+    slider = stored_cover_rows(entry)[0]
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_pick_edit"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_COVER_ID: slider[CONF_COVER_ID]},
     )
     schema = result["data_schema"]
     assert schema is not None
@@ -1538,26 +1569,27 @@ async def test_subentry_reconfigure_prefills_display_values(
     assert suggested[CONF_TRAVEL_DOWN] == 13.0
 
     suggested[CONF_NAME] = "Renamed slider"
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         schema(suggested),
     )
 
     assert result["type"] is FlowResultType.ABORT
-    updated = next(iter(entry.subentries.values()))
-    restored = CoverConfig.from_stored(updated.subentry_id, updated.data)
-    assert updated.title == "Renamed slider"
+    assert result["reason"] == "cover_updated"
+    updated = stored_cover_rows(entry)[0]
+    restored = CoverConfig.from_stored(str(updated[CONF_COVER_ID]), updated)
+    assert updated[CONF_NAME] == "Renamed slider"
     assert restored.channels == (1, 2, 3)
     assert restored.travel_up == 12.0
     assert restored.travel_down == 13.0
 
 
 @pytest.mark.asyncio
-async def test_subentry_reconfigure_carries_hidden_travel_forward(
+async def test_cover_edit_merges_and_preserves_unknown_keys_and_cover_id(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconfiguring into an aggregate retains stored travel calibration."""
+    """Cover edits merge validated fields without replacing identity or hidden data."""
     entry = await create_remote_entry(
         hass,
         monkeypatch,
@@ -1568,40 +1600,44 @@ async def test_subentry_reconfigure_carries_hidden_travel_forward(
                 CONF_TRAVEL_UP: 12,
                 CONF_TRAVEL_DOWN: 12,
             },
-            {
-                CONF_NAME: "Sink",
-                CONF_CHANNELS: "5",
-                CONF_TRAVEL_UP: 9,
-                CONF_TRAVEL_DOWN: 9,
-            },
         ],
     )
-    sink = next(subentry for subentry in entry.subentries.values() if subentry.unique_id == "5")
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={
-            "source": config_entries.SOURCE_RECONFIGURE,
-            "subentry_id": sink.subentry_id,
+    stored = stored_cover_rows(entry)[0]
+    cover_id = stored[CONF_COVER_ID]
+    unknown = {"calibration_epoch": 4, "vendor": {"offset": 7}}
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_COVERS: [{**stored, **unknown}],
         },
     )
-    result = await hass.config_entries.subentries.async_configure(
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3,5"},
+        {"next_step_id": "cover_pick_edit"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_COVER_ID: cover_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_NAME: "Renamed slider", CONF_CHANNELS: "1,2,3"},
     )
     assert result["type"] is FlowResultType.ABORT
-    updated = next(
-        subentry
-        for subentry in entry.subentries.values()
-        if subentry.subentry_id == sink.subentry_id
-    )
-    assert updated.unique_id == "1-2-3-5"
-    assert updated.title == "Kitchen shades"
-    restored = CoverConfig.from_stored(updated.subentry_id, updated.data)
-    assert restored.travel_up == 9.0
+    assert result["reason"] == "cover_updated"
+    updated = stored_cover_rows(entry)[0]
+    assert updated[CONF_COVER_ID] == cover_id
+    assert updated[CONF_NAME] == "Renamed slider"
+    assert updated["calibration_epoch"] == 4
+    assert updated["vendor"] == {"offset": 7}
+    assert updated[CONF_TRAVEL_UP] == 12.0
+    assert updated[CONF_TRAVEL_DOWN] == 12.0
 
 
 @pytest.mark.asyncio
-async def test_subentry_reconfigure_to_leaf_requires_travel(
+async def test_cover_edit_to_leaf_requires_travel(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1619,17 +1655,17 @@ async def test_subentry_reconfigure_to_leaf_requires_travel(
             {CONF_NAME: "All", CONF_CHANNELS: "1,2,3,4"},
         ],
     )
-    aggregate = next(
-        subentry for subentry in entry.subentries.values() if subentry.unique_id == "1-2-3-4"
+    aggregate = next(row for row in stored_cover_rows(entry) if row[CONF_CHANNELS] == [1, 2, 3, 4])
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_pick_edit"},
     )
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "cover"),
-        context={
-            "source": config_entries.SOURCE_RECONFIGURE,
-            "subentry_id": aggregate.subentry_id,
-        },
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_COVER_ID: aggregate[CONF_COVER_ID]},
     )
-    result = await hass.config_entries.subentries.async_configure(
+    result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {CONF_NAME: "Solo", CONF_CHANNELS: "6"},
     )
@@ -1637,12 +1673,175 @@ async def test_subentry_reconfigure_to_leaf_requires_travel(
     assert result["errors"] == {"base": "travel_required"}
 
 
+@pytest.mark.parametrize("registry_state", ("enabled", "disabled", "missing"))
 @pytest.mark.asyncio
-async def test_reconfigure_edit_updates_settings_and_keeps_identity(
+async def test_cover_remove_deletes_the_registry_row(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    registry_state: str,
+) -> None:
+    """Removing a cover explicitly deletes any enabled or disabled registry row."""
+    from homeassistant.helpers import entity_registry as er
+
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            },
+            {
+                CONF_NAME: "Sink",
+                CONF_CHANNELS: "5",
+                CONF_TRAVEL_UP: 9,
+                CONF_TRAVEL_DOWN: 9,
+            },
+        ],
+    )
+    removed = stored_cover_rows(entry)[0]
+    cover_id = str(removed[CONF_COVER_ID])
+    registry = er.async_get(hass)
+    if registry_state != "missing":
+        registry.async_get_or_create(
+            "cover",
+            DOMAIN,
+            cover_id,
+            config_entry=entry,
+            disabled_by=(er.RegistryEntryDisabler.USER if registry_state == "disabled" else None),
+        )
+
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_pick_remove"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_COVER_ID: cover_id},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "cover_remove_confirm"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cover_removed"
+    assert [row[CONF_NAME] for row in stored_cover_rows(entry)] == ["Sink"]
+    assert registry.async_get_entity_id("cover", DOMAIN, cover_id) is None
+
+
+@pytest.mark.parametrize(
+    ("covers", "target_index", "reason"),
+    [
+        (
+            [
+                {
+                    CONF_NAME: "Only",
+                    CONF_CHANNELS: "1",
+                    CONF_TRAVEL_UP: 12,
+                    CONF_TRAVEL_DOWN: 12,
+                }
+            ],
+            0,
+            "last_cover",
+        ),
+        (
+            [
+                {
+                    CONF_NAME: "Leaf",
+                    CONF_CHANNELS: "1",
+                    CONF_TRAVEL_UP: 12,
+                    CONF_TRAVEL_DOWN: 12,
+                },
+                {
+                    CONF_NAME: "All",
+                    CONF_CHANNELS: "1,2",
+                },
+            ],
+            0,
+            "aggregate_dependency",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cover_remove_refuses_last_cover_and_aggregate_dependency(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    covers: list[dict[str, Any]],
+    target_index: int,
+    reason: str,
+) -> None:
+    """Removal refuses the last cover and leaves required aggregate members intact."""
+    entry = await create_remote_entry(hass, monkeypatch, covers)
+    before = [dict(row) for row in stored_cover_rows(entry)]
+    cover_id = before[target_index][CONF_COVER_ID]
+
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_pick_remove"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_COVER_ID: cover_id},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == reason
+    assert stored_cover_rows(entry) == before
+
+
+@pytest.mark.asyncio
+async def test_pickers_disambiguate_duplicate_names_by_cover_id(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Editing settings updates mutable fields without replacing identity or covers."""
+    """Edit and remove picker values and duplicate labels expose stable cover IDs."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Shade",
+                CONF_CHANNELS: "1",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 12,
+            },
+            {
+                CONF_NAME: "Shade",
+                CONF_CHANNELS: "5",
+                CONF_TRAVEL_UP: 9,
+                CONF_TRAVEL_DOWN: 9,
+            },
+        ],
+    )
+    cover_ids = [str(row[CONF_COVER_ID]) for row in stored_cover_rows(entry)]
+
+    for step_id in ("cover_pick_edit", "cover_pick_remove"):
+        result = await start_reconfigure_flow(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {"next_step_id": step_id},
+        )
+        schema = result["data_schema"]
+        assert schema is not None
+        select = schema.schema[CONF_COVER_ID]
+        options = select.config["options"]
+        assert [option["value"] for option in options] == cover_ids
+        labels = [option["label"] for option in options]
+        assert len(set(labels)) == 2
+        assert all(cover_id in label for cover_id, label in zip(cover_ids, labels, strict=True))
+        hass.config_entries.flow.async_abort(result["flow_id"])
+
+
+@pytest.mark.asyncio
+async def test_remote_settings_reconfigure_round_trips_covers_verbatim(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Editing remote settings round-trips every cover row and unknown key verbatim."""
     entry = await create_remote_entry(
         hass,
         monkeypatch,
@@ -1655,13 +1854,18 @@ async def test_reconfigure_edit_updates_settings_and_keeps_identity(
             }
         ],
     )
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={
-            "source": config_entries.SOURCE_RECONFIGURE,
-            "entry_id": entry.entry_id,
+    cover_rows = [
+        {
+            **stored_cover_rows(entry)[0],
+            "future_calibration": {"curve": [1, 3, 5]},
+            "opaque_flag": True,
         },
+    ]
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_COVERS: cover_rows},
     )
+    result = await start_reconfigure_flow(hass, entry)
     assert result["type"] is FlowResultType.MENU
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
@@ -1691,7 +1895,8 @@ async def test_reconfigure_edit_updates_settings_and_keeps_identity(
     assert updated.key == "a1b2c3:42"
     assert updated.remote.bases is not None
     assert updated.remote.bases.trailer == 0xDD05
-    assert [subentry.unique_id for subentry in entry.subentries.values()] == ["1-2-3"]
+    assert stored_cover_rows(entry) == cover_rows
+    assert not entry.subentries
 
 
 @pytest.mark.asyncio
@@ -1712,6 +1917,7 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
             }
         ],
     )
+    original_covers = [dict(row) for row in stored_cover_rows(entry)]
     fake = FakeMqtt()
     install_mqtt(monkeypatch, fake)
     result = await hass.config_entries.flow.async_init(
@@ -1763,7 +1969,8 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
     assert updated.name == "Renamed remote"
     assert updated.area_id == "pantry"
     assert entry.title == "Renamed remote"
-    assert [subentry.unique_id for subentry in entry.subentries.values()] == ["1-2"]
+    assert stored_cover_rows(entry) == original_covers
+    assert not entry.subentries
 
 
 @pytest.mark.asyncio
