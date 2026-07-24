@@ -57,7 +57,7 @@ Learn wizard   ◀─(MQTT rx)── broker ◀─(rf433/<bridge>/rx)── RF B
 |---|---|
 | **Home Assistant** | Version **2026.5** or newer (ships Python 3.14, which this integration's syntax requires), with the MQTT integration configured |
 | **MQTT broker** | Any — the Mosquitto add-on is the easiest |
-| **RF bridge** | Sonoff RF Bridge R2 flashed with [esphome-rf433-mqtt-bridge][bridge-repo] (Portisch RF firmware required) |
+| **RF bridge** | One or more [Sonoff RF Bridge R2][bridge-hardware-buy] units flashed with [esphome-rf433-mqtt-bridge][bridge-repo] — **board revision matters**, see [Hardware](#hardware) |
 | **Blinds** | AOK OEM 433.92 MHz tubular motors — commonly sold as Zemismart; other AOK resellers are expected to be compatible |
 
 ## Installation
@@ -162,10 +162,23 @@ To pair one:
 
 ## Hardware
 
-- **Bridge:** Sonoff RF Bridge R2 — see [esphome-rf433-mqtt-bridge][bridge-repo] for flashing.
-- **Motors:** AOK OEM tubular roller-shade motors (Zemismart-branded and others).
-- **3D-printed tube adapters:** printable adapters for fitting these motors to other roller
-  tubes are maintained in [joyfulhouse/ZemismartAdapters][adapters-repo].
+**Bridge:** [Sonoff RF Bridge R2][bridge-hardware-buy] (433 MHz variant), flashed with
+[esphome-rf433-mqtt-bridge][bridge-repo]. Each bridge needs two firmwares — Portisch on the RF
+coprocessor, then the ESPHome package on the Wi-Fi chip — and the complete walkthrough lives in
+[**HARDWARE.md**][bridge-hardware].
+
+> **Check the board revision before buying.** Only R2 **V1.0/V2.0** boards (Silicon Labs
+> **EFM8BB1** coprocessor) are validated. The 2022+ R2 **V2.2** switched to an **OB38S003**, which
+> cannot run Portisch and is unsupported. Sellers rarely state the revision, so new stock is a
+> gamble; secondhand V1.0/V2.0 units are the safe buy.
+
+Tasmota is used only as a one-time tool to flash the coprocessor — a Tasmota bridge cannot drive
+this integration, which speaks the ESPHome package's MQTT contract.
+
+**Motors:** AOK OEM tubular roller-shade motors (Zemismart-branded and others).
+
+**3D-printed tube adapters:** printable adapters for fitting these motors to other roller tubes
+are maintained in [joyfulhouse/ZemismartAdapters][adapters-repo].
 
 ## Automation Example
 
@@ -297,6 +310,8 @@ MIT — see [LICENSE](LICENSE).
 [kofi-shield]: https://img.shields.io/badge/Ko--fi-support-FF5E5B.svg?style=for-the-badge&logo=ko-fi&logoColor=white
 [kofi]: https://ko-fi.com/bryanli
 [bridge-repo]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge
+[bridge-hardware]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/blob/main/HARDWARE.md
+[bridge-hardware-buy]: https://itead.cc/product/sonoff-rf-bridge-433/
 [adapters-repo]: https://github.com/joyfulhouse/ZemismartAdapters
 [issues]: https://github.com/joyfulhouse/zemismart-blinds/issues
 [discussions]: https://github.com/joyfulhouse/zemismart-blinds/discussions
