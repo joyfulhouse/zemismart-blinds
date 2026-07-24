@@ -131,37 +131,37 @@ def test_reference_decoder_accepts_short_trailer_without_weakening_decode() -> N
         decode_b0(short)
 
 
-LIVE_OFFICE_B1_CAPTURES = (
-    # Live Office-bridge captures of the physical 5cad7c:da remote's ALL
-    # presses (2026-07-17). The remote transmits 64 payload bits plus a
-    # trailer that captures as a single 0-read — one pair short of nominal.
+REKEYED_FIELD_B1_CAPTURES = (
+    # Real field-captured bucket timings and 65-pair truncated-trailer
+    # structures, re-keyed to the synthetic test identity and command bases.
+    # These preserve per-capture RF jitter but are no longer verbatim captures.
     (
-        "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
-        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A192A1A1A19"
-        "2A1A1955",
-        0xF4BB,  # UP
+        "AAB10413EC026C012C143C381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+        "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A192929292A192A192A"
+        "1A1955",
+        0xF42B,  # UP
     ),
     (
-        "AAB10413EC0276012C144638192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
-        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A192A1A1A1A19292A1929292929"
+        "AAB10413EC0276012C1446381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+        "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A192A1A1A1A19292A1A1A1A1929"
         "2A1A1955",
-        0xBC83,  # DOWN
+        0xBCF3,  # DOWN
     ),
     (
-        "AAB10413EC0276012C145038192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
-        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A192A1A1A19292A192A192929"
-        "2A1A1955",
-        0xDCA3,  # STOP
+        "AAB10413EC0276012C1450381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+        "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A192A1A1A19292929292A19292"
+        "A1A1955",
+        0xDC13,  # STOP
     ),
 )
 
 
-@pytest.mark.parametrize(("raw", "cmd"), LIVE_OFFICE_B1_CAPTURES)
-def test_rx_capture_decoder_accepts_live_oem_truncated_trailer(raw: str, cmd: int) -> None:
-    """Live captures of a truncated-trailer OEM remote decode for RX use only."""
+@pytest.mark.parametrize(("raw", "cmd"), REKEYED_FIELD_B1_CAPTURES)
+def test_rx_capture_decoder_accepts_rekeyed_field_truncated_trailer(raw: str, cmd: int) -> None:
+    """Re-keyed field timing fixtures with a truncated trailer decode for RX use only."""
     assert decode_rx_capture(raw) == {
-        "prefix": 0x5CAD7C,
-        "remote_id": 0xDA,
+        "prefix": TEST_PREFIX,
+        "remote_id": TEST_REMOTE_ID,
         "channel": 0xC0FF,
         "chans": [1, 2, 3, 4, 5, 6],
         "cmd": cmd,

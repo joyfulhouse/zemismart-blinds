@@ -120,10 +120,12 @@ Live state sync: physical remote presses now move the matching covers.
 
 ### Fixed
 
-- **OEM truncated-trailer captures decode**: some remotes (live-captured office `5cad7c`)
-  transmit 64 payload bits plus a single trailer 0-read instead of the nominal `[1, 0]`;
-  receive-side decoding (`decode_rx_capture`) now tolerates it, while transport
-  encode/decode stays strict. Presses from such remotes were previously dropped silently.
+- **OEM truncated-trailer captures decode**: some remotes transmit 64 payload bits plus a single
+  trailer 0-read instead of the nominal `[1, 0]`; receive-side decoding (`decode_rx_capture`) now
+  tolerates it, while transport encode/decode stays strict. The regression fixtures retain real
+  field-captured bucket timing jitter and trailer structure but are re-keyed to a synthetic
+  identity rather than storing verbatim captures. Presses with this structure were previously
+  dropped silently.
 - Release-hardening rounds 11–16 on the cover/scheduler core (displaced-STOP freeze
   regression, timeout snapshot coverage, restore ordering, echo anchoring, teardown race).
 

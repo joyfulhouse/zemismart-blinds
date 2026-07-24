@@ -92,20 +92,21 @@ def test_frame_signature_ignores_non_movement_and_garbage(frame: str) -> None:
     assert frame_signature(frame) is None
 
 
-def test_frame_signature_decodes_live_truncated_trailer_capture() -> None:
-    """A real OEM capture with a truncated trailer still classifies.
+def test_frame_signature_decodes_rekeyed_field_truncated_trailer_capture() -> None:
+    """A re-keyed OEM field capture with a truncated trailer still classifies.
 
-    Live Office-bridge capture of the physical 5cad7c:da remote's ALL/UP press
-    (2026-07-17): 64 payload bits plus a single trailer 0-read. Every press
-    was silently dropped here while this decode was strict.
+    The bucket timings and 65-pair single-0-read trailer structure came from
+    a real field capture; its payload is re-keyed to the synthetic test
+    identity and is no longer verbatim. This structure was silently dropped
+    here while receive decoding was strict.
     """
-    live_up = (
-        "AAB10413EC026C012C143C38192A192A1A1A19292A192A192A1A192A192A1A1A1A1A19292A"
-        "1A192A1A192A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A19292A192A1A1A19"
-        "2A1A1955"
+    rekeyed_up = (
+        "AAB10413EC026C012C143C381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+        "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A192929292A192A192A"
+        "1A1955"
     )
-    assert frame_signature(live_up) == (
-        "5cad7c:da",
+    assert frame_signature(rekeyed_up) == (
+        "a1b2c3:42",
         frozenset({1, 2, 3, 4, 5, 6}),
         "UP",
     )

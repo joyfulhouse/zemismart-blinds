@@ -155,7 +155,7 @@ So **~11.9–13.1 s last-start**, with the final RF train finishing ≈14.3 s.
 
 The "ten trains" premise is workload-dependent. Coalescing applies only to
 untimed non-group UP/DOWN commands (`models.py:2458`), and any multi-channel
-cover is a group (`models.py:631`). The office remote has five single-channel
+cover is a group (`models.py:631`). One measured remote has five single-channel
 leaves and two groups, so a scene targeting all 16 entities emits **≥12
 trains**, not 10. Ten holds for a curated one-logical-cover-per-remote scene.
 

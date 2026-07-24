@@ -9,16 +9,16 @@ Release target: `v0.5.0`
 
 ## The problem, from the production UI
 
-On the integrations page, every remote entry renders like this (Office Remote, 7 covers):
+On the integrations page, every remote entry renders like this (Sample Remote, 7 covers):
 
 ```text
-Office Remote                                (config entry)
+Sample Remote                                (config entry)
 ├─ Devices that don't belong to a sub-entry
-│  └─ Office Remote — RF433 remote · 7 entities
+│  └─ Sample Remote — RF433 remote · 7 entities
 ├─ Backyard Window (Cover)
-│  └─ Office Remote — RF433 remote · 7 entities      ← same device again
+│  └─ Sample Remote — RF433 remote · 7 entities      ← same device again
 ├─ Left Slider (Cover)
-│  └─ Office Remote — RF433 remote · 7 entities      ← and again
+│  └─ Sample Remote — RF433 remote · 7 entities      ← and again
 └─ … × 7 subentries, each repeating the one device
 ```
 
@@ -26,7 +26,7 @@ The same remote device appears once per cover subentry plus once in the "don't b
 bucket. The owner's expected rendering is simply:
 
 ```text
-Office Remote  →  Office Remote (device)  →  click: its covers
+Sample Remote  →  Sample Remote (device)  →  click: its covers
 ```
 
 ## Root cause
@@ -75,7 +75,7 @@ Considered and rejected:
 ```jsonc
 {
   // remote fields, unchanged:
-  "name": "Office Remote", "prefix": "0x…", "remote_id": "0x…",
+  "name": "Sample Remote", "prefix": "0x…", "remote_id": "0x…",
   "base_up": "0x…", "base_down": "0x…", "base_stop": "0x…",
   "area_id": "office", "repeats": 3, "coalesce_window_ms": 150,
   // NEW — replaces subentries:

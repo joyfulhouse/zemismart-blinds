@@ -34,11 +34,12 @@ No checksum — integrity comes from the command derivation (below).
 - **bit 1** = short-high (~300 µs) + long-low (~600 µs)
 - Preamble: a `~5100 µs` low+high sync pair (Portisch nibble prefix `38`).
 - Frame = preamble + 64 payload bits + **2 trailing bits `[1,0]`** (matches OEM frames).
-- **Not every OEM remote puts the full trailer on air**: the office `5cad7c` remote's presses
-  capture one pair short, as a single trailing 0-read (live-captured 2026-07-17 — every press was
-  rejected until receive-side decoding tolerated it). RX paths must use `decode_rx_capture`
-  (trailer-tolerant, like the calibration decoder); `encode_b0`/`decode_b0` transport frames stay
-  strict `[1,0]`.
+- **Not every OEM remote puts the full trailer on air**: a real field-captured case ends one pair
+  short, as a single trailing 0-read; every press with that structure was rejected until
+  receive-side decoding tolerated it. Its regression fixtures preserve the real per-capture
+  bucket timings and truncated-trailer structure but are re-keyed to the synthetic test identity,
+  so they are not verbatim captures. RX paths must use `decode_rx_capture` (trailer-tolerant, like
+  the calibration decoder); `encode_b0`/`decode_b0` transport frames stay strict `[1,0]`.
 - B1 bucket captures may retain one additional idle/sync low-high pair after those trailer bits;
   `decode_b0` accepts only that bounded capture padding and never treats it as payload.
 - Captured by the Sonoff bridge in **B1 raw-bucket** mode; transmitted as **B0**

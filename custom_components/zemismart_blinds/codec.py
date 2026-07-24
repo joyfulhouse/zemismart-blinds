@@ -568,10 +568,11 @@ def decode_rx_capture(hexstr: str) -> DecodedFrame:
     """Decode one live bridge capture, tolerating OEM trailer truncation.
 
     Physical remotes do not all put the nominal ``[1, 0]`` trailer on air: the
-    office ``5cad7c`` remote's presses capture one pair short, as a single
-    trailing 0-read (live-captured 2026-07-17). Receive-side decoding accepts
-    that truncation; transport frames built by :func:`encode_b0` and validated
-    by :func:`decode_b0` stay strict.
+    field-captured regression case ends one pair short, as a single trailing
+    0-read. Its fixtures retain the real bucket timings and trailer structure
+    while re-keying the payload to a synthetic identity. Receive-side decoding
+    accepts that truncation; transport frames built by :func:`encode_b0` and
+    validated by :func:`decode_b0` stay strict.
     """
     return _decode_frame(hexstr, allow_missing_trailer=True)
 
