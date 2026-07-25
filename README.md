@@ -207,7 +207,10 @@ automation:
 
 - Re-check the calibration: capture the remote button again and compare the decoded
   prefix/remote ID with the entry's configuration.
-- Increase **RF repeats** in the entry's Configure dialog (distant or obstructed blinds).
+- Increase **RF repeats** in the entry's Configure dialog (distant or obstructed blinds), but
+  see the repeats tradeoff under Known Limitations first — more repeats lengthens the time a
+  physical remote press can go unrecognised, and lengthens each train's occupancy of the shared
+  channel, so it is not always the right lever for a blind that intermittently misses commands.
 - Verify the blind's channel: a motor paired to remote channel 3 ignores a channel-1 frame.
 
 ### Position drifts
@@ -236,7 +239,16 @@ logger:
   such a move is not guaranteed to disarm that STOP — the bridge STOP can still halt the reversed
   motion — and a displaced restored-timed command may keep a position that should read `unknown`.
   Re-issue the movement if a blind stops unexpectedly after a takeover.
-- **Assumed position**: there is no motor feedback; position is modeled from travel time.
+- **Assumed position**: there is no motor feedback; position is modeled from travel time. A
+  command is modelled as successful once the bridge reports it **started transmitting** — which
+  confirms RF left the bridge, never that a motor received or obeyed it. A command that does not
+  reach its motor is therefore indistinguishable from one that works, and the cover will report
+  the commanded position with no error and no log entry. Verify by eye if a blind matters.
+- **RF repeats trade reliability against takeover responsiveness**: raising `repeats` adds
+  redundancy on air, but the integration must treat its own train as its own for the whole time it
+  is transmitting. At the default `repeats: 3` a genuine remote press near a just-issued command
+  can go unrecognised for roughly 9 seconds; at the maximum of 20 that grows to roughly 27. Higher
+  repeats also lengthen how long one bridge occupies the shared channel.
 - **Bridge isolated from MQTT mid-command**: a bridge that loses its network link (but not power)
   keeps executing its already-armed fail-safe STOP locally. With multiple bridges, commands fail
   over to another bridge meanwhile, and the isolated bridge's late STOP can still reach the motor
