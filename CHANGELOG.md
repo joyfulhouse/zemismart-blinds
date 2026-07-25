@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A commanded start no longer silently swallows a genuine remote press** (#15). Any
+  same-remote overlapping-channel press heard before a recorded commanded start was
+  dropped with no bound on how far before — no dispatch, no takeover, no disarm, no log —
+  for the stamp's whole 60 s retention. A capture held while its command was pending is
+  re-classified only once the bridge confirms, so somebody pressing STOP on a moving blind
+  reached that guard with a `heard_at` far below the eventual `started_at` and vanished
+  whole. The guard now suppresses only genuine **late news** — a press heard before our RF
+  started *and* still undelivered when it did — and logs every suppression.
+
+  This supersedes the note in 0.5.2 below, which described `_COMMANDED_START_TTL_SECONDS`
+  as an unchanged blanket. It is no longer a blanket: retention is unchanged, but
+  suppression depth is now bounded by delivery order rather than unbounded.
+
+  Recognising our own echo was never this guard's job and is not affected: that is the
+  ledger window's asymmetric lower edge, added in 0.5.2, and an echo that outruns even
+  that tolerance is still reported by the near-miss log rather than silently absorbed.
+
+- **An early-flushed STOP is no longer read as a person stopping the blind** (#16). A timed
+  move's `stop_raw` sits armed on the bridge until its deadline, and a newer overlapping
+  command flushes it immediately. Nothing orders the peer bridge's report of that flushed
+  frame after the transmitting bridge's own `displaced` status — both cross the same
+  broker, and the queueing that biases `started` late biases `displaced` too. In the losing
+  order the frame was matched against the *original* windows, with the STOP a whole
+  `stop_after_ms` away, and dispatched as a physical press — which then displaced the very
+  command that caused the flush, so a quick re-command of a moving cover could simply stop
+  instead of moving.
+
+  The flush is now recognised from the command that causes it: latest-command-wins means an
+  overlapping newer command on the same bridge is what flushes the older one's armed STOP,
+  and that command is known locally before it is even published, which beats any status
+  over the wire. Deliberately **not** a blanket widening — our `stop_raw` is byte-identical
+  to the frame a person's remote puts on air, so a mid-travel STOP with no displacing
+  command in flight still takes the cover over exactly as before.
+
+  Separately, `displaced` carries no `age_ms`, so its window was anchored on pure
+  wall-clock receipt — worse than `started_at`, which at least removes the firmware's own
+  queueing. The drain window now takes the same lower-edge tolerance every other confirmed
+  window gets. Firmware stamping `age_ms` on `displaced` would let this be measured rather
+  than budgeted.
+
+- **Emission proof now follows the frame rather than the clock** (#17). Two sequential
+  commands for one cover — a repeated `close_cover` — share a frame signature, and the
+  anchor-lag lower edge added in 0.5.2 let the newer command's window reach back across the
+  older one's. An echo of the older command's own repeat train was credited to its
+  successor. Press suppression was never affected (both are our own frames and neither
+  dispatches); the casualty was the restore-time anchor verification, where a cover waiting
+  on one specific command for post-restart proof never received it. Window fit is now
+  ranked: a capture that fits without spending the anchor-lag budget wins outright, and
+  only when nothing fits on those terms is the budget spent.
+
 ## [0.5.2] - 2026-07-25
 
 ### Fixed
