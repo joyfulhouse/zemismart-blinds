@@ -1144,8 +1144,14 @@ def test_own_stop_echo_is_not_dispatched_as_a_press_through_the_consumer() -> No
 # correct its own transport leg.
 _FLUSH_HANDOFF: Final = 300.0
 _FLUSH_STOP_OFFSET_MS: Final = 60_000
+# The displacer is admitted at 305.0 and stays armed until 425.0 -- its own
+# deadline is two minutes out, far longer than the flush it caused.
+_DISPLACER_HANDOFF: Final = 305.0
+_DISPLACER_STOP_OFFSET_MS: Final = 120_000
 _FLUSH_HEARD_TIME: Final = 305.0
 _FLUSH_DISPLACED_TIME: Final = 306.2
+# 15 s past the displacer's admission, still deep inside its armed span.
+_LATE_HUMAN_STOP_TIME: Final = 320.0
 
 
 def _timed_move_ledger() -> tuple[CommandLedger, FrameSignature]:
@@ -1168,14 +1174,28 @@ def _timed_move_ledger() -> tuple[CommandLedger, FrameSignature]:
 
 
 def _register_displacing_command(ledger: CommandLedger) -> None:
-    """Register the newer overlapping command that makes the bridge flush."""
+    """Confirm the newer overlapping command that makes the bridge flush.
+
+    Itself a TIMED move, with a two-minute deadline of its own. That is the
+    ordinary case — a second `set_cover_position` over an in-flight one — and
+    it is the case that exposes any bound tied to the displacer's own armed
+    span rather than to the instant it was admitted.
+    """
     ledger.register_pending(
         "displacer",
         _BRIDGE_A,
         (1,),
         "UP",
-        [LedgerFrameSpec(_required_signature((1,), "UP"), offset_ms=0, airtime_ms=3_000)],
+        [
+            LedgerFrameSpec(_required_signature((1,), "UP"), offset_ms=0, airtime_ms=3_000),
+            LedgerFrameSpec(
+                _required_signature((1,), "STOP"),
+                offset_ms=_DISPLACER_STOP_OFFSET_MS,
+                airtime_ms=3_000,
+            ),
+        ],
     )
+    ledger.confirm("displacer", _DISPLACER_HANDOFF)
 
 
 def test_early_flushed_stop_heard_before_its_displaced_status_stays_ours() -> None:
@@ -1343,3 +1363,86 @@ def test_emission_proof_reaches_the_command_that_emitted_the_frame() -> None:
 
     assert dispatched == []
     assert proofs == ["cmd-first"]
+
+
+def test_timed_displacer_does_not_own_a_stop_long_after_its_admission() -> None:
+    """A displacer's armed span is not a licence to absorb later STOP presses.
+
+    Displacement is a ONE-TIME event at admission: the bridge flushes the older
+    command's armed frames as it accepts the newer one, and never again. Bounding
+    ownership by the displacer's own liveness instead confuses the two, and a
+    displacer that is itself a timed move stays "live" until its own deadline —
+    which the firmware caps at MAX_TRAVEL_SECONDS, one hour.
+
+    Adjusting a blind twice in quick succession is ordinary usage, so that bound
+    left a real STOP on the first command's channels invisible for the entire
+    remaining span of the second. This is the deafness #15 exists to eliminate,
+    and it must not be reintroduced here in a wider form.
+    """
+    ledger, stop = _timed_move_ledger()
+    _register_displacing_command(ledger)
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(ledger, dispatched, [], [_LATE_HUMAN_STOP_TIME])
+
+    # Still armed: the displacer's own STOP is 120 s out, the victim's 60 s.
+    assert ledger.match(stop, _LATE_HUMAN_STOP_TIME) is None
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_LATE_HUMAN_STOP_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        _LATE_HUMAN_STOP_TIME,
+    )
+
+    assert [event.button for event in dispatched] == ["STOP"]
+
+
+def test_capture_held_against_a_newer_pending_twin_resolves_to_its_own_command() -> None:
+    """A lag-funded capture parked behind a same-signature successor is not stranded.
+
+    Ranking nominal fits above lag-funded ones (#17) means a newer PENDING entry
+    with the same signature is still reached first — it has no window to rank at
+    all — so the capture is held rather than credited. It must not be lost there:
+    once that successor resolves, the capture re-classifies and the emission proof
+    reaches the command whose lag budget it actually needed.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    ledger.register_pending(
+        "cmd-anchored-late",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000)],
+    )
+    # Anchored late enough that the capture below needs the lag budget.
+    ledger.confirm("cmd-anchored-late", _REPEAT_FIRST_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS)
+    ledger.register_pending(
+        "cmd-successor",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000)],
+    )
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_REPEAT_FIRST_HANDOFF]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_REPEAT_FIRST_HANDOFF * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "DOWN"),
+        _REPEAT_FIRST_HANDOFF,
+    )
+    assert dispatched == []
+    assert proofs == []  # held against the pending successor
+
+    # The successor never reaches the air and is retired.
+    ledger.retire("cmd-successor")
+    consumer.resume_holds("cmd-successor")
+
+    assert dispatched == []
+    assert proofs == ["cmd-anchored-late"]

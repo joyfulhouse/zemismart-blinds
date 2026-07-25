@@ -37,11 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of moving.
 
   The flush is now recognised from the command that causes it: latest-command-wins means an
-  overlapping newer command on the same bridge is what flushes the older one's armed STOP,
-  and that command is known locally before it is even published, which beats any status
-  over the wire. Deliberately **not** a blanket widening — our `stop_raw` is byte-identical
-  to the frame a person's remote puts on air, so a mid-travel STOP with no displacing
-  command in flight still takes the cover over exactly as before.
+  overlapping newer command on the same bridge is what flushes the older one's armed STOP.
+  Displacement is a **one-time event at admission**, so ownership is pinned to the newer
+  command's measured handoff — the instant its own first frame went on air — and not to how
+  long that command stays armed. Bounding it by the displacer's liveness instead would be
+  catastrophic: a displacer that is itself a timed move stays armed until its own deadline,
+  which firmware caps at one hour, so adjusting a blind twice in quick succession would
+  leave a real STOP on the first command's channels invisible for the whole remaining span
+  of the second.
+
+  Deliberately **not** a blanket widening — our `stop_raw` is byte-identical to the frame a
+  person's remote puts on air, so a mid-travel STOP outside a displacing command's
+  admission instant still takes the cover over exactly as before.
 
   Separately, `displaced` carries no `age_ms`, so its window was anchored on pure
   wall-clock receipt — worse than `started_at`, which at least removes the firmware's own

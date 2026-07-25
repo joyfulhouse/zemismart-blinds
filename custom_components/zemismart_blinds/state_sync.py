@@ -288,6 +288,10 @@ class _LedgerEntry:
     pending_since: float | None = None
     expires_at: float | None = None
     displaced: bool = False
+    # When this command's own first frame went on air. Displacement of an
+    # OLDER command happens as the bridge admits this one, so for any command
+    # this is also the instant it flushed its predecessor's armed frames.
+    handoff: float | None = None
 
 
 class CommandLedger:
@@ -328,6 +332,7 @@ class CommandLedger:
         latest_end = max((window.ends_at for window in windows), default=handoff)
         entry.phase = "confirmed"
         entry.windows = windows
+        entry.handoff = handoff
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
 
     def live_overlapping(
@@ -472,9 +477,9 @@ class CommandLedger:
         both cross the same broker, and the queueing that biases "started" late
         biases "displaced" too.
 
-        So the flush is recognised from the command that CAUSES it instead. The
-        displacing command is registered locally before it is even published,
-        which beats any status over the wire by construction.
+        So the flush is recognised from the command that CAUSES it instead,
+        and pinned to the instant that command was admitted rather than to how
+        long it stays armed -- see _flushed_at_a_newer_admission.
 
         Deliberately NOT a blanket widening of the armed span. Our stop_raw is
         byte-identical to the frame a person's remote puts on air, so owning
@@ -495,32 +500,63 @@ class CommandLedger:
                 for window in entry.windows
             ):
                 continue
-            if self._displacement_in_flight(entry, heard_at):
+            if self._flushed_at_a_newer_admission(entry, heard_at):
                 return "confirmed", entry.command_id, entry.bridge_id
         return None
 
-    def _displacement_in_flight(self, entry: _LedgerEntry, now: float) -> bool:
-        """Report whether a newer command can be flushing this one's RF.
+    def _flushed_at_a_newer_admission(self, entry: _LedgerEntry, heard_at: float) -> bool:
+        """Report whether a newer command's admission flushed this one's RF then.
+
+        Displacement is a ONE-TIME event. The bridge flushes an older command's
+        armed frames as it admits a newer one and never again, so the newer
+        command's HANDOFF -- the measured instant its own first frame went on
+        air -- is the flush instant, give or take the frame ahead of it.
+
+        The displacer's own liveness is emphatically NOT the bound. A displacer
+        that is itself a timed move stays armed until its own deadline, which
+        firmware caps at MAX_TRAVEL_SECONDS (one hour); adjusting a blind twice
+        in quick succession would then leave a real STOP on the first command's
+        channels invisible for the whole remaining span of the second. That is
+        the deafness _superseding_commanded_start was narrowed to eliminate,
+        and it must not reappear here.
 
         Only same-bridge overlaps count: armed scheduler state lives in the
         selected bridge's RAM, so a command routed elsewhere cannot flush it.
-        Liveness is re-derived per call rather than latched, so a displacing
-        command that is rejected or retired withdraws the tolerance it lent
-        instead of leaving the older STOP owned until its deadline.
+
+        A still-PENDING newer command is deliberately not trusted. Its flush
+        instant is unknown, and the only anchor available would be a local
+        registration time no measurement backs. Little is lost: a timed
+        displacer registers its own stop_raw, so the flushed capture shares
+        that pending entry's signature and is HELD against it, then
+        re-classified once it confirms. What remains uncovered is an untimed
+        displacer whose peer-heard /rx overtakes its own "started" status --
+        and the peer must receive the entire frame before it can publish, so
+        its report is generated strictly later than that status. That residue
+        fails to the safe side: the capture dispatches as a press, exactly as
+        it did before any of this existed.
         """
         newer = False
         for candidate in self._entries.values():
             if candidate.command_id == entry.command_id:
                 newer = True
                 continue
+            admitted_at = candidate.handoff
             if (
                 not newer
+                or admitted_at is None
+                or candidate.displaced
                 or candidate.bridge_id != entry.bridge_id
                 or set(candidate.channels).isdisjoint(entry.channels)
             ):
                 continue
-            if candidate.phase == "pending" or any(
-                window.ends_at >= now for window in candidate.windows
+            # The flushed frame goes on air immediately BEFORE the frame whose
+            # admission flushed it, and that admission anchor carries the same
+            # late bias as every other -- hence lag tolerance below, slack only
+            # above.
+            if (
+                admitted_at - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS
+                <= heard_at
+                <= admitted_at + _LEDGER_WINDOW_SLACK_SECONDS
             ):
                 return True
         return False
