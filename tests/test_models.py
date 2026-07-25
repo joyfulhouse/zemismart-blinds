@@ -995,10 +995,12 @@ async def test_raw_command_stamps_start_only_for_movement_frames(
 
         assert len(hub._state_sync._commanded_starts) == expected_stamp_count
 
+        # Delivered a second after our own RF started: stale news either way.
         hub._state_sync._dispatch_press(
             (config.remote.key, channels, "DOWN"),
             _STATE_SYNC_RECV_TIME - 1.0,
             "bridge-b",
+            _STATE_SYNC_RECV_TIME + 1.0,
             _STATE_SYNC_RECV_TIME + 1.0,
         )
 
@@ -3988,6 +3990,7 @@ async def test_started_stamp_uses_final_under_lock_coalesced_channels(
             (first_config.remote.key, channels, "DOWN"),
             older_at,
             "bridge-b",
+            seen_at,
             seen_at,
         )
 

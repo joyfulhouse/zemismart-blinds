@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Final
 
 import pytest
@@ -724,28 +725,22 @@ def test_consumer_drops_resumed_hold_older_than_overlapping_press() -> None:
 
 
 def test_consumer_drops_press_older_than_overlapping_commanded_start() -> None:
-    """A late older physical capture cannot replace a newer commanded start."""
+    """A late older physical capture cannot replace a newer commanded start.
+
+    Driven through ``handle_rx`` rather than ``_dispatch_press`` so the guard
+    is measured on the path production actually takes: both captures are
+    delivered at _LATE_DELIVERY_TIME, after our own RF had already started.
+    """
     dispatched: list[HeardEvent] = []
     consumer = _consumer(CommandLedger(), dispatched, [], [_LATE_DELIVERY_TIME])
-    signature = _required_signature((1,), "UP")
     consumer.record_commanded_start(
         _REMOTE_KEY,
         frozenset({1}),
         _COMMANDED_START_TIME,
     )
 
-    consumer._dispatch_press(
-        signature,
-        _OLDER_PRESS_TIME,
-        _BRIDGE_A,
-        _LATE_DELIVERY_TIME,
-    )
-    consumer._dispatch_press(
-        signature,
-        _NEWER_PRESS_TIME,
-        _BRIDGE_A,
-        _LATE_DELIVERY_TIME,
-    )
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), _OLDER_PRESS_TIME)
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 7_000, _frame((1,), "UP"), _NEWER_PRESS_TIME)
 
     assert [event.heard_at for event in dispatched] == [_NEWER_PRESS_TIME]
 
@@ -975,6 +970,81 @@ def test_held_capture_far_before_its_handoff_is_still_a_real_press() -> None:
 
     assert [event.button for event in dispatched] == ["STOP"]
     assert proofs == []
+
+
+_STALE_PRESS_HEARD_TIME: Final = 104.0
+_STALE_PRESS_DELIVERY_TIME: Final = 110.0
+
+
+def test_held_press_far_before_a_commanded_start_still_dispatches() -> None:
+    """The commanded-start guard must not swallow a 25 s older genuine press.
+
+    The test above deliberately omits ``record_commanded_start``; production
+    never does. The hub records the stamp immediately before resolving the
+    ``started`` future that unblocks ``confirm()``, so the very same person
+    pressing STOP 25 s before the bridge confirmed hits BOTH guards, and the
+    ordering guard used to be unbounded below: any same-remote overlapping
+    press heard before the stamp was dropped, invisibly, for the stamp's whole
+    retention. That is where the integration went deaf to a real person.
+    """
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "command-timed",
+        _BRIDGE_A,
+        (1,),
+        "STOP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=3_000)],
+    )
+    dispatched: list[HeardEvent] = []
+    now_value = [_GENUINE_PRESS_HEARD_TIME]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        1_000,
+        _frame((1,), "STOP"),
+        _GENUINE_PRESS_HEARD_TIME,
+    )
+    assert dispatched == []  # held while pending
+
+    now_value[0] = _GENUINE_PRESS_LATE_CONFIRM_TIME
+    consumer.record_commanded_start(
+        _REMOTE_KEY,
+        frozenset({1}),
+        _GENUINE_PRESS_LATE_CONFIRM_TIME,
+    )
+    ledger.confirm("command-timed", _GENUINE_PRESS_LATE_CONFIRM_TIME)
+    consumer.resume_holds("command-timed")
+
+    assert [event.button for event in dispatched] == ["STOP"]
+
+
+def test_suppressed_stale_press_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Stale delivery is still dropped, and no longer invisibly.
+
+    Narrowing the guard must not re-admit what it exists for: a capture heard
+    before our own RF started and delivered only afterwards is news our command
+    already superseded, and it stays dropped. It now says so — the guard's own
+    calibration was otherwise unobservable in the field, which is how it went a
+    whole release absorbing real presses without leaving a trace.
+    """
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(CommandLedger(), dispatched, [], [_STALE_PRESS_DELIVERY_TIME])
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), _COMMANDED_START_TIME)
+
+    with caplog.at_level(logging.DEBUG, logger=state_sync_module._LOGGER.name):
+        consumer.handle_rx(
+            _BRIDGE_A,
+            _BOOT,
+            1_000,
+            _frame((1,), "UP"),
+            _STALE_PRESS_HEARD_TIME,
+        )
+
+    assert dispatched == []
+    assert "stale delivery" in caplog.text
 
 
 _LATE_ANCHOR_STOP_OFFSET_MS: Final = 15_000

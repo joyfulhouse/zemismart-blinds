@@ -52,6 +52,9 @@ _EXACT_EVENT_CAP: Final = 1_024
 _DEBOUNCE_WINDOW_SECONDS: Final = 1.5
 _DEBOUNCE_TTL_SECONDS: Final = 60.0
 _DEBOUNCE_CAP: Final = 512
+# Retention only. A stamp cannot reach further back than the clock projection
+# clamp allows a capture to be old (_CLOCK_MAX_PROJECTION_LAG_SECONDS), so the
+# extra retention here bounds memory rather than suppression depth.
 _COMMANDED_START_TTL_SECONDS: Final = 60.0
 _COMMANDED_START_CAP: Final = 512
 _HOLD_TTL_SECONDS: Final = 30.0
@@ -592,7 +595,14 @@ class StateSyncConsumer:
         clock = self._clock_resolver(bridge_id)
         heard_at = clock.to_ha_time(boot, t, recv_time)
         clock.observe(boot, t, recv_time)
-        self._classify(signature, heard_at, bridge_id, seen_at, hold_pending=True)
+        self._classify(
+            signature,
+            heard_at,
+            bridge_id,
+            seen_at,
+            received_at=seen_at,
+            hold_pending=True,
+        )
 
     def resume_holds(self, command_id: str) -> None:
         """Re-run captures held for one command after its phase changes."""
@@ -613,6 +623,7 @@ class StateSyncConsumer:
                 capture.heard_at,
                 capture.bridge_id,
                 seen_at,
+                received_at=capture.held_at,
                 hold_pending=True,
             )
         self._maintain(seen_at)
@@ -689,6 +700,7 @@ class StateSyncConsumer:
                 capture.heard_at,
                 capture.bridge_id,
                 seen_at,
+                received_at=capture.held_at,
                 hold_pending=False,
             )
 
@@ -729,6 +741,7 @@ class StateSyncConsumer:
         bridge_id: str,
         seen_at: float,
         *,
+        received_at: float,
         hold_pending: bool,
     ) -> None:
         """Apply ledger classification, holding, proof, and press dispatch."""
@@ -742,7 +755,7 @@ class StateSyncConsumer:
             if hold_pending:
                 self._hold(command_id, signature, heard_at, bridge_id, seen_at)
                 return
-        self._dispatch_press(signature, heard_at, bridge_id, seen_at)
+        self._dispatch_press(signature, heard_at, bridge_id, seen_at, received_at)
 
     def _hold(
         self,
@@ -765,12 +778,52 @@ class StateSyncConsumer:
             ),
         )
 
+    def _superseding_commanded_start(
+        self,
+        remote_key: str,
+        channels: frozenset[int],
+        heard_at: float,
+        received_at: float,
+    ) -> float | None:
+        """Return an overlapping commanded start this press is stale news against.
+
+        A commanded start outranks a press only when the press is genuinely
+        LATE NEWS: heard before our own RF went on air, and still undelivered
+        to us at the moment that RF started. Both halves matter.
+
+        Dropping the second half is what made this guard deaf to real people.
+        A capture held while its command was pending is re-classified only once
+        the bridge confirms -- up to _LEDGER_PENDING_TTL_SECONDS later -- so its
+        `heard_at` trails the eventual `started_at` by that whole interval even
+        though we had the capture in hand first. That is somebody pressing STOP
+        on a moving blind, and comparing `heard_at` alone absorbed it entirely:
+        no dispatch, no takeover, no disarm, no log.
+
+        This is not the echo defence and must not be widened back into one. Our
+        own emission is recognised by the ledger window, whose lower edge
+        already carries _LEDGER_ANCHOR_LAG_SECONDS for precisely the anchor bias
+        that would put an echo below its own commanded start; an echo that
+        outran even that tolerance is reported by _log_near_miss rather than
+        silently eaten here.
+        """
+        return next(
+            (
+                stamp.started_at
+                for (recent_remote, recent_channels), stamp in self._commanded_starts.items()
+                if recent_remote == remote_key
+                and not recent_channels.isdisjoint(channels)
+                and heard_at < stamp.started_at <= received_at
+            ),
+            None,
+        )
+
     def _dispatch_press(
         self,
         signature: FrameSignature,
         heard_at: float,
         bridge_id: str,
         seen_at: float,
+        received_at: float,
     ) -> None:
         """Debounce and dispatch the first copy of a physical press."""
         remote_key, channels, button = signature
@@ -781,12 +834,22 @@ class StateSyncConsumer:
             for (recent_remote, recent_channels, _recent_button), stamp in self._debounce.items()
         ):
             return
-        if any(
-            recent_remote == remote_key
-            and not recent_channels.isdisjoint(channels)
-            and stamp.started_at > heard_at
-            for (recent_remote, recent_channels), stamp in self._commanded_starts.items()
-        ):
+        superseding_start = self._superseding_commanded_start(
+            remote_key,
+            channels,
+            heard_at,
+            received_at,
+        )
+        if superseding_start is not None:
+            _LOGGER.debug(
+                "state_sync: dropping %s on channels %s heard at %.3f as stale delivery -- "
+                "our own start at %.3f was already on air %.3fs before it reached us",
+                button,
+                sorted(channels),
+                heard_at,
+                superseding_start,
+                received_at - superseding_start,
+            )
             return
         previous = self._debounce.get(signature)
         if previous is not None and abs(heard_at - previous.heard_at) <= _DEBOUNCE_WINDOW_SECONDS:
