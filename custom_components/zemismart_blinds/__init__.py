@@ -406,12 +406,26 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
 
     remote = entry.runtime_data.remote
     registry = dr.async_get(hass)
+    identifier = (DOMAIN, remote.key)
+    # Pre-0.5.2 devices were keyed on the ENTRY id, which is not durable: a
+    # delete-and-re-add mints a new entry_id and therefore a whole new device,
+    # silently breaking every automation targeting the old device_id while
+    # entity_ids return intact. Re-identify the existing row IN PLACE so the
+    # device_id itself — the thing automations actually target — survives.
+    existing = registry.async_get_device(identifiers={identifier})
+    if existing is None:
+        legacy = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+        if legacy is not None:
+            existing = registry.async_update_device(
+                legacy.id,
+                new_identifiers={identifier},
+            )
     # Creation detection must precede get_or_create: a user's cleared area
     # (area_id None on an EXISTING device) must never be re-assigned.
-    existed = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)}) is not None
+    existed = existing is not None
     device = registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, entry.entry_id)},
+        identifiers={identifier},
         manufacturer="Zemismart",
         model="RF433 remote",
         name=remote.name,
@@ -434,8 +448,15 @@ def _prune_stale_cover_devices(hass: HomeAssistant, entry: ZemismartConfigEntry)
 
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
+    remote_identifier = (DOMAIN, entry.runtime_data.remote.key)
     for device in dr.async_entries_for_config_entry(device_registry, entry.entry_id):
-        if (DOMAIN, entry.entry_id) in device.identifiers:
+        # Both the durable key and the retired entry-id key protect the remote:
+        # a prune racing ahead of _ensure_remote_device's re-identification
+        # must not mistake the not-yet-re-keyed remote for a stale child.
+        if (
+            remote_identifier in device.identifiers
+            or (DOMAIN, entry.entry_id) in device.identifiers
+        ):
             continue
         if er.async_entries_for_device(entity_registry, device.id, include_disabled_entities=True):
             continue

@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-25
+
+### Fixed
+
+- **A cover's travel model is no longer corrupted by the integration mistaking its own
+  transmission for a physical remote press.** A capture held while its command was still
+  pending is now resolved against *that command* rather than re-derived from the confirmed
+  emission window. The window's bounds come from the bridge's `started` status, which is
+  published separately from the RF it describes and can arrive *after* a peer bridge has
+  already reported hearing the frame — measured at **1.117 s** of skew during a concurrent
+  seven-cover burst, against 0.75 s of window slack. The window therefore rejected our own
+  frame, and the hub took the cover over as though someone had pressed the physical remote,
+  writing state with no Home Assistant context and leaving the cover `unknown` or frozen at
+  a partial position. Only visible under concurrent multi-remote bursts, which is why
+  single-cover operation never showed it; a burst regression test now covers the real
+  workload.
+
+  Ownership of a held capture is bounded to a plausible status lag
+  (`_LEDGER_HELD_TRUST_SECONDS`, 5 s). A timed move registers its own `stop_raw`, so a
+  person pressing STOP produces a capture identical to one of our own frames; without that
+  bound such a press would have been silently absorbed — bypassing takeover handling
+  entirely — for as long as the bridge took to confirm, up to the 30 s started-status
+  timeout.
+
+- **The mid-travel model freeze on covers whose remote also runs timed partial moves is
+  fixed too.** Same root cause, different sub-case. The held-capture fix above only reaches
+  frames still *pending* when their echo arrives — true of an action frame, emitted within
+  ~250 ms, but not of a `stop_raw` frame, emitted `stop_after_ms` later when the command
+  has long since confirmed. That echo arrives through the ordinary `match()` window path,
+  where the same late anchor has shifted *every* window in the entry. Confirmed windows are
+  now **asymmetric**: the lower edge absorbs `_LEDGER_ANCHOR_LAG_SECONDS` of anchor lag
+  while the upper edge keeps its original tight slack, because `started_at` is biased late
+  and never early. Our own STOP echo is no longer read as a person stopping the blind by
+  hand — which froze HA's travel model partway while the motor ran on to its limit, leaving
+  HA reporting a partial position for a cover that had physically closed.
+
+- The remote's device is now identified by the durable remote key (`prefix:remote_id`, the
+  same identity as the entry's unique id) instead of the config **entry id**. Existing
+  devices are re-identified **in place** on the next setup, so `device_id`, area overrides,
+  name, and all attached entities are preserved — automations targeting the remote device
+  keep working. Previously, deleting and re-adding a remote minted a new entry id and
+  therefore a brand-new device, silently breaking every `device_id` target while
+  `entity_id` targets returned intact.
+
+### Notes
+
+- **Correction to the 0.3.1 release notes (retroactive).** 0.3.1 moved covers into the
+  remote's device and pruned the pre-0.3.1 per-cover child devices. Those notes promised
+  only that friendly names and entity ids stay byte-stable; they did not say that the
+  per-cover **child devices were removed**, so any automation or script targeting a cover
+  by `device_id` stopped matching from 0.3.1 onward and silently did nothing. Retarget
+  those actions **by `entity_id`** (cover entity ids were preserved throughout), or target
+  the remote's device. 0.5.0 did **not** cause this: its migration preserves cover
+  identity, and `unique_id` values that look freshly minted are ULIDs created when the
+  covers were first onboarded.
+
+[0.5.2]: https://github.com/joyfulhouse/zemismart-blinds/releases/tag/v0.5.2
+
 ## [0.5.1] - 2026-07-24
 
 ### Changed

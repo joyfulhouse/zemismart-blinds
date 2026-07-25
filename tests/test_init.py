@@ -52,6 +52,9 @@ from custom_components.zemismart_blinds.state_sync import (
 )
 from tests.synthetic import TEST_BASES, TEST_CH12_UP_B0, TEST_PREFIX, TEST_REMOTE_ID
 
+# The durable remote identity that keys the remote device (never the entry_id).
+REMOTE_DEVICE_KEY = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -900,6 +903,14 @@ async def test_migration_folds_subentries_into_data_preserving_identity(
     migrated_device = dr.async_get(hass).async_get(device.id)
     assert migrated_device is not None
     assert migrated_device.config_entries_subentries[entry.entry_id] == {None}
+    # device_id is the thing automations target, so it must survive the
+    # migration AND the durable-key re-identification that setup performs.
+    # Asserting only that the device still EXISTS would miss a recreate.
+    assert migrated_device.id == device.id
+    # Setup re-keys the entry-id identifier onto the durable remote identity,
+    # in place — the row is re-identified, never replaced.
+    assert device.identifiers == {(DOMAIN, entry.entry_id)}
+    assert migrated_device.identifiers == {(DOMAIN, REMOTE_DEVICE_KEY)}
 
     await async_unload_entry(hass, entry)
 
@@ -1217,7 +1228,7 @@ async def test_remote_entry_data_builds_leaf_entities_and_devices(
         assert entity._config.repeats == 5
         # Covers are entities INSIDE the remote's device, carrying their own
         # unprefixed name (deployed friendly names must stay byte-stable).
-        assert entity.device_info == {"identifiers": {(DOMAIN, entry.entry_id)}}
+        assert entity.device_info == {"identifiers": {(DOMAIN, REMOTE_DEVICE_KEY)}}
         assert entity.has_entity_name is False
         assert entity.name == entity._config.name
         if entity.unique_id == aggregate_cover_id:
@@ -1232,15 +1243,15 @@ async def test_remote_entry_data_builds_leaf_entities_and_devices(
     # The stale pre-0.3.1 child device was pruned; only the remote remains.
     assert registry.async_get(stale.id) is None
     entry_devices = dr.async_entries_for_config_entry(registry, entry.entry_id)
-    assert [device.identifiers for device in entry_devices] == [{(DOMAIN, entry.entry_id)}]
+    assert [device.identifiers for device in entry_devices] == [{(DOMAIN, REMOTE_DEVICE_KEY)}]
 
     # Remote device exists with the remote's area; reload keeps a user override.
-    parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    parent = registry.async_get_device(identifiers={(DOMAIN, REMOTE_DEVICE_KEY)})
     assert parent is not None
     assert parent.area_id == "living_room"
     registry.async_update_device(parent.id, area_id="pantry")
     integration_module._ensure_remote_device(hass, entry)
-    parent_after = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    parent_after = registry.async_get_device(identifiers={(DOMAIN, REMOTE_DEVICE_KEY)})
     assert parent_after is not None
     assert parent_after.area_id == "pantry"
 
@@ -1441,14 +1452,193 @@ async def test_cleared_device_area_survives_reload(
     await async_setup_entry(hass, entry)
 
     registry = dr.async_get(hass)
-    parent = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    parent = registry.async_get_device(identifiers={(DOMAIN, REMOTE_DEVICE_KEY)})
     assert parent is not None
     assert parent.area_id == "living_room"
     registry.async_update_device(parent.id, area_id=None)
 
     integration_module._ensure_remote_device(hass, entry)
-    parent_after = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
+    parent_after = registry.async_get_device(identifiers={(DOMAIN, REMOTE_DEVICE_KEY)})
     assert parent_after is not None
     assert parent_after.area_id is None
 
     await async_unload_entry(hass, entry)
+
+
+def _rekey_entry(entry_id: str) -> ConfigEntry[RemoteRuntime]:
+    """Build one remote entry whose unique_id is the durable remote key."""
+    return ConfigEntry(
+        data={
+            **config_entry("ignored").data,
+            CONF_COVERS: [
+                {
+                    CONF_COVER_ID: "cover-slider",
+                    "name": "Slider",
+                    "channels": [1, 2, 3],
+                    "travel_up": 12.0,
+                    "travel_down": 12.0,
+                },
+            ],
+        },
+        discovery_keys=MappingProxyType({}),
+        domain=DOMAIN,
+        entry_id=entry_id,
+        minor_version=1,
+        options={},
+        source="user",
+        subentries_data=None,
+        title="Kitchen remote",
+        unique_id=REMOTE_DEVICE_KEY,
+        version=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_device_rekeys_in_place_preserving_device_id(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An entry_id-keyed device is re-identified in place, keeping its device_id.
+
+    Re-keying to the durable remote identity must NEVER recreate the device:
+    a new device_id would break every automation targeting it, which is the
+    exact breakage this change exists to stop happening again.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    entry = _rekey_entry("rekey-entry")
+    add_to_manager(hass, entry)
+    remote_key = entry.unique_id
+    assert remote_key is not None
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    added: list[tuple[list[Any], dict[str, Any]]] = []
+
+    def record_add(
+        entities: list[Any],
+        update_before_add: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del update_before_add
+        added.append((list(entities), kwargs))
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        await cover_module.async_setup_entry(
+            hass,
+            entry,
+            cast("AddConfigEntryEntitiesCallback", record_add),
+        )
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+
+    # The deployed pre-re-key device, carrying a user's area override.
+    registry = dr.async_get(hass)
+    legacy = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=None,
+        identifiers={(DOMAIN, entry.entry_id)},
+        name="Kitchen remote",
+    )
+    registry.async_update_device(legacy.id, area_id="pantry")
+    legacy_device_id = legacy.id
+
+    assert await async_setup_entry(hass, entry)
+
+    # Same registry row, re-identified — not a replacement.
+    rekeyed = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
+    assert rekeyed is not None
+    assert rekeyed.id == legacy_device_id
+    assert rekeyed.identifiers == {(DOMAIN, remote_key)}
+    # The stale identifier is gone, so nothing resolves it twice.
+    assert registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)}) is None
+    # A user's area override survives the re-key.
+    assert rekeyed.area_id == "pantry"
+    # Exactly one device for the entry: the re-key did not leave a duplicate,
+    # and _prune_stale_cover_devices did not eat the newly-keyed remote.
+    entry_devices = dr.async_entries_for_config_entry(registry, entry.entry_id)
+    assert [device.identifiers for device in entry_devices] == [{(DOMAIN, remote_key)}]
+
+    # Cover entities attach to the durable identity.
+    assert added
+    for entities, _kwargs in added:
+        for entity in entities:
+            assert entity.device_info == {"identifiers": {(DOMAIN, remote_key)}}
+
+    await async_unload_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_remote_device_survives_entry_delete_and_readd(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-adding a remote under a NEW entry_id reuses the same device row.
+
+    Keying on entry_id made delete-and-re-add mint a brand-new device while
+    entity_ids returned intact — a silent device_id churn indistinguishable
+    from the reported breakage. The durable key must remove that failure mode.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+
+    def make_forward(target: ConfigEntry[RemoteRuntime]) -> Any:
+        async def forward(
+            _entry: ConfigEntry[RemoteRuntime],
+            _platforms: list[Any],
+        ) -> None:
+            await cover_module.async_setup_entry(
+                hass,
+                target,
+                cast("AddConfigEntryEntitiesCallback", lambda *a, **k: None),
+            )
+
+        return forward
+
+    first = _rekey_entry("entry-before-readd")
+    add_to_manager(hass, first)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", make_forward(first))
+    assert await async_setup_entry(hass, first)
+    registry = dr.async_get(hass)
+    remote_key = first.unique_id
+    assert remote_key is not None
+    original = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
+    assert original is not None
+    original_device_id = original.id
+    registry.async_update_device(original.id, area_id="pantry")
+    await async_unload_entry(hass, first)
+
+    # Same physical remote, re-added: a different entry_id entirely.
+    second = _rekey_entry("entry-after-readd")
+    add_to_manager(hass, second)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", make_forward(second))
+    assert await async_setup_entry(hass, second)
+
+    readded = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
+    assert readded is not None
+    assert readded.id == original_device_id
+    assert readded.area_id == "pantry"
+
+    await async_unload_entry(hass, second)

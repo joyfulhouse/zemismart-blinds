@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 FrameSignature = tuple[str, frozenset[int], str]
 LedgerMatch = tuple[Literal["pending", "confirmed"], str, str]
 
+_LOGGER = logging.getLogger(__name__)
+
 _MOVEMENT_BUTTONS: Final = frozenset({"UP", "DOWN", "STOP"})
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
 _UINT32_MODULUS: Final = 1 << 32
@@ -26,6 +29,19 @@ _CLOCK_LONG_GAP_SECONDS: Final = 1_036_800.0
 _CLOCK_MAX_PROJECTION_LAG_SECONDS: Final = 30.0
 
 _LEDGER_WINDOW_SLACK_SECONDS: Final = 0.75
+# How late the confirmed anchor itself may be. `started_at` is derived as
+# `recv_time - age_ms/1000`: age_ms corrects the FIRMWARE's own queueing delay,
+# but nothing corrects the MQTT transport leg between the bridge publishing its
+# status and HA's callback running, so the anchor is biased LATE and never
+# early. Every window built from it therefore sits later than the RF it
+# describes, by an amount production measured at 1.117 s during a concurrent
+# seven-cover burst. This bound is applied to the LOWER edge only -- widening
+# the upper edge would suppress genuine presses long after we stopped
+# transmitting, which the late bias never justifies.
+#
+# NOT an architectural ceiling: heavier congestion can exceed it. Rejections
+# are logged so that shows up instead of silently reviving the phantom press.
+_LEDGER_ANCHOR_LAG_SECONDS: Final = 5.0
 _LEDGER_ENTRY_TTL_SECONDS: Final = 60.0
 _LEDGER_PENDING_TTL_SECONDS: Final = 30.0
 _DISPLACED_STOP_DRAIN_SECONDS: Final = 30.0
@@ -259,6 +275,8 @@ class _LedgerEntry:
     phase: Literal["pending", "confirmed"] = "pending"
     windows: tuple[_LedgerWindow, ...] = ()
     pending_since: float | None = None
+    registered_at: float | None = None
+    confirmed_handoff: float | None = None
     expires_at: float | None = None
     displaced: bool = False
 
@@ -277,8 +295,13 @@ class CommandLedger:
         channels: tuple[int, ...],
         button: str,
         frames: list[LedgerFrameSpec],
+        now: float | None = None,
     ) -> None:
-        """Register a complete command envelope before broker publication."""
+        """Register a complete command envelope before broker publication.
+
+        ``now`` anchors the earliest instant this command could possibly have
+        put energy on the air; see :meth:`resolve_held`.
+        """
         self._entries.pop(command_id, None)
         self._entries[command_id] = _LedgerEntry(
             command_id=command_id,
@@ -286,6 +309,7 @@ class CommandLedger:
             channels=channels,
             button=button,
             frames=tuple(frames),
+            registered_at=now,
         )
         self._enforce_caps()
 
@@ -300,6 +324,7 @@ class CommandLedger:
         windows = tuple(self._window(frame, handoff) for frame in entry.frames)
         latest_end = max((window.ends_at for window in windows), default=handoff)
         entry.phase = "confirmed"
+        entry.confirmed_handoff = handoff
         entry.windows = windows
         entry.expires_at = latest_end + _LEDGER_ENTRY_TTL_SECONDS
 
@@ -384,6 +409,91 @@ class CommandLedger:
         entry.displaced = True
         return flushed
 
+    def resolve_held(
+        self,
+        command_id: str,
+        signature: FrameSignature,
+        heard_at: float,
+    ) -> LedgerMatch | None:
+        """Return ownership of a capture held against one specific command.
+
+        Deliberately window-FREE. A held capture was heard after the command
+        was registered and before the bridge confirmed its start, so it is
+        provably our own emission. The confirmed window cannot arbitrate that:
+        its bounds derive from the START STATUS, which the bridge publishes
+        separately from the RF it describes and which can therefore arrive
+        AFTER a peer bridge has already reported hearing the frame. A
+        concurrent multi-remote burst measured 1.117 s of that skew against
+        _LEDGER_WINDOW_SLACK_SECONDS, so the window rejected our own frame and
+        the hub took the cover over as a physical press.
+
+        Returns None once the command is gone: a retired command never
+        transmitted anything we can claim, so its held captures must fall
+        through to ordinary classification and stay eligible as real presses.
+        """
+        entry = self._entries.get(command_id)
+        if entry is None:
+            return None
+        if not any(frame.signature == signature for frame in entry.frames):
+            return None
+        if not self._within_emission_envelope(entry, heard_at):
+            return None
+        return entry.phase, entry.command_id, entry.bridge_id
+
+    def _within_emission_envelope(self, entry: _LedgerEntry, heard_at: float) -> bool:
+        """Return whether a capture falls inside this command's possible airtime.
+
+        Ownership is NOT unconditional. Registration happens under the publish
+        lock strictly before the frame is handed to the broker, so nothing we
+        sent can be heard before it; and once confirmed, nothing we sent can be
+        heard after the last emission window closes. A same-signature capture
+        outside those bounds is somebody's finger on a real remote -- most
+        dangerously a STOP that a timed move also registers as ``stop_raw`` --
+        and must fall through to ordinary press classification.
+
+        Between those bounds the two are genuinely indistinguishable: identical
+        frames, identical air. We keep the command there, because that span is
+        the one where we are demonstrably transmitting.
+        """
+        registered_at = entry.registered_at
+        if registered_at is not None and heard_at < registered_at - _LEDGER_WINDOW_SLACK_SECONDS:
+            return False
+        if entry.phase != "confirmed" or not entry.windows:
+            return True
+        if heard_at > max(window.ends_at for window in entry.windows):
+            return False
+        handoff = entry.confirmed_handoff
+        if handoff is None:
+            return True
+        # Read the handoff the bridge actually reported rather than recovering
+        # it from window bounds: displace() rewrites a STOP window's starts_at
+        # to the DISPLACEMENT instant, and for a bare STOP command that window
+        # is the action frame's own -- so deriving the handoff from the windows
+        # would silently slide this bound forward by the displacement delay.
+        lag = handoff - heard_at
+        if lag > _LEDGER_ANCHOR_LAG_SECONDS:
+            # _LEDGER_ANCHOR_LAG_SECONDS is calibrated against ONE measurement
+            # (1.117 s). Nothing architecturally caps the real skew: age_ms
+            # corrects the firmware's own delay but cannot see the MQTT
+            # transport leg. Log every rejection so a load pattern that exceeds
+            # the bound is visible instead of silently reviving the phantom
+            # press this whole envelope exists to prevent.
+            _LOGGER.debug(
+                "state_sync: held capture for %s rejected as a real press; "
+                "heard %.3fs before its handoff (bound %.1fs)",
+                entry.command_id,
+                lag,
+                _LEDGER_ANCHOR_LAG_SECONDS,
+            )
+            return False
+        if lag > 0:
+            _LOGGER.debug(
+                "state_sync: claimed held capture for %s heard %.3fs before its handoff",
+                entry.command_id,
+                lag,
+            )
+        return True
+
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the newest pending or windowed confirmed command match."""
         for command_id in reversed(self._entries):
@@ -415,11 +525,15 @@ class CommandLedger:
 
     @staticmethod
     def _window(frame: LedgerFrameSpec, handoff: float) -> _LedgerWindow:
-        """Build one symmetric-slack confirmed frame window."""
+        """Build one confirmed frame window, slack above and lag tolerance below."""
         frame_handoff = handoff + frame.offset_ms / _MILLISECONDS_PER_SECOND
         return _LedgerWindow(
             signature=frame.signature,
-            starts_at=frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS,
+            # Asymmetric by design: a frame can be heard well BEFORE the window
+            # its own late anchor implies -- most acutely a stop_raw frame,
+            # which fires stop_after_ms after the action frame and so is almost
+            # always classified through this path rather than while pending.
+            starts_at=(frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS),
             ends_at=(
                 frame_handoff
                 + frame.airtime_ms / _MILLISECONDS_PER_SECOND
@@ -564,13 +678,33 @@ class StateSyncConsumer:
                 remaining.append(capture)
         self._holds = remaining
         for capture in selected:
-            self._classify(
-                capture.signature,
-                capture.heard_at,
-                capture.bridge_id,
-                seen_at,
-                hold_pending=True,
-            )
+            # Resolve against the command this capture was HELD for, not by
+            # window: see CommandLedger.resolve_held. Falling back to
+            # _classify would re-derive ownership from the confirmed window
+            # and reject our own frame whenever the start status lagged the RF.
+            owned = self._ledger.resolve_held(command_id, capture.signature, capture.heard_at)
+            if owned is None:
+                self._classify(
+                    capture.signature,
+                    capture.heard_at,
+                    capture.bridge_id,
+                    seen_at,
+                    hold_pending=True,
+                )
+                continue
+            phase, owning_command, command_bridge = owned
+            if phase == "pending":
+                # Unreachable under current wiring: every resume_holds caller
+                # confirms, displaces, releases or retires the entry first. Kept
+                # as a total function, and deliberately preserving the ORIGINAL
+                # held_at -- re-stamping it here would renew the hold TTL on
+                # every resume and strand the capture forever if a future call
+                # site ever does reach this branch.
+                del owning_command
+                self._holds.append(capture)
+                continue
+            if capture.bridge_id != command_bridge:
+                self._on_emission_proof(owning_command)
         self._maintain(seen_at)
 
     def record_commanded_start(
