@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.3] - 2026-07-25
 
+### Documentation
+
+- **README and INSTALL rewritten for people who just bought some blinds.** Both opened on
+  protocol architecture and hardware caveats before answering "is this for me?". The README now
+  leads with that question, states the one piece of hardware needed up front, and folds the
+  depth — air arbitration, virtual remotes, restart edge cases — into disclosure sections that
+  stay available without being in the way. Visible prose is down to about 40% of before with
+  nothing removed. INSTALL is now a four-step path with a what-you-need checklist and an explicit
+  "it's working when" check at the end of each step.
+
 ### Fixed
 
 - **A commanded start no longer silently swallows a genuine remote press** (#15). Any

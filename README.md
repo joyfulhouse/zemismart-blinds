@@ -1,7 +1,6 @@
 # Zemismart Blinds for Home Assistant
 
-Local RF control of AOK/Zemismart 433.92 MHz roller blinds from Home Assistant — no cloud, no
-hub app, just MQTT and a flashed Sonoff RF Bridge.
+Control AOK/Zemismart 433 MHz roller blinds from Home Assistant. No cloud, no vendor app, no hub.
 
 [![GitHub Release][releases-shield]][releases]
 [![License][license-shield]](LICENSE)
@@ -11,137 +10,86 @@ hub app, just MQTT and a flashed Sonoff RF Bridge.
 [![GitHub Sponsors][sponsors-shield]][sponsors]
 [![Ko-fi][kofi-shield]][kofi]
 
-## What Does This Integration Do?
+---
 
-Many roller blinds sold under the **Zemismart** brand (and other resellers of **AOK** OEM tubular
-motors) are RF-only: a 433.92 MHz remote is the sole way to control them. This integration models
-your hardware the way it actually works: **one device per physical remote**, with each blind — or
-an arbitrary group of blinds on the same remote — as a `cover` entity of that device, driven by
-generating the motors' native RF protocol from scratch through one or more inexpensive Sonoff RF
-Bridge R2 units.
+## Is this for you?
 
-- **Open, close, stop, and set position** with assumed-state travel-time position modeling.
-- **True group commands**: a group is one RF transmission, not several colliding commands.
-- **Calibrate from a single capture**: one labeled button press from your remote derives the
-  remote's complete command set ([fully reverse-engineered protocol](PROTOCOL.md)).
-- **Virtual remotes**: mint identities that never existed as hardware and pair motors to them.
-- **Reliable delivery**: correlated bridge acknowledgements, bridge-side STOP deadlines for
-  partial movement, and area-aware multi-bridge failover.
-- **Cross-bridge air arbitration**: with several bridges, normal commands are scheduled onto the
-  shared 433 MHz channel so simultaneous scenes stop talking over each other — while STOP
-  commands are never delayed.
-- **Guided remote learning**: a time-boxed bridge capture identifies the remote, action, and
-  channels automatically during onboarding or reconfiguration.
+Your blinds came with a small 433 MHz remote and **no app, no Wi-Fi, no hub** — the remote is the
+only way to control them. They're sold as **Zemismart**, or under other names using **AOK** motors.
 
-## Architecture
+If that's you, this integration gives you open, close, stop, and set-position in Home Assistant.
 
-This project is two cooperating parts:
+**You'll need one piece of hardware:** a Sonoff RF Bridge (~$15) to actually send the radio
+signals. Home Assistant has no 433 MHz radio of its own.
 
-| Repository | Role |
-|---|---|
-| **zemismart-blinds** (this repo) | Home Assistant integration — owns every remote identity, generates Portisch B0 frames, models position, chooses a bridge |
-| **[esphome-rf433-mqtt-bridge][bridge-repo]** | ESPHome firmware — a deliberately dumb MQTT-to-433 MHz beacon with no blind codes and no cover entities |
+## What you get
 
-The two meet at a fixed MQTT topic contract (`rf433/<bridge>/...`) through **whatever MQTT broker
-your Home Assistant already uses** — the Mosquitto add-on works out of the box, and any other
-broker (standalone Mosquitto, EMQX, a NAS container) works identically.
+- **Open, close, stop, and set position** — including partial positions
+- **Groups** — "all office blinds" is *one* radio command, not five competing ones
+- **One-press setup** — press a button on your remote and the integration works out the rest
+- **Sees your physical remote** — press the wall remote and Home Assistant follows along
+- **Multiple bridges** — big houses work; commands route to the nearest bridge automatically
 
-```
-Home Assistant ──(MQTT tx)── broker ──(rf433/<bridge>/tx)── RF Bridge ──📡── blinds
-Learn wizard   ◀─(MQTT rx)── broker ◀─(rf433/<bridge>/rx)── RF Bridge ◀─📡── remote button
-```
+## Quick start
 
-## Prerequisites
+**1. Get a bridge working** — a Sonoff RF Bridge R2, flashed with
+[our firmware][bridge-repo]. This is the only fiddly part, and it involves soldering.
 
-| Requirement | Details |
-|---|---|
-| **Home Assistant** | Version **2026.5** or newer (ships Python 3.14, which this integration's syntax requires), with the MQTT integration configured |
-| **MQTT broker** | Any — the Mosquitto add-on is the easiest |
-| **RF bridge** | One or more [Sonoff RF Bridge R2][bridge-hardware-buy] units flashed with [esphome-rf433-mqtt-bridge][bridge-repo] — **board revision matters**, see [Hardware](#hardware) |
-| **Blinds** | AOK OEM 433.92 MHz tubular motors — commonly sold as Zemismart; other AOK resellers are expected to be compatible |
-
-## Installation
-
-See **[INSTALL.md](INSTALL.md)** for the complete guide, including bridge flashing and first-blind
-calibration.
-
-**Quick version (HACS):** add this repository as a custom repository in HACS, install
-**Zemismart Blinds**, restart Home Assistant, then add the integration from
-**Settings → Devices & services**.
+**2. Install this integration** — via HACS, then restart Home Assistant.
 
 [![Open in HACS][hacs-repo-shield]][hacs-repo]
 
-## Configuration
+**3. Add your remote** — *Settings → Devices & services → Add integration → Zemismart Blinds*,
+choose **Learn from remote**, and press a button on your physical remote when asked.
 
-You add **remotes**, and each remote owns its covers: one run of the add-integration flow creates
-one remote device, then walks you through adding that remote's blinds and groups as cover
-entities. The guided **Learn** path is the default:
+📖 **[Full setup guide → INSTALL.md](INSTALL.md)**
 
-1. Enter the remote's **name** and Home Assistant **area**, then use the automatically selected
-   online bridge or choose another one.
-2. Press **Up**, **Down**, or **Stop** on the physical remote during the 30-second capture window.
-   The flow decodes the first valid action frame and detects its prefix, remote ID, channels, and
-   button automatically.
-3. Confirm the detected identity and the remote's transport settings, then add the remote's
-   covers one at a time: a **cover name**, its **channels** (`1` for one blind, or `1,2,3` for a
-   group), and the full up/down **travel times**. Add as many covers as the remote controls, then
-   finish.
+## How it works
 
-**Advanced** setup can enter a remote manually from one labeled B0/B1 reference or direct 16-bit
-action base, or allocate a virtual remote. The optional OEM TRAILER base should be left blank
-unless captured.
+You add a **remote**, and that remote owns its blinds. One physical remote becomes one device in
+Home Assistant, and each blind (or group of blinds) becomes a `cover` entity on it.
 
-Everything about an existing remote is managed from its entry's **Reconfigure** menu:
-
-- **Relearn from remote** — replace the identity or calibration with a fresh capture.
-- **Edit remote settings** — name, area, RF repeats, coalescing.
-- **Add cover / Edit cover / Remove cover** — manage the remote's covers; edits keep each
-  cover's identity (entity IDs, history, and automations survive), and removal deletes exactly
-  that cover's entity.
-
-The flow accepts hex with or without the `0x` prefix.
-
-### Position behavior
-
-Position is estimated, not measured, and a new entity starts unknown. Full OPEN/CLOSE re-anchors
-at 100/0 after one complete configured travel plus a margin. SET_POSITION requires a known
-estimate and arms an absolute STOP deadline **on the bridge**, so a partial move stops even if
-Home Assistant restarts mid-travel. An acknowledgement timeout makes position unknown instead of
-pretending a command moved the motor.
-
-### Multi-bridge behavior
-
-If no bridge in the cover's area is online, the integration falls back to the retained default
-bridge, then any online bridge, and exposes `degraded_bridge: true`. One shared worker publishes
-one command at a time and waits for the bridge's acknowledgement before the next — with
-intelligent coalescing that merges near-simultaneous commands for blinds on the same remote into
-a single group frame.
-
-With two or more online bridges, **cross-bridge air arbitration** additionally schedules normal
-commands so different bridges do not transmit over each other on the shared 433 MHz channel: the
-calendar anchors on each command's actual RF start, reserves known future fail-safe STOP windows,
-and delays only normal work — an explicit STOP is never held, arbitration switches off below two
-online bridges, and every failure path publishes rather than blocks (a hard 130 s ceiling
-guarantees it). Scenes that fan out across the house therefore start their blinds staggered a
-couple of seconds apart instead of colliding on air. Arbitration counters are included in any
-entry's diagnostics download. To measure without delaying (or as a rollback), an
-installation-wide YAML escape selects shadow mode:
-
-```yaml
-zemismart_blinds:
-  air_arbitration_mode: shadow
+```
+Home Assistant  ──►  MQTT broker  ──►  RF Bridge  ──📡──►  your blinds
+                                            ▲
+                                            └──📡── your physical remote
 ```
 
-## Services
+The integration generates the exact radio signals your remote sends. The bridge is a dumb relay —
+it knows nothing about blinds.
 
-### `zemismart_blinds.send_raw`
+## Setting up a blind
 
-Debug escape hatch: send one complete `AAB0...55` frame through a named bridge with optional
-repeats.
+After the learn step, you add covers one at a time. Each needs:
 
-### `zemismart_blinds.new_virtual_remote`
+| Field | What to enter |
+|---|---|
+| **Name** | e.g. "Living Room Left" |
+| **Channels** | `1` for a single blind, or `1,2,3` for a group |
+| **Travel time** | How many seconds it takes to go fully up, and fully down |
 
-Returns a fresh remote identity **with a complete synthesized calibration**:
+Time your blind with a stopwatch — that's how position gets estimated.
+
+<details>
+<summary><b>Changing things later</b></summary>
+
+Everything lives in the entry's **Reconfigure** menu:
+
+- **Relearn from remote** — recapture the identity or calibration
+- **Edit remote settings** — name, area, RF repeats, coalescing
+- **Add / Edit / Remove cover** — manage covers; edits keep entity IDs, history, and automations intact
+
+</details>
+
+<details>
+<summary><b>Advanced setup (manual entry, virtual remotes)</b></summary>
+
+Instead of learning from a remote, you can enter one manually from a labeled B0/B1 reference or a
+direct 16-bit action base. Hex works with or without the `0x` prefix. Leave the optional OEM
+TRAILER base blank unless you captured one.
+
+**Virtual remotes** mint an identity that never existed as hardware, so you can pair a motor
+directly to Home Assistant. Call `zemismart_blinds.new_virtual_remote`:
 
 ```yaml
 prefix: "0x5c1a2b"
@@ -153,34 +101,38 @@ base_stop: "0xdc89"
 
 To pair one:
 
-1. Call the service, then add a manual integration entry using the returned prefix, remote ID, and
-   UP base (calibration action UP).
-2. Put the motor into its RF pairing mode with its physical program button (confirm the pairing
-   jog; exact button timing varies by motor revision, so keep the motor's own instructions).
-3. Send OPEN from the new cover while the motor is in pairing mode, exit pairing mode, and verify
-   OPEN, CLOSE, and STOP. Keep the original remote paired until validation is complete.
+1. Add a manual entry using the returned prefix, remote ID, and UP base (calibration action UP).
+2. Put the motor into RF pairing mode with its program button (watch for the pairing jog — exact
+   timing varies by motor revision, so follow the motor's own instructions).
+3. Send OPEN from the new cover while pairing mode is active, exit pairing mode, then verify OPEN,
+   CLOSE, and STOP. Keep the original remote paired until you've confirmed it all works.
 
-## Hardware
+</details>
 
-**Bridge:** [Sonoff RF Bridge R2][bridge-hardware-buy] (433 MHz variant), flashed with
-[esphome-rf433-mqtt-bridge][bridge-repo]. Each bridge needs two firmwares — Portisch on the RF
-coprocessor, then the ESPHome package on the Wi-Fi chip — and the complete walkthrough lives in
-[**HARDWARE.md**][bridge-hardware].
+## About position
 
-> **Check the board revision before buying.** Only R2 **V1.0/V2.0** boards (Silicon Labs
-> **EFM8BB1** coprocessor) are validated. The 2022+ R2 **V2.2** switched to an **OB38S003**, which
-> cannot run Portisch and is unsupported. Sellers rarely state the revision, so new stock is a
-> gamble; secondhand V1.0/V2.0 units are the safe buy.
+**Position is an estimate, not a measurement.** These motors report nothing back — the integration
+counts seconds against your configured travel time.
 
-Tasmota is used only as a one-time tool to flash the coprocessor — a Tasmota bridge cannot drive
-this integration, which speaks the ESPHome package's MQTT contract.
+What that means day to day:
 
-**Motors:** AOK OEM tubular roller-shade motors (Zemismart-branded and others).
+- A **full open or close** is self-correcting. The motor stops at its own limit, so the estimate
+  re-anchors at 100 or 0.
+- A **partial position** drifts a little over time. Send a full open or close to true it up.
+- A brand-new blind reads `unknown` until you move it fully one way.
 
-**3D-printed tube adapters:** printable adapters for fitting these motors to other roller tubes
-are maintained in [joyfulhouse/ZemismartAdapters][adapters-repo].
+<details>
+<summary><b>Why a blind can be "wrong" in Home Assistant</b></summary>
 
-## Automation Example
+The radio protocol is one-way. The integration knows a command *left the bridge*, never that a
+motor *received* it. So a command that never arrives looks exactly like one that worked, and the
+cover will report the position it expected — no error, no log entry.
+
+If a blind genuinely matters to an automation, verify by eye or trigger on something else.
+
+</details>
+
+## Automation example
 
 ```yaml
 automation:
@@ -196,29 +148,38 @@ automation:
 
 ## Troubleshooting
 
-### Cover commands time out
+<details>
+<summary><b>Commands time out</b></summary>
 
-1. Check the bridge is online: the retained `rf433/<bridge_id>/availability` topic should be
-   `online` (use an MQTT explorer, e.g. **MQTT Explorer** or `mosquitto_sub`).
-2. Confirm Home Assistant's MQTT integration is connected to the **same broker** as the bridges.
-3. Watch `rf433/<bridge_id>/status` while commanding — a `rejected` status includes a reason.
+1. Is the bridge online? Its retained `rf433/<bridge_id>/availability` topic should read `online`.
+   Check with MQTT Explorer or `mosquitto_sub`.
+2. Is Home Assistant's MQTT integration pointed at the **same broker** as the bridges?
+3. Watch `rf433/<bridge_id>/status` while sending a command — a `rejected` status explains why.
 
-### Blind doesn't move but commands are accepted
+</details>
 
-- Re-check the calibration: capture the remote button again and compare the decoded
-  prefix/remote ID with the entry's configuration.
-- Increase **RF repeats** in the entry's Configure dialog (distant or obstructed blinds), but
-  see the repeats tradeoff under Known Limitations first — more repeats lengthens the time a
-  physical remote press can go unrecognised, and lengthens each train's occupancy of the shared
-  channel, so it is not always the right lever for a blind that intermittently misses commands.
-- Verify the blind's channel: a motor paired to remote channel 3 ignores a channel-1 frame.
+<details>
+<summary><b>Command is accepted but the blind doesn't move</b></summary>
 
-### Position drifts
+- **Check the channel.** A motor paired to channel 3 ignores a channel-1 command. This is the most
+  common cause.
+- **Recheck calibration.** Capture the remote button again and compare the decoded prefix and
+  remote ID against the entry.
+- **Try more RF repeats** in *Configure* — but read the tradeoff under
+  [Good to know](#good-to-know) first. More repeats is not always the right lever.
 
-Travel-time position is an estimate. Re-anchor with a full OPEN or CLOSE, and tune the up/down
-travel seconds in Configure (motors are often slower upward).
+</details>
 
-### Enable debug logging
+<details>
+<summary><b>Position is drifting</b></summary>
+
+Send a full open or close to re-anchor, then tune the travel seconds in *Configure*. Motors are
+usually slower going up than down, so time each direction separately.
+
+</details>
+
+<details>
+<summary><b>Enable debug logging</b></summary>
 
 ```yaml
 logger:
@@ -227,39 +188,85 @@ logger:
     custom_components.zemismart_blinds: debug
 ```
 
-## Known Limitations
+</details>
 
-- **Live state sync requires the paired bridge firmware**: when the bridges run the state-sync
-  firmware contract (continuous idle-listen `/rx`, boot id, enriched `/status`, `/cmd disarm`),
-  physical remote presses are observed and mirrored into each cover's assumed state. Without that
-  firmware the integration is transmit-only and RF reception is limited to the time-boxed Learn wizard.
-- **Physical takeover of a restored or clamped timed move (deferred)**: after a Home Assistant
-  restart, or once a group member reaches its own limit before the group's RF frame ends, HA may no
-  longer model the command's still-armed bridge fail-safe STOP. A physical remote press that reverses
-  such a move is not guaranteed to disarm that STOP — the bridge STOP can still halt the reversed
-  motion — and a displaced restored-timed command may keep a position that should read `unknown`.
-  Re-issue the movement if a blind stops unexpectedly after a takeover.
-- **Assumed position**: there is no motor feedback; position is modeled from travel time. A
-  command is modelled as successful once the bridge reports it **started transmitting** — which
-  confirms RF left the bridge, never that a motor received or obeyed it. A command that does not
-  reach its motor is therefore indistinguishable from one that works, and the cover will report
-  the commanded position with no error and no log entry. Verify by eye if a blind matters.
-- **RF repeats trade reliability against takeover responsiveness**: raising `repeats` adds
-  redundancy on air, but the integration must treat its own train as its own for the whole time it
-  is transmitting. At the default `repeats: 3` a genuine remote press near a just-issued command
-  can go unrecognised for roughly 9 seconds; at the maximum of 20 that grows to roughly 27. Higher
-  repeats also lengthen how long one bridge occupies the shared channel.
-- **Bridge isolated from MQTT mid-command**: a bridge that loses its network link (but not power)
-  keeps executing its already-armed fail-safe STOP locally. With multiple bridges, commands fail
-  over to another bridge meanwhile, and the isolated bridge's late STOP can still reach the motor
-  over the air. One-way RF offers no way to recall it; re-issue the movement if a blind stops
-  unexpectedly after a bridge drops.
-- **Bridge reboot during an HA restart**: a bridge's armed fail-safe STOP lives in its RAM. If the
-  bridge power-cycles entirely within Home Assistant's own downtime (offline and back online before
-  HA restores state), a restored in-flight partial move cannot detect that its STOP was lost and
-  models to its target. Bridges that are offline at restore time, or drop offline afterwards, are
-  detected and the cover becomes `unknown`.
-- **Calibration needs one capture** per new physical remote (a one-time step per remote).
+## Good to know
+
+These are real behaviours worth knowing before you rely on the integration for something
+important.
+
+- **Position is assumed, never measured.** See [About position](#about-position).
+- **More RF repeats trades reliability for responsiveness.** While the integration is transmitting,
+  it treats matching signals as its own — so a physical remote press right after a command can go
+  unnoticed for roughly **9.5 s** at the default `repeats: 3`, or **26.5 s** at the maximum of 20.
+  Several blinds moving at once through one bridge extends that further.
+- **A bridge that loses Wi-Fi mid-command** still runs its already-armed stop timer locally. Other
+  bridges take over meanwhile, and that late stop can still reach the motor. Re-issue the movement
+  if a blind stops unexpectedly.
+
+<details>
+<summary><b>More limitations (restarts, takeover, calibration)</b></summary>
+
+- **Live state sync needs the paired bridge firmware.** With the state-sync firmware contract
+  (continuous idle-listen `/rx`, boot id, enriched `/status`, `/cmd disarm`), physical remote
+  presses are mirrored into each cover. Without it the integration is transmit-only, and RF
+  reception is limited to the Learn wizard.
+- **Physical takeover of a restored or clamped timed move.** After a Home Assistant restart, or
+  once a group member hits its own limit before the group's frame ends, HA may no longer model the
+  bridge's still-armed stop. A remote press reversing such a move isn't guaranteed to disarm it.
+- **A bridge that fully reboots during HA's own downtime** loses its armed stop from RAM. A
+  restored in-flight partial move can't detect that and models to its target. Bridges offline at
+  restore time, or that drop afterwards, are detected and the cover goes `unknown`.
+- **Calibration needs one capture per physical remote** — a one-time step.
+
+</details>
+
+## Multiple bridges
+
+One bridge is enough to start. Add more when rooms are out of range.
+
+Commands route to a bridge in the cover's own area, and fall back automatically when one is
+offline (the cover then reports `degraded_bridge: true`).
+
+<details>
+<summary><b>How simultaneous commands are scheduled</b></summary>
+
+With two or more bridges online, **air arbitration** keeps them from transmitting over each other
+on the shared 433 MHz channel. It anchors on each command's actual RF start, reserves known future
+fail-safe stop windows, and delays only normal work — an explicit STOP is never held. Arbitration
+switches off below two online bridges, and every failure path publishes rather than blocks (a hard
+130 s ceiling guarantees it).
+
+The practical effect: a scene that fans out across the house staggers its blinds a couple of
+seconds apart instead of colliding.
+
+Counters are included in any entry's diagnostics download. To measure without delaying — or as a
+rollback — there's an installation-wide YAML escape:
+
+```yaml
+zemismart_blinds:
+  air_arbitration_mode: shadow
+```
+
+Near-simultaneous commands for blinds on the same remote are also merged into a single group frame
+automatically.
+
+</details>
+
+## Hardware
+
+**Bridge:** [Sonoff RF Bridge R2][bridge-hardware-buy], 433 MHz variant, flashed with
+[esphome-rf433-mqtt-bridge][bridge-repo].
+
+> ⚠️ **Check the board revision before buying.** Only R2 **V1.0/V2.0** boards (Silicon Labs
+> **EFM8BB1** chip) work. The 2022+ **V2.2** uses an **OB38S003**, which cannot run the required
+> firmware. Sellers rarely state the revision, so new stock is a gamble — secondhand V1.0/V2.0
+> units are the safe buy.
+
+**Motors:** AOK OEM tubular roller-shade motors (Zemismart-branded and others).
+
+**3D-printed adapters** for fitting these motors to other roller tubes:
+[joyfulhouse/ZemismartAdapters][adapters-repo].
 
 ## Development
 
@@ -268,28 +275,24 @@ git clone https://github.com/joyfulhouse/zemismart-blinds.git
 cd zemismart-blinds
 uv sync
 
-# Lint, type check, test
 uv run ruff check . && uv run ruff format --check .
 uv run mypy --strict
 uv run pytest
 ```
 
-The codec tests pin byte-exact golden vectors (generated with the hardware-validated codec for
-synthetic remote identities), exhaust all non-empty channel subsets, and cover calibration
-derivation across opcode-byte carries. See [PROTOCOL.md](PROTOCOL.md) for the full protocol
-specification.
+The protocol is fully documented in [PROTOCOL.md](PROTOCOL.md). Codec tests pin byte-exact golden
+vectors, exhaust all non-empty channel subsets, and cover calibration derivation across
+opcode-byte carries.
 
 ## Support
 
-- **Bug reports / feature requests**: [GitHub Issues][issues]
+- **Bugs and feature requests**: [GitHub Issues][issues]
 - **Questions**: [GitHub Discussions][discussions]
 
-## Support Development
+## Support development
 
-This integration is built and maintained in my spare time, with real hardware and tooling costs
-behind every release. If it's useful to you, consider sponsoring the project or leaving a tip to
-help offset development and testing — it's genuinely appreciated and helps keep the project
-moving.
+This is built and maintained in my spare time, with real hardware costs behind every release. If
+it's useful to you, sponsoring or a tip genuinely helps keep it moving.
 
 [![GitHub Sponsors][sponsors-shield]][sponsors] [![Ko-fi][kofi-shield]][kofi]
 
@@ -322,7 +325,6 @@ MIT — see [LICENSE](LICENSE).
 [kofi-shield]: https://img.shields.io/badge/Ko--fi-support-FF5E5B.svg?style=for-the-badge&logo=ko-fi&logoColor=white
 [kofi]: https://ko-fi.com/bryanli
 [bridge-repo]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge
-[bridge-hardware]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/blob/main/HARDWARE.md
 [bridge-hardware-buy]: https://itead.cc/product/sonoff-rf-bridge-433/
 [adapters-repo]: https://github.com/joyfulhouse/ZemismartAdapters
 [issues]: https://github.com/joyfulhouse/zemismart-blinds/issues
