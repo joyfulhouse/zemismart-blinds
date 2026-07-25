@@ -1043,3 +1043,50 @@ def test_stop_echo_arriving_before_its_late_anchored_window_stays_ours() -> None
 
     # Tolerance is lower-edge only: long after the train ends it is a real press.
     assert ledger.match(stop, true_stop_time + 60.0) is None
+
+
+def test_own_stop_echo_is_not_dispatched_as_a_press_through_the_consumer() -> None:
+    """End-to-end: our own STOP echo must not reach dispatch as a press.
+
+    This is the assertion that actually protects the reported bug, and it is
+    deliberately at CONSUMER level rather than calling ``ledger.match``
+    directly. ``_dispatch_press``'s commanded-start guard cannot help here: it
+    only drops presses heard BEFORE a commanded start, and a stop_raw echo is
+    heard ``stop_after_ms`` AFTER it. So unlike the held-capture path -- where
+    that guard already suppressed the press and this change only restores the
+    emission proof -- here the window is the sole line of defence, and a late
+    anchor shifting it past our own echo dispatches a phantom STOP that freezes
+    the travel model mid-flight while the motor runs on to its limit.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
+            LedgerFrameSpec(stop, offset_ms=_LATE_ANCHOR_STOP_OFFSET_MS, airtime_ms=3_000),
+        ],
+        _LATE_ANCHOR_HANDOFF,
+    )
+    dispatched: list[HeardEvent] = []
+    anchored_at = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS
+    now_value = [anchored_at]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), anchored_at)
+    ledger.confirm("timed", anchored_at)
+
+    true_stop_time = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_STOP_OFFSET_MS / 1_000
+    now_value[0] = true_stop_time
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(true_stop_time * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        true_stop_time,
+    )
+
+    assert dispatched == []

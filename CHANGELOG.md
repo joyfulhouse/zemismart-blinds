@@ -20,19 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drive a cover to `unknown`. Only visible under concurrent multi-remote bursts; a burst
   regression test now covers that workload.
 
-  **Scope, stated precisely:** this does NOT prevent a phantom physical-press takeover in
-  that regime. `_dispatch_press` already drops a press predating a recorded commanded
-  start, and the hub always records one before resolving the future that unblocks
+  **Scope of this first bullet, stated precisely:** on the held-capture path it does NOT
+  prevent a phantom press. `_dispatch_press` already drops a press predating a recorded
+  commanded start, and the hub always records one before resolving the future that unblocks
   confirmation — verified by running the new tests against the pre-change code, where the
-  no-press assertions pass and only the emission-proof assertions fail. The originally
-  reported mid-travel model freeze is therefore **not** closed by this release.
+  no-press assertions pass and only the emission-proof assertions fail. The press
+  suppression that does matter is the next bullet.
 
   Ownership of a held capture is bounded to a plausible status lag
-  (`_LEDGER_HELD_TRUST_SECONDS`, 5 s). A timed move registers its own `stop_raw`, so a
-  person pressing STOP produces a capture identical to one of our own frames; without that
-  bound such a press would have been silently absorbed — bypassing takeover handling
-  entirely — for as long as the bridge took to confirm, up to the 30 s started-status
-  timeout.
+  (`_LEDGER_ANCHOR_LAG_SECONDS`, 5 s), so a command cannot claim a capture indefinitely.
+  Note that a genuine press in that region is separately suppressed by the pre-existing
+  `_COMMANDED_START_TTL_SECONDS` (60 s) guard, which is a far larger blanket than anything
+  introduced here and is unchanged by this release.
 
 - **The mid-travel model freeze on covers whose remote also runs timed partial moves is
   fixed too.** Same root cause, different sub-case. The held-capture fix above only reaches
@@ -45,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never early. Our own STOP echo is no longer read as a person stopping the blind by
   hand — which froze HA's travel model partway while the motor ran on to its limit, leaving
   HA reporting a partial position for a cover that had physically closed.
+
+  This is the bullet that closes the reported incident. The commanded-start guard gives no
+  protection here — it only drops presses heard *before* a commanded start, and a `stop_raw`
+  echo is heard `stop_after_ms` *after* one — so the window is the only line of defence.
+  Verified end-to-end at consumer level: against the pre-change code the phantom `STOP` is
+  dispatched, and with the fix it is not.
 
 - The remote's device is now identified by the durable remote key (`prefix:remote_id`, the
   same identity as the entry's unique id) instead of the config **entry id**. Existing
