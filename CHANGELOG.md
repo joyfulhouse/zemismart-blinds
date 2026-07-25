@@ -88,6 +88,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than 3.75 s. Widening remains the safe direction — the alternative is asserting a
   takeover we cannot distinguish from our own transmission.
 
+- **A travel that ends against a hard limit re-anchors itself** (#23). Both endpoints are
+  physical stops, so a cover that ran a travel out to 0 or 100 is held there by the motor's own
+  limit switch and its estimate is corroborated by the hardware. That already settled a
+  questioned restore-time anchor, but only when the *commanded* target was an endpoint. A group
+  member whose own travel clamps to its limit while the group aims somewhere in between reaches
+  the same hard stop and was left questioned anyway, because `absolute_anchor` records the
+  group's intent rather than the member's outcome. Re-anchoring now keys on where the motion
+  actually ended.
+
+  Deliberately not applied to a position that merely *reads* 0 or 100 without a completed travel
+  behind it: a restored estimate from a questioned origin would then launder itself into a
+  verified one, which is what marking it unknown exists to prevent.
+
 ### Documentation
 
 - **The RF-repeats selector now states the takeover-responsiveness tradeoff** (#20). `repeats`

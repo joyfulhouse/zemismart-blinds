@@ -3473,6 +3473,62 @@ async def test_set_position_aborts_when_started_preparatory_stop_is_displaced(
 
 
 @pytest.mark.asyncio
+async def test_group_member_clamped_to_its_limit_re_anchors(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaching a hard limit settles the anchor even when the GROUP did not.
+
+    ``absolute_anchor`` records the group's intent, so a member whose own
+    travel clamps to its endpoint while the group aims somewhere in between
+    was left questioned despite physically resting against its limit switch.
+    Re-anchoring keys on where the motion actually ENDED.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    # An empty registry: bridge-a is never seen online, so the questioned
+    # anchor survives the restore and only reaching a limit can settle it.
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    travel = 0.02
+    hub = ZemismartHub(BridgeRegistry(), quiet_publish)
+    config = cover_config(travel=travel)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+        entity._position = 20.0
+        # The group aims at 50 -- NOT an endpoint, so absolute_anchor is False --
+        # but this member's own travel overshoots and clamps to 0.
+        entity._start_member_motion(
+            cover_module._MotionStart(
+                source="commanded",
+                started_at=cover_module.WALL_CLOCK(),
+                deadline=None,
+                bridge_id="bridge-b",
+                command_id="group-down",
+            ),
+            ack=None,
+            direction=-1,
+            duration=travel,
+            group_target=50.0,
+        )
+        assert entity._motion_target == 0.0
+        assert entity._motion_absolute_anchor is False
+        await asyncio.sleep(travel + 0.01 + 0.05)
+
+        assert entity.current_cover_position == 0
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
 async def test_partial_move_keeps_the_unverified_anchor_revocable(
     hass: HomeAssistant,
 ) -> None:
