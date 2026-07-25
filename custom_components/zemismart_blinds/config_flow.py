@@ -177,6 +177,29 @@ def _release_capture_owner(
         del _CAPTURE_OWNERS[owner_key]
 
 
+def _rekey_remote_device(hass: HomeAssistant, old_key: str, new_key: str) -> None:
+    """Move the remote's device onto a new remote identity, in place.
+
+    Re-identifying preserves the device_id, its area override, and every entity
+    attached to it. Recreating would not, and the device_id is what automations
+    target -- so a relearn must never be allowed to mint a new one.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    if old_key == new_key:
+        return
+    registry = dr.async_get(hass)
+    device = registry.async_get_device(identifiers={(DOMAIN, old_key)})
+    if device is None:
+        return
+    if registry.async_get_device(identifiers={(DOMAIN, new_key)}) is not None:
+        # Something already owns the new identity; async_update_device would
+        # raise a collision and abort the flow. Leave both rows alone and let
+        # _ensure_remote_device converge on the survivor at reload.
+        return
+    registry.async_update_device(device.id, new_identifiers={(DOMAIN, new_key)})
+
+
 @dataclass(slots=True)
 class _DiscoverySession:
     """Retained bridge state collected by one bounded flow-local subscription."""
@@ -981,6 +1004,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # window closes).
             runtime.hub.drain_owner(entry.entry_id)
             await runtime.hub.async_disarm_remote(current.key)
+        # The remote device is keyed by the remote identity, and a relearn is
+        # the one flow that changes that identity on an EXISTING entry. Re-key
+        # in place before the entry update: otherwise the reload finds neither
+        # the new key nor the retired entry-id key, mints a fresh device, and
+        # the old one is pruned once its covers re-home -- churning the
+        # device_id every automation targets and silently dropping the user's
+        # area override with it.
+        _rekey_remote_device(self.hass, current.key, updated.key)
         self.hass.config_entries.async_update_entry(
             entry,
             title=updated.name,

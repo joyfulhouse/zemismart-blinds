@@ -9,18 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A cover's travel model is no longer corrupted by the integration mistaking its own
-  transmission for a physical remote press.** A capture held while its command was still
+- **The integration no longer loses proof that its own command reached the air.** A
+  capture held while its command was still
   pending is now resolved against *that command* rather than re-derived from the confirmed
   emission window. The window's bounds come from the bridge's `started` status, which is
   published separately from the RF it describes and can arrive *after* a peer bridge has
   already reported hearing the frame — measured at **1.117 s** of skew during a concurrent
   seven-cover burst, against 0.75 s of window slack. The window therefore rejected our own
-  frame, and the hub took the cover over as though someone had pressed the physical remote,
-  writing state with no Home Assistant context and leaving the cover `unknown` or frozen at
-  a partial position. Only visible under concurrent multi-remote bursts, which is why
-  single-cover operation never showed it; a burst regression test now covers the real
-  workload.
+  frame, costing the command its emission proof — which clears the unverified anchor and can
+  drive a cover to `unknown`. Only visible under concurrent multi-remote bursts; a burst
+  regression test now covers that workload.
+
+  **Scope, stated precisely:** this does NOT prevent a phantom physical-press takeover in
+  that regime. `_dispatch_press` already drops a press predating a recorded commanded
+  start, and the hub always records one before resolving the future that unblocks
+  confirmation — verified by running the new tests against the pre-change code, where the
+  no-press assertions pass and only the emission-proof assertions fail. The originally
+  reported mid-travel model freeze is therefore **not** closed by this release.
 
   Ownership of a held capture is bounded to a plausible status lag
   (`_LEDGER_HELD_TRUST_SECONDS`, 5 s). A timed move registers its own `stop_raw`, so a

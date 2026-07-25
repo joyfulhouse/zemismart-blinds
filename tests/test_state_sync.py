@@ -805,10 +805,17 @@ def test_held_capture_survives_a_started_status_later_than_its_own_rf() -> None:
 
     The confirmed window's lower bound is derived from the START STATUS, which
     is published separately from the RF it describes and can arrive AFTER a
-    peer bridge already reported hearing the frame. Under a concurrent
-    multi-remote burst that skew was measured at 1.117 s against 0.75 s of
-    slack, so the window check rejected our own emission and the integration
-    took the cover over as if a human had pressed the remote.
+    peer bridge already reported hearing the frame; a concurrent multi-remote
+    burst measured 1.117 s of that skew against 0.75 s of slack.
+
+    SCOPE, measured rather than assumed: the ``dispatched == []`` assertion
+    below ALSO passes without this fix, because ``_dispatch_press`` already
+    drops a press predating a recorded commanded start, and the hub always
+    records one before resolving the future that unblocks ``confirm()``. What
+    this fix actually changes is the ``proofs`` assertion -- the window miss
+    cost us the EMISSION PROOF that the command reached the air, and losing
+    that clears the unverified anchor. Do not read this test as evidence that
+    a phantom press was prevented.
     """
     ledger = CommandLedger()
     signature = _required_signature((1,), "DOWN")
@@ -835,8 +842,12 @@ def test_held_capture_survives_a_started_status_later_than_its_own_rf() -> None:
     )
     assert dispatched == []
 
-    # The late status confirms the command well after the frame was heard.
+    # Production ALWAYS records a commanded start before resume_holds: the hub
+    # calls record_commanded_start immediately before resolving the `started`
+    # future that unblocks confirm(). Omitting it measures a path the running
+    # integration never takes.
     now_value[0] = _LATE_START_CONFIRM_TIME
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), _LATE_START_CONFIRM_TIME)
     ledger.confirm("command-late", _LATE_START_CONFIRM_TIME)
     consumer.resume_holds("command-late")
 
@@ -858,9 +869,11 @@ def test_concurrent_burst_across_bridges_dispatches_no_phantom_press() -> None:
     This is the Night sweep's real workload: one parallel burst across several
     covers, each transmitted by a different bridge, every frame overheard by
     peer bridges, and every "started" status delayed behind the RF it
-    describes. Single-command tests pass while this fails, because the skew
-    only appears once the bridges contend — so the burst is the regression
-    that matters.
+    describes.
+
+    As above, the discriminating assertion is ``proofs``, not ``dispatched``:
+    ``_commanded_starts`` already suppresses the press. This pins that seven
+    concurrent commands each retain proof they reached the air.
     """
     ledger = CommandLedger()
     dispatched: list[HeardEvent] = []
@@ -904,9 +917,10 @@ def test_concurrent_burst_across_bridges_dispatches_no_phantom_press() -> None:
     assert dispatched == []
 
     # Each bridge's "started" status arrives only after its own RF was heard.
-    for command_id, _channels, _sender, heard_at in commands:
+    for command_id, channels, _sender, heard_at in commands:
         confirmed_at = heard_at + _BURST_STATUS_LAG_SECONDS
         now_value[0] = confirmed_at
+        consumer.record_commanded_start(_REMOTE_KEY, frozenset(channels), confirmed_at)
         ledger.confirm(command_id, confirmed_at)
         consumer.resume_holds(command_id)
 
