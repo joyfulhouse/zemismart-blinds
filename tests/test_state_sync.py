@@ -791,3 +791,275 @@ def test_consumer_close_clears_state_and_stops_dispatch() -> None:
 
     assert len(dispatched) == 1
     assert consumer._commanded_starts == {}
+
+
+# Production capture 2026-07-25 07:45:39: a bridge put DOWN on air at 39.248
+# and its own "started" status did not reach HA until 40.365 — 1.117 s later,
+# against 0.75 s of window slack. Reproduced here with the same shape.
+_LATE_START_HEARD_TIME: Final = 100.0
+_LATE_START_CONFIRM_TIME: Final = 101.2
+
+
+def test_held_capture_survives_a_started_status_later_than_its_own_rf() -> None:
+    """A capture held while pending stays ours when 'started' lands late.
+
+    The confirmed window's lower bound is derived from the START STATUS, which
+    is published separately from the RF it describes and can arrive AFTER a
+    peer bridge already reported hearing the frame; a concurrent multi-remote
+    burst measured 1.117 s of that skew against 0.75 s of slack.
+
+    SCOPE, measured rather than assumed: the ``dispatched == []`` assertion
+    below ALSO passes without this fix, because ``_dispatch_press`` already
+    drops a press predating a recorded commanded start, and the hub always
+    records one before resolving the future that unblocks ``confirm()``. What
+    this fix actually changes is the ``proofs`` assertion -- the window miss
+    cost us the EMISSION PROOF that the command reached the air, and losing
+    that clears the unverified anchor. Do not read this test as evidence that
+    a phantom press was prevented.
+    """
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "DOWN")
+    ledger.register_pending(
+        "command-late",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=3_000)],
+    )
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_LATE_START_HEARD_TIME]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+
+    # A peer bridge hears our frame BEFORE the transmitting bridge's status
+    # reaches HA. The entry is still pending, so the capture is held.
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        1_000,
+        _frame((1,), "DOWN"),
+        _LATE_START_HEARD_TIME,
+    )
+    assert dispatched == []
+
+    # Production ALWAYS records a commanded start before resume_holds: the hub
+    # calls record_commanded_start immediately before resolving the `started`
+    # future that unblocks confirm(). Omitting it measures a path the running
+    # integration never takes.
+    now_value[0] = _LATE_START_CONFIRM_TIME
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), _LATE_START_CONFIRM_TIME)
+    ledger.confirm("command-late", _LATE_START_CONFIRM_TIME)
+    consumer.resume_holds("command-late")
+
+    # Our own transmission must never surface as a physical remote press.
+    assert dispatched == []
+    # Heard on a different bridge than the one that sent it: still proof the
+    # command actually reached the air.
+    assert proofs == ["command-late"]
+
+
+_BURST_COMMAND_COUNT: Final = 7
+_BURST_RF_SPACING_SECONDS: Final = 0.25
+_BURST_STATUS_LAG_SECONDS: Final = 1.2
+
+
+def test_concurrent_burst_across_bridges_dispatches_no_phantom_press() -> None:
+    """Seven overlapping commands with lagging start statuses stay ours.
+
+    This is the Night sweep's real workload: one parallel burst across several
+    covers, each transmitted by a different bridge, every frame overheard by
+    peer bridges, and every "started" status delayed behind the RF it
+    describes.
+
+    As above, the discriminating assertion is ``proofs``, not ``dispatched``:
+    ``_commanded_starts`` already suppresses the press. This pins that seven
+    concurrent commands each retain proof they reached the air.
+    """
+    ledger = CommandLedger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_LATE_START_HEARD_TIME]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+
+    commands = []
+    for index in range(_BURST_COMMAND_COUNT):
+        channels = (index + 1,)
+        command_id = f"burst-{index}"
+        sender = f"bridge-{index}"
+        heard_at = _LATE_START_HEARD_TIME + index * _BURST_RF_SPACING_SECONDS
+        ledger.register_pending(
+            command_id,
+            sender,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    _required_signature(channels, "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=3_000,
+                ),
+            ],
+        )
+        commands.append((command_id, channels, sender, heard_at))
+
+    # Every frame goes on air and is overheard by a PEER bridge first.
+    for _command_id, channels, sender, heard_at in commands:
+        now_value[0] = heard_at
+        listener = f"listener-{sender}"
+        consumer.handle_rx(
+            listener,
+            _BOOT,
+            int(heard_at * _MILLISECONDS_PER_SECOND),
+            _frame(channels, "DOWN"),
+            heard_at,
+        )
+    # Nothing may dispatch while the commands are still unconfirmed.
+    assert dispatched == []
+
+    # Each bridge's "started" status arrives only after its own RF was heard.
+    for command_id, channels, _sender, heard_at in commands:
+        confirmed_at = heard_at + _BURST_STATUS_LAG_SECONDS
+        now_value[0] = confirmed_at
+        consumer.record_commanded_start(_REMOTE_KEY, frozenset(channels), confirmed_at)
+        ledger.confirm(command_id, confirmed_at)
+        consumer.resume_holds(command_id)
+
+    # Not one of the seven may surface as a physical remote press.
+    assert dispatched == []
+    assert sorted(proofs) == sorted(command_id for command_id, *_ in commands)
+
+
+_GENUINE_PRESS_REGISTER_TIME: Final = 100.0
+_GENUINE_PRESS_HEARD_TIME: Final = 105.0
+_GENUINE_PRESS_LATE_CONFIRM_TIME: Final = 130.0
+
+
+def test_held_capture_far_before_its_handoff_is_still_a_real_press() -> None:
+    """A signature-colliding press outside the status-lag envelope dispatches.
+
+    A timed move registers its own ``stop_raw``, so a person pressing STOP on
+    the physical remote produces a capture IDENTICAL to a frame we have
+    registered, and it is held like any other. Trusting every held capture
+    unconditionally would silently absorb that press — bypassing the takeover
+    machinery entirely — for as long as the bridge took to confirm, up to the
+    30 s started-status timeout. Ownership is therefore bounded to the plausible
+    status lag; a press heard 25 s before the eventual handoff is a person.
+    """
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "command-timed",
+        _BRIDGE_A,
+        (1,),
+        "STOP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=3_000)],
+    )
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_GENUINE_PRESS_HEARD_TIME]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        1_000,
+        _frame((1,), "STOP"),
+        _GENUINE_PRESS_HEARD_TIME,
+    )
+    assert dispatched == []  # held while pending, as before
+
+    # The bridge only confirms 25 s later: far outside any plausible lag.
+    now_value[0] = _GENUINE_PRESS_LATE_CONFIRM_TIME
+    ledger.confirm("command-timed", _GENUINE_PRESS_LATE_CONFIRM_TIME)
+    consumer.resume_holds("command-timed")
+
+    assert [event.button for event in dispatched] == ["STOP"]
+    assert proofs == []
+
+
+_LATE_ANCHOR_STOP_OFFSET_MS: Final = 15_000
+_LATE_ANCHOR_HANDOFF: Final = 200.0
+_LATE_ANCHOR_SKEW_SECONDS: Final = 1.2
+
+
+def test_stop_echo_arriving_before_its_late_anchored_window_stays_ours() -> None:
+    """A stop_raw echo is ours even when the whole entry was anchored late.
+
+    A stop_raw frame fires stop_after_ms AFTER the action frame, so by the time
+    its own echo is heard the command has long since confirmed — it never goes
+    through the held-capture path, only through match(). The anchor that built
+    every window in the entry is `recv_time - age_ms/1000`, which cannot correct
+    the MQTT transport leg and so runs late; the STOP's window inherits that
+    same shift. Without lower-edge tolerance our own STOP echo lands before its
+    own window and is classified as somebody stopping the blind by hand, which
+    freezes the travel model mid-flight while the motor runs on to its limit.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed-move",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
+            LedgerFrameSpec(stop, offset_ms=_LATE_ANCHOR_STOP_OFFSET_MS, airtime_ms=3_000),
+        ],
+    )
+    # The status lagged, so confirm() anchors every window late by that skew.
+    ledger.confirm("timed-move", _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS)
+
+    # Our own STOP goes on air at its TRUE scheduled time, before the window
+    # the late anchor implies.
+    true_stop_time = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_STOP_OFFSET_MS / 1_000
+    assert ledger.match(stop, true_stop_time) == ("confirmed", "timed-move", _BRIDGE_A)
+
+    # Tolerance is lower-edge only: long after the train ends it is a real press.
+    assert ledger.match(stop, true_stop_time + 60.0) is None
+
+
+def test_own_stop_echo_is_not_dispatched_as_a_press_through_the_consumer() -> None:
+    """End-to-end: our own STOP echo must not reach dispatch as a press.
+
+    This is the assertion that actually protects the reported bug, and it is
+    deliberately at CONSUMER level rather than calling ``ledger.match``
+    directly. ``_dispatch_press``'s commanded-start guard cannot help here: it
+    only drops presses heard BEFORE a commanded start, and a stop_raw echo is
+    heard ``stop_after_ms`` AFTER it. So unlike the held-capture path -- where
+    that guard already suppressed the press and this change only restores the
+    emission proof -- here the window is the sole line of defence, and a late
+    anchor shifting it past our own echo dispatches a phantom STOP that freezes
+    the travel model mid-flight while the motor runs on to its limit.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
+            LedgerFrameSpec(stop, offset_ms=_LATE_ANCHOR_STOP_OFFSET_MS, airtime_ms=3_000),
+        ],
+    )
+    dispatched: list[HeardEvent] = []
+    anchored_at = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS
+    now_value = [anchored_at]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+    consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), anchored_at)
+    ledger.confirm("timed", anchored_at)
+
+    true_stop_time = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_STOP_OFFSET_MS / 1_000
+    now_value[0] = true_stop_time
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(true_stop_time * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        true_stop_time,
+    )
+
+    assert dispatched == []

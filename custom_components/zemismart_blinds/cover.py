@@ -236,7 +236,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         _ensure_remote_device, and repeating them here would let one cover
         rename the shared device.
         """
-        return DeviceInfo(identifiers={(DOMAIN, self._remote_entry_id)})
+        return DeviceInfo(identifiers={(DOMAIN, self._config.remote.key)})
 
     @property
     def available(self) -> bool:
@@ -1135,7 +1135,7 @@ class ZemismartAggregateCover(CoverEntity):
         _ensure_remote_device, and repeating them here would let one cover
         rename the shared device.
         """
-        return DeviceInfo(identifiers={(DOMAIN, self._remote_entry_id)})
+        return DeviceInfo(identifiers={(DOMAIN, self._config.remote.key)})
 
     async def async_added_to_hass(self) -> None:
         """Register with the coordinator and the hub's takeover machinery."""

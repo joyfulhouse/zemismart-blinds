@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-25
+
+### Fixed
+
+- **The integration no longer reads its own STOP transmission as a physical remote press.**
+  `started_at` is derived as `recv_time - age_ms/1000`: `age_ms` corrects the firmware's own
+  queueing delay, but nothing corrects the MQTT transport leg between the bridge publishing
+  its status and Home Assistant's callback running. The anchor is therefore biased **late and
+  never early**, and every emission window built from it sits later than the RF it describes
+  — measured at **1.117 s** during a concurrent seven-cover burst, against 0.75 s of slack.
+
+  A `stop_raw` frame fires `stop_after_ms` after its action frame, so its echo arrives long
+  after the command confirmed and is classified through the ordinary window path — where
+  that shift pushed our own STOP outside its own window. It was then dispatched as a
+  physical press, freezing HA's travel model partway while the motor ran on to its limit,
+  and leaving HA reporting a partial position for a cover that had physically closed. The
+  `_dispatch_press` commanded-start guard cannot help: it only drops presses heard *before*
+  a commanded start, and this echo arrives after one.
+
+  Confirmed windows are now **asymmetric** — the lower edge absorbs
+  `_LEDGER_ANCHOR_LAG_SECONDS`, the upper edge keeps its original tight slack, since the
+  bias only ever runs one way. Verified end-to-end at consumer level: against the previous
+  code the phantom `STOP` is dispatched; with this change it is not. A concurrent
+  seven-cover burst regression test covers the workload that exposed it — single-cover
+  operation never showed it.
+
+  `_LEDGER_ANCHOR_LAG_SECONDS` is calibrated against a single measurement and is **not** an
+  architectural ceiling. A capture matching a known signature but falling outside its window
+  is logged, so a load pattern exceeding the bound is visible rather than silently becoming
+  a phantom press again. Note also the pre-existing `_COMMANDED_START_TTL_SECONDS` (60 s)
+  guard, which blanket-suppresses same-remote overlapping-channel presses heard before a
+  commanded start; it is unchanged here and is a far larger blanket than anything added.
+
+- The remote's device is now identified by the durable remote key (`prefix:remote_id`, the
+  same identity as the entry's unique id) instead of the config **entry id**. Existing
+  devices are re-identified **in place** on the next setup, so `device_id`, area overrides,
+  name, and all attached entities are preserved — automations targeting the remote device
+  keep working. Previously, deleting and re-adding a remote minted a new entry id and
+  therefore a brand-new device, silently breaking every `device_id` target while
+  `entity_id` targets returned intact. A relearn — the one flow that changes an existing
+  entry's identity — re-keys the device in place for the same reason.
+
+  Scope: `device_id` survives a delete-and-re-add (Home Assistant restores the row by
+  identifier), but a user's **area override does not** — the restored device is treated as
+  a creation and the remote's configured area is re-applied. Rolling back to 0.5.1 churns
+  `device_id` once as the old code recreates the device under the retired entry-id key;
+  no duplicates or orphans accumulate.
+
+### Notes
+
+- **Correction to the 0.3.1 release notes (retroactive).** 0.3.1 moved covers into the
+  remote's device and pruned the pre-0.3.1 per-cover child devices. Those notes promised
+  only that friendly names and entity ids stay byte-stable; they did not say that the
+  per-cover **child devices were removed**, so any automation or script targeting a cover
+  by `device_id` stopped matching from 0.3.1 onward and silently did nothing. Retarget
+  those actions **by `entity_id`** (cover entity ids were preserved throughout), or target
+  the remote's device. 0.5.0 did **not** cause this: its migration preserves cover
+  identity, and `unique_id` values that look freshly minted are ULIDs created when the
+  covers were first onboarded.
+
+[0.5.2]: https://github.com/joyfulhouse/zemismart-blinds/releases/tag/v0.5.2
+
 ## [0.5.1] - 2026-07-24
 
 ### Changed

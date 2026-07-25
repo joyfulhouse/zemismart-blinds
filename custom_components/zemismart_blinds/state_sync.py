@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 FrameSignature = tuple[str, frozenset[int], str]
 LedgerMatch = tuple[Literal["pending", "confirmed"], str, str]
 
+_LOGGER = logging.getLogger(__name__)
+
 _MOVEMENT_BUTTONS: Final = frozenset({"UP", "DOWN", "STOP"})
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
 _UINT32_MODULUS: Final = 1 << 32
@@ -26,6 +29,18 @@ _CLOCK_LONG_GAP_SECONDS: Final = 1_036_800.0
 _CLOCK_MAX_PROJECTION_LAG_SECONDS: Final = 30.0
 
 _LEDGER_WINDOW_SLACK_SECONDS: Final = 0.75
+# How late a confirmed window's own anchor may be. `started_at` is derived as
+# `recv_time - age_ms/1000`: age_ms corrects the FIRMWARE's queueing delay, but
+# nothing corrects the MQTT transport leg between the bridge publishing its
+# status and HA's callback running. The anchor is therefore biased LATE and
+# never early, so every window built from it sits later than the RF it
+# describes -- measured at 1.117 s during a concurrent seven-cover burst.
+#
+# Applied to the LOWER edge only. Widening the upper edge would suppress
+# genuine presses long after we stopped transmitting, which the late bias never
+# justifies. NOT an architectural ceiling: heavier congestion can exceed it, so
+# near-misses are logged rather than passing silently.
+_LEDGER_ANCHOR_LAG_SECONDS: Final = 5.0
 _LEDGER_ENTRY_TTL_SECONDS: Final = 60.0
 _LEDGER_PENDING_TTL_SECONDS: Final = 30.0
 _DISPLACED_STOP_DRAIN_SECONDS: Final = 30.0
@@ -397,7 +412,32 @@ class CommandLedger:
                 for window in entry.windows
             ):
                 return "confirmed", entry.command_id, entry.bridge_id
+        self._log_near_miss(signature, heard_at)
         return None
+
+    def _log_near_miss(self, signature: FrameSignature, heard_at: float) -> None:
+        """Report a capture we own the signature of but classified as a press.
+
+        _LEDGER_ANCHOR_LAG_SECONDS is calibrated against a single measurement.
+        If real skew ever exceeds it this is the only warning: the capture
+        becomes a phantom physical press and silently takes a cover over.
+        """
+        for entry in self._entries.values():
+            if entry.phase != "confirmed":
+                continue
+            for window in entry.windows:
+                if window.signature != signature:
+                    continue
+                _LOGGER.debug(
+                    "state_sync: %s capture outside command %s window "
+                    "[%.3f, %.3f] by %.3fs; treating as a physical press",
+                    signature[2],
+                    entry.command_id,
+                    window.starts_at,
+                    window.ends_at,
+                    min(abs(heard_at - window.starts_at), abs(heard_at - window.ends_at)),
+                )
+                return
 
     def gc(self, now: float) -> None:
         """Expire stale entries and reassert bridge and global bounds."""
@@ -415,11 +455,15 @@ class CommandLedger:
 
     @staticmethod
     def _window(frame: LedgerFrameSpec, handoff: float) -> _LedgerWindow:
-        """Build one symmetric-slack confirmed frame window."""
+        """Build one confirmed frame window: slack above, anchor lag below."""
         frame_handoff = handoff + frame.offset_ms / _MILLISECONDS_PER_SECOND
         return _LedgerWindow(
             signature=frame.signature,
-            starts_at=frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS,
+            # Asymmetric by design -- a frame can be heard well BEFORE the
+            # window its own late anchor implies. Most acutely a stop_raw
+            # frame, which fires stop_after_ms after the action frame and so is
+            # always classified here rather than while its command is pending.
+            starts_at=(frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS),
             ends_at=(
                 frame_handoff
                 + frame.airtime_ms / _MILLISECONDS_PER_SECOND

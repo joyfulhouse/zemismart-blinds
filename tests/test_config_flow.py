@@ -1918,6 +1918,22 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
         ],
     )
     original_covers = [dict(row) for row in stored_cover_rows(entry)]
+    # A relearn is the one flow that changes an EXISTING entry's remote
+    # identity, and the remote device is keyed by that identity. The device_id
+    # is what automations target, so it must survive -- along with any area the
+    # user set on the device page.
+    from homeassistant.helpers import device_registry as dr
+
+    registry = dr.async_get(hass)
+    original_key = RemoteConfig.from_entry(entry.data).key
+    # Model the deployed registry: _ensure_remote_device has already keyed this
+    # remote's device by its identity, and the user set an area on it.
+    device_before = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, original_key)},
+        name="Kitchen remote",
+    )
+    registry.async_update_device(device_before.id, area_id="user_override")
     fake = FakeMqtt()
     install_mqtt(monkeypatch, fake)
     result = await hass.config_entries.flow.async_init(
@@ -1971,6 +1987,13 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
     assert entry.title == "Renamed remote"
     assert stored_cover_rows(entry) == original_covers
     assert not entry.subentries
+    # Re-identified in place: same registry row, same device_id, same area.
+    device_after = registry.async_get_device(identifiers={(DOMAIN, updated.key)})
+    assert device_after is not None
+    assert device_after.id == device_before.id
+    assert device_after.area_id == "user_override"
+    # The retired identity no longer resolves, so nothing is left to prune.
+    assert registry.async_get_device(identifiers={(DOMAIN, original_key)}) is None
 
 
 @pytest.mark.asyncio
