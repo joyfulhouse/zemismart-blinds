@@ -2284,7 +2284,6 @@ class ZemismartHub:
             tuple(sorted(command.channels)),
             button,
             frames,
-            self._now(),
         )
         command.ledger_registered = True
 

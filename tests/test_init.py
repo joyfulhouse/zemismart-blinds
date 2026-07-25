@@ -1629,6 +1629,12 @@ async def test_remote_device_survives_entry_delete_and_readd(
     original_device_id = original.id
     registry.async_update_device(original.id, area_id="pantry")
     await async_unload_entry(hass, first)
+    # Drive the device through HA's deleted_devices table, exactly as removing
+    # the config entry would. Without this the second entry would simply adopt
+    # a still-ACTIVE row, which is a different code path and would pass even if
+    # restoration-by-identifier did not work at all.
+    registry.async_remove_device(original.id)
+    assert registry.async_get_device(identifiers={(DOMAIN, remote_key)}) is None
 
     # Same physical remote, re-added: a different entry_id entirely.
     second = _rekey_entry("entry-after-readd")
@@ -1638,7 +1644,15 @@ async def test_remote_device_survives_entry_delete_and_readd(
 
     readded = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
     assert readded is not None
+    # The point of the durable key: HA restores the deleted row by identifier,
+    # so the device_id every automation targets survives a delete-and-re-add.
     assert readded.id == original_device_id
-    assert readded.area_id == "pantry"
+    # KNOWN LIMITATION, asserted so it cannot change silently: a user's area
+    # override does NOT survive a full delete. _ensure_remote_device sees no
+    # ACTIVE device, treats the restored row as a creation, and re-applies the
+    # remote's configured area over it. Not a regression -- before the durable
+    # key a re-add minted an entirely new device and lost the override too --
+    # but device_id survival is the only guarantee this change makes.
+    assert readded.area_id == "living_room"
 
     await async_unload_entry(hass, second)

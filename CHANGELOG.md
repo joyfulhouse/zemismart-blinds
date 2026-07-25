@@ -9,47 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The integration no longer loses proof that its own command reached the air.** A
-  capture held while its command was still
-  pending is now resolved against *that command* rather than re-derived from the confirmed
-  emission window. The window's bounds come from the bridge's `started` status, which is
-  published separately from the RF it describes and can arrive *after* a peer bridge has
-  already reported hearing the frame — measured at **1.117 s** of skew during a concurrent
-  seven-cover burst, against 0.75 s of window slack. The window therefore rejected our own
-  frame, costing the command its emission proof — which clears the unverified anchor and can
-  drive a cover to `unknown`. Only visible under concurrent multi-remote bursts; a burst
-  regression test now covers that workload.
+- **The integration no longer reads its own STOP transmission as a physical remote press.**
+  `started_at` is derived as `recv_time - age_ms/1000`: `age_ms` corrects the firmware's own
+  queueing delay, but nothing corrects the MQTT transport leg between the bridge publishing
+  its status and Home Assistant's callback running. The anchor is therefore biased **late and
+  never early**, and every emission window built from it sits later than the RF it describes
+  — measured at **1.117 s** during a concurrent seven-cover burst, against 0.75 s of slack.
 
-  **Scope of this first bullet, stated precisely:** on the held-capture path it does NOT
-  prevent a phantom press. `_dispatch_press` already drops a press predating a recorded
-  commanded start, and the hub always records one before resolving the future that unblocks
-  confirmation — verified by running the new tests against the pre-change code, where the
-  no-press assertions pass and only the emission-proof assertions fail. The press
-  suppression that does matter is the next bullet.
+  A `stop_raw` frame fires `stop_after_ms` after its action frame, so its echo arrives long
+  after the command confirmed and is classified through the ordinary window path — where
+  that shift pushed our own STOP outside its own window. It was then dispatched as a
+  physical press, freezing HA's travel model partway while the motor ran on to its limit,
+  and leaving HA reporting a partial position for a cover that had physically closed. The
+  `_dispatch_press` commanded-start guard cannot help: it only drops presses heard *before*
+  a commanded start, and this echo arrives after one.
 
-  Ownership of a held capture is bounded to a plausible status lag
-  (`_LEDGER_ANCHOR_LAG_SECONDS`, 5 s), so a command cannot claim a capture indefinitely.
-  Note that a genuine press in that region is separately suppressed by the pre-existing
-  `_COMMANDED_START_TTL_SECONDS` (60 s) guard, which is a far larger blanket than anything
-  introduced here and is unchanged by this release.
+  Confirmed windows are now **asymmetric** — the lower edge absorbs
+  `_LEDGER_ANCHOR_LAG_SECONDS`, the upper edge keeps its original tight slack, since the
+  bias only ever runs one way. Verified end-to-end at consumer level: against the previous
+  code the phantom `STOP` is dispatched; with this change it is not. A concurrent
+  seven-cover burst regression test covers the workload that exposed it — single-cover
+  operation never showed it.
 
-- **The mid-travel model freeze on covers whose remote also runs timed partial moves is
-  fixed too.** Same root cause, different sub-case. The held-capture fix above only reaches
-  frames still *pending* when their echo arrives — true of an action frame, emitted within
-  ~250 ms, but not of a `stop_raw` frame, emitted `stop_after_ms` later when the command
-  has long since confirmed. That echo arrives through the ordinary `match()` window path,
-  where the same late anchor has shifted *every* window in the entry. Confirmed windows are
-  now **asymmetric**: the lower edge absorbs `_LEDGER_ANCHOR_LAG_SECONDS` of anchor lag
-  while the upper edge keeps its original tight slack, because `started_at` is biased late
-  and never early. Our own STOP echo is no longer read as a person stopping the blind by
-  hand — which froze HA's travel model partway while the motor ran on to its limit, leaving
-  HA reporting a partial position for a cover that had physically closed.
-
-  This is the bullet that closes the reported incident. The commanded-start guard gives no
-  protection here — it only drops presses heard *before* a commanded start, and a `stop_raw`
-  echo is heard `stop_after_ms` *after* one — so the window is the only line of defence.
-  Verified end-to-end at consumer level: against the pre-change code the phantom `STOP` is
-  dispatched, and with the fix it is not.
+  `_LEDGER_ANCHOR_LAG_SECONDS` is calibrated against a single measurement and is **not** an
+  architectural ceiling. A capture matching a known signature but falling outside its window
+  is logged, so a load pattern exceeding the bound is visible rather than silently becoming
+  a phantom press again. Note also the pre-existing `_COMMANDED_START_TTL_SECONDS` (60 s)
+  guard, which blanket-suppresses same-remote overlapping-channel presses heard before a
+  commanded start; it is unchanged here and is a far larger blanket than anything added.
 
 - The remote's device is now identified by the durable remote key (`prefix:remote_id`, the
   same identity as the entry's unique id) instead of the config **entry id**. Existing
@@ -57,7 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, and all attached entities are preserved — automations targeting the remote device
   keep working. Previously, deleting and re-adding a remote minted a new entry id and
   therefore a brand-new device, silently breaking every `device_id` target while
-  `entity_id` targets returned intact.
+  `entity_id` targets returned intact. A relearn — the one flow that changes an existing
+  entry's identity — re-keys the device in place for the same reason.
+
+  Scope: `device_id` survives a delete-and-re-add (Home Assistant restores the row by
+  identifier), but a user's **area override does not** — the restored device is treated as
+  a creation and the remote's configured area is re-applied. Rolling back to 0.5.1 churns
+  `device_id` once as the old code recreates the device under the retired entry-id key;
+  no duplicates or orphans accumulate.
 
 ### Notes
 

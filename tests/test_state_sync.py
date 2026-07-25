@@ -953,7 +953,6 @@ def test_held_capture_far_before_its_handoff_is_still_a_real_press() -> None:
         (1,),
         "STOP",
         [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=3_000)],
-        _GENUINE_PRESS_REGISTER_TIME,
     )
     dispatched: list[HeardEvent] = []
     proofs: list[str] = []
@@ -976,30 +975,6 @@ def test_held_capture_far_before_its_handoff_is_still_a_real_press() -> None:
 
     assert [event.button for event in dispatched] == ["STOP"]
     assert proofs == []
-
-
-def test_held_capture_trust_bound_is_inclusive_at_its_edge() -> None:
-    """Pin the exact cutoff: at the bound we own it, just past it we do not."""
-    signature = _required_signature((1,), "STOP")
-
-    def resolve(gap: float) -> tuple[str, str, str] | None:
-        ledger = CommandLedger()
-        ledger.register_pending(
-            "edge",
-            _BRIDGE_A,
-            (1,),
-            "STOP",
-            [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=3_000)],
-            _GENUINE_PRESS_REGISTER_TIME,
-        )
-        handoff = _GENUINE_PRESS_REGISTER_TIME + state_sync_module._LEDGER_ANCHOR_LAG_SECONDS
-        ledger.confirm("edge", handoff)
-        return ledger.resolve_held("edge", signature, handoff - gap)
-
-    bound = state_sync_module._LEDGER_ANCHOR_LAG_SECONDS
-    assert resolve(bound) is not None
-    assert resolve(bound - 0.5) is not None
-    assert resolve(bound + 0.001) is None
 
 
 _LATE_ANCHOR_STOP_OFFSET_MS: Final = 15_000
@@ -1031,7 +1006,6 @@ def test_stop_echo_arriving_before_its_late_anchored_window_stays_ours() -> None
             LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
             LedgerFrameSpec(stop, offset_ms=_LATE_ANCHOR_STOP_OFFSET_MS, airtime_ms=3_000),
         ],
-        _LATE_ANCHOR_HANDOFF,
     )
     # The status lagged, so confirm() anchors every window late by that skew.
     ledger.confirm("timed-move", _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS)
@@ -1070,7 +1044,6 @@ def test_own_stop_echo_is_not_dispatched_as_a_press_through_the_consumer() -> No
             LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
             LedgerFrameSpec(stop, offset_ms=_LATE_ANCHOR_STOP_OFFSET_MS, airtime_ms=3_000),
         ],
-        _LATE_ANCHOR_HANDOFF,
     )
     dispatched: list[HeardEvent] = []
     anchored_at = _LATE_ANCHOR_HANDOFF + _LATE_ANCHOR_SKEW_SECONDS
