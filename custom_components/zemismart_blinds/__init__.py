@@ -399,8 +399,10 @@ def _repair_v2_registry_skew(
 def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> None:
     """Create the remote's device; every cover entity attaches to it.
 
-    The configured area applies at creation only: a user's later device-page
-    override must survive reloads, so an existing device is never re-homed.
+    The configured area SEEDS a genuinely new device and nothing else: a user's
+    later device-page override must survive reloads, re-keys and a full
+    delete-and-re-add, so neither an existing nor a restored device is ever
+    re-homed.
     """
     from homeassistant.helpers import device_registry as dr
 
@@ -423,6 +425,18 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
     # Creation detection must precede get_or_create: a user's cleared area
     # (area_id None on an EXISTING device) must never be re-assigned.
     existed = existing is not None
+    # A row HA still holds in deleted_devices is RESTORED, not created.
+    # DeletedDeviceEntry deliberately carries area_id, name_by_user and labels
+    # across the delete and to_device_entry replays them, so the override is
+    # already back on the row get_or_create hands us — re-applying the
+    # configured area would be us overwriting the user, not HA losing them.
+    # This is the identical lookup get_or_create itself performs to decide
+    # restore-vs-create, and it must run FIRST because a successful restore
+    # pops the entry out of deleted_devices. Asking the registry whether it
+    # holds the row is the only sound test: a restored device the user had
+    # CLEARED comes back with area_id None, so the row's own fields cannot
+    # tell restoration from creation.
+    restored = not existed and registry.deleted_devices.get_entry({identifier}) is not None
     device = registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={identifier},
@@ -430,7 +444,7 @@ def _ensure_remote_device(hass: HomeAssistant, entry: ZemismartConfigEntry) -> N
         model="RF433 remote",
         name=remote.name,
     )
-    if not existed:
+    if not existed and not restored:
         registry.async_update_device(device.id, area_id=remote.area_id)
 
 

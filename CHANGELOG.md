@@ -108,11 +108,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entity_id` targets returned intact. A relearn — the one flow that changes an existing
   entry's identity — re-keys the device in place for the same reason.
 
-  Scope: `device_id` survives a delete-and-re-add (Home Assistant restores the row by
-  identifier), but a user's **area override does not** — the restored device is treated as
-  a creation and the remote's configured area is re-applied. Rolling back to 0.5.1 churns
-  `device_id` once as the old code recreates the device under the retired entry-id key;
-  no duplicates or orphans accumulate.
+  Scope: `device_id` survives a delete-and-re-add, because Home Assistant restores the
+  deleted row by identifier. Rolling back to 0.5.1 churns `device_id` once as the old code
+  recreates the device under the retired entry-id key; no duplicates or orphans accumulate.
+
+- **A user's device-page area override now survives a delete-and-re-add too** (#18).
+  Decision: a restored device keeps its area; the remote's configured area seeds a
+  genuinely **new** device and nothing else.
+
+  Three things settle it. Home Assistant's own deleted-device record deliberately carries
+  `area_id`, the user's rename and labels across the delete and replays them for 30 days on
+  restore — the override was never lost, we were overwriting it. We already preserve the
+  area everywhere else the row survives, including the in-place re-key above, and the
+  rename and labels already survived this same delete because we never touched them; area
+  was the lone exception. And "a full delete resets to defaults" does not describe what
+  happens here: if a delete really reset the device, `device_id` would not survive either.
+  A half-reset — id and name persist, area silently does not — is worse than either whole
+  behaviour, because nothing tells the user which of their settings are the durable ones.
+
+  The cost is the opposite case: someone who deletes and re-adds a remote specifically to
+  clear a bad area must now clear it on the device page instead. That is one visible click,
+  against an override that used to disappear with no indication it ever had.
+
+  New versus restored is decided by asking the device registry whether it still holds the
+  deleted row — the identical lookup Home Assistant itself performs to choose between
+  restoring and creating. The row's own fields cannot answer it: a restored device whose
+  area the user had **cleared** comes back with no area, exactly like a fresh one. Both
+  cases are pinned by tests.
 
 ### Notes
 

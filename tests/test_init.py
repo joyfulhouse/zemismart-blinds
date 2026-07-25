@@ -1647,12 +1647,80 @@ async def test_remote_device_survives_entry_delete_and_readd(
     # The point of the durable key: HA restores the deleted row by identifier,
     # so the device_id every automation targets survives a delete-and-re-add.
     assert readded.id == original_device_id
-    # KNOWN LIMITATION, asserted so it cannot change silently: a user's area
-    # override does NOT survive a full delete. _ensure_remote_device sees no
-    # ACTIVE device, treats the restored row as a creation, and re-applies the
-    # remote's configured area over it. Not a regression -- before the durable
-    # key a re-add minted an entirely new device and lost the override too --
-    # but device_id survival is the only guarantee this change makes.
-    assert readded.area_id == "living_room"
+    # A RESTORED row is not a creation. HA's DeletedDeviceEntry deliberately
+    # carries area_id, name_by_user and labels across a delete and replays them
+    # on restore, so the user's override is still there when we get the row
+    # back -- re-applying the configured area would be us overwriting it, not
+    # HA failing to keep it. The configured area seeds a NEW device only.
+    assert readded.area_id == "pantry"
+
+    await async_unload_entry(hass, second)
+
+
+@pytest.mark.asyncio
+async def test_cleared_area_survives_entry_delete_and_readd(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user's explicit NO-area choice also survives a delete-and-re-add.
+
+    The sharp case for restore detection. A restored row that the user had
+    cleared comes back with ``area_id is None`` -- indistinguishable, by that
+    field alone, from a freshly minted device. Anything keying off "the area
+    looks unset" would re-home this device into the configured area and
+    silently undo the user's choice, so restore must be detected by asking
+    the registry whether it still holds the row, not by inspecting the row.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        _topic: str,
+        _callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        return lambda: None
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+
+    def make_forward(target: ConfigEntry[RemoteRuntime]) -> Any:
+        async def forward(
+            _entry: ConfigEntry[RemoteRuntime],
+            _platforms: list[Any],
+        ) -> None:
+            await cover_module.async_setup_entry(
+                hass,
+                target,
+                cast("AddConfigEntryEntitiesCallback", lambda *a, **k: None),
+            )
+
+        return forward
+
+    first = _rekey_entry("entry-before-cleared-readd")
+    add_to_manager(hass, first)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", make_forward(first))
+    assert await async_setup_entry(hass, first)
+    registry = dr.async_get(hass)
+    remote_key = first.unique_id
+    assert remote_key is not None
+    original = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
+    assert original is not None
+    assert original.area_id == "living_room"
+    registry.async_update_device(original.id, area_id=None)
+    await async_unload_entry(hass, first)
+    registry.async_remove_device(original.id)
+
+    second = _rekey_entry("entry-after-cleared-readd")
+    add_to_manager(hass, second)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", make_forward(second))
+    assert await async_setup_entry(hass, second)
+
+    readded = registry.async_get_device(identifiers={(DOMAIN, remote_key)})
+    assert readded is not None
+    assert readded.id == original.id
+    assert readded.area_id is None
 
     await async_unload_entry(hass, second)
