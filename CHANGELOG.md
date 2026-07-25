@@ -66,6 +66,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranked: a capture that fits without spending the anchor-lag budget wins outright, and
   only when nothing fits on those terms is the budget spent.
 
+- **Our own repeats are no longer read as a physical press when one bridge serves several
+  blinds** (#21). A bridge holding more than one target dispatches them round-robin, one slot
+  each, so a command's own repeat train is spread out rather than sent back-to-back. The
+  own-emission window's upper edge was computed as if the train were always contiguous, so past
+  four concurrent targets our own later repeats fell outside it and were dispatched as a physical
+  remote press — invalidating the in-flight commanded motion and either re-anchoring travel at a
+  wrong instant or marking the cover unknown. Measured on air: at seven concurrent targets our own
+  frames were still going out 8.1 s after their handoff, against a window that closed at 3.75 s.
+
+  The upper edge now stretches by the round-robin concurrency actually observed, counted at
+  classification time from ledger state — not fixed at registration, because the peers that
+  stretch a train are usually admitted after it. Only the first repeat keeps native timing, so the
+  widening is `(repeats - 1) x (concurrent - 1)` slots rather than a blanket multiply of the whole
+  train, and it collapses to exactly today's behaviour when a bridge serves one target. It is
+  bounded by the firmware's sixteen-target limit so a miscount cannot widen a window without end.
+  The lower edge, and its anchor-lag tolerance from 0.5.2, are untouched.
+
+  The cost is honest and bounded: while the window is open a genuine same-signature press is
+  absorbed, so takeover detection at seven concurrent targets is suppressed for about 15.7 s
+  rather than 3.75 s. Widening remains the safe direction — the alternative is asserting a
+  takeover we cannot distinguish from our own transmission.
+
+### Documentation
+
+- **The RF-repeats selector now states the takeover-responsiveness tradeoff** (#20). `repeats`
+  is the number of complete press bursts the bridge puts on air — each already a full OEM burst
+  of embedded frame repeats, not a single frame. Raising it improves reliability for distant or
+  obstructed blinds, but each extra burst the bridge owes widens the interval in which a genuine
+  physical STOP press near a just-issued overlapping command is classified as our own flushed
+  emission instead of a takeover — about 9.5 s at the default 3, growing to about 26.5 s at the
+  maximum 20. That coupling was invisible at the point of choice; the `repeats` field's help
+  text in the add and reconfigure flows now quantifies it. This is documentation only: widening
+  the window is the correct, physically honest direction (see #16), so the fix is to inform the
+  choice, not bound it. The README note added after 0.5.2 covers the same tradeoff for readers
+  who never open the dialog.
+
 ## [0.5.2] - 2026-07-25
 
 ### Fixed
