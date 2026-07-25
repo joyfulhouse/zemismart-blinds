@@ -687,9 +687,17 @@ class CommandLedger:
     def _log_near_miss(self, signature: FrameSignature, heard_at: float) -> None:
         """Report a capture we own the signature of but classified as a press.
 
-        _LEDGER_ANCHOR_LAG_SECONDS is calibrated against a single measurement.
-        If real skew ever exceeds it this is the only warning: the capture
-        becomes a phantom physical press and silently takes a cover over.
+        Emitted at WARNING because it really is the only warning: the capture
+        becomes a phantom physical press and takes a cover over, and every
+        other symptom of that is silent -- no error, no unavailable, just a
+        position that stops matching the window. It stayed invisible at DEBUG
+        through two production freezes on 2026-07-25 (#21, #23), which is
+        precisely the evidence this line exists to provide.
+
+        A genuine press landing just outside a window we own logs here too.
+        That false positive is worth accepting: it is rare, it names the
+        command and the miss distance, and the alternative is the phantom
+        takeover staying undiagnosable.
         """
         for entry in self._entries.values():
             if entry.phase != "confirmed":
@@ -697,7 +705,7 @@ class CommandLedger:
             for window in entry.windows:
                 if window.signature != signature:
                     continue
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "state_sync: %s capture outside command %s window "
                     "[%.3f, %.3f] by %.3fs; treating as a physical press",
                     signature[2],
