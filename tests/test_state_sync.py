@@ -1685,3 +1685,84 @@ def test_round_robin_concurrency_is_capped_at_the_firmware_target_limit() -> Non
         ledger.confirm(f"cap-{index}", _CAP_HANDOFF)
 
     assert ledger.match(signature, _CAP_BETWEEN_CAPPED_AND_UNCAPPED) is None
+
+
+# #22 coherence check: a TIMED move's action frame is deliberately truncated
+# below the full repeat train (models.py::_ledger_registration computes
+# `action_ms = min(train_ms, stop_after_ms + _LEDGER_REPEAT_AIRTIME_MS)`,
+# unchanged by this fix) because its fail-safe STOP promotes and preempts
+# the remaining action repeats at its wall-clock deadline. The round-robin
+# stretch must compose with that truncation rather than fight it: it is
+# applied per-window from THAT window's own `train_seconds`, so the
+# (already-shorter) action window is stretched using its own smaller
+# effective repeat count, while the untruncated STOP window -- a separate
+# window on a separate signature -- is stretched using the full count. This
+# pins that composition with a concrete number rather than only reasoning
+# about it.
+_TIMED_ROUND_ROBIN_HANDOFF: Final = 0.0
+_TIMED_ROUND_ROBIN_TARGET_COUNT: Final = 7
+_TIMED_ROUND_ROBIN_TRAIN_MS: Final = 3_000  # repeats=3, the production default
+# Chosen to avoid an exact .5 s boundary (Python's round() is round-half-to-
+# even, which would make the effective repeat count ambiguous at one).
+_TIMED_ROUND_ROBIN_STOP_AFTER_MS: Final = 1_200
+# action_ms = min(3000, 1200 + 1000) = 2200 -> train_seconds=2.2 -> repeats=2.
+# Nominal action window closes at 2.2 + 0.75 = 2.95 s. Stretched by
+# concurrency=7: (2 - 1) * (7 - 1) * 1 s = 6 s -> closes at 8.95 s.
+_TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO: Final = 5.0
+
+
+def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window() -> None:
+    """A timed move's shortened action window still stretches correctly (#22).
+
+    Without this composition, a timed move's own late-but-legitimate action
+    repeat -- already narrowed by the fail-safe-STOP truncation -- would be
+    doubly disadvantaged under concurrency: narrowed AND unstretched. This
+    proves the stretch still reaches a truncated window using that window's
+    own (smaller) repeat count, exactly as it does for an untruncated one.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed-office",
+        _ROUND_ROBIN_BRIDGE,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(
+                action,
+                offset_ms=0,
+                airtime_ms=(
+                    _TIMED_ROUND_ROBIN_STOP_AFTER_MS + state_sync_module._LEDGER_REPEAT_AIRTIME_MS
+                ),
+            ),
+            LedgerFrameSpec(
+                stop,
+                offset_ms=_TIMED_ROUND_ROBIN_STOP_AFTER_MS,
+                airtime_ms=_TIMED_ROUND_ROBIN_TRAIN_MS,
+            ),
+        ],
+    )
+    ledger.confirm("timed-office", _TIMED_ROUND_ROBIN_HANDOFF)
+    for index in range(_TIMED_ROUND_ROBIN_TARGET_COUNT - 1):
+        channels = (index + 10,)
+        ledger.register_pending(
+            f"peer-{index}",
+            _ROUND_ROBIN_BRIDGE,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    _required_signature(channels, "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=_TIMED_ROUND_ROBIN_TRAIN_MS,
+                ),
+            ],
+        )
+        ledger.confirm(f"peer-{index}", _TIMED_ROUND_ROBIN_HANDOFF)
+
+    assert ledger.match(action, _TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO) == (
+        "confirmed",
+        "timed-office",
+        _ROUND_ROBIN_BRIDGE,
+    )
