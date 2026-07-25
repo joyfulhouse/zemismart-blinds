@@ -1263,3 +1263,83 @@ def test_displaced_stop_window_absorbs_the_displaced_status_transport_lag() -> N
         "timed-move",
         _BRIDGE_A,
     )
+
+
+# Two sequential commands for the same remote, channels and button — a quick
+# repeated close_cover — carry the SAME signature. With the anchor-lag lower
+# edge their windows overlap, so an echo of the older command's own repeat
+# train lands inside the newer command's window too.
+_REPEAT_FIRST_HANDOFF: Final = 100.0
+_REPEAT_SECOND_HANDOFF: Final = 104.0
+_REPEAT_FIRST_ECHO_TIME: Final = 101.5
+
+
+def _sequential_same_signature_ledger() -> tuple[CommandLedger, FrameSignature]:
+    """Confirm two same-signature commands 4 s apart on one bridge."""
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    for command_id, handoff in (
+        ("cmd-first", _REPEAT_FIRST_HANDOFF),
+        ("cmd-second", _REPEAT_SECOND_HANDOFF),
+    ):
+        ledger.register_pending(
+            command_id,
+            _BRIDGE_A,
+            (1,),
+            "DOWN",
+            [LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000)],
+        )
+        ledger.confirm(command_id, handoff)
+    return ledger, action
+
+
+def test_overlapping_windows_credit_the_command_that_actually_emitted() -> None:
+    """An echo inside one command's own window is not stolen by its successor.
+
+    match() takes the newest entry whose window contains the capture, and the
+    anchor-lag lower edge makes the newer window reach back over the older
+    one — far enough here that the older command's own echo, sitting squarely
+    inside its NOMINAL window, is credited to a command that had not yet been
+    handed off when the frame went on air.
+
+    Press suppression is unaffected either way: both are our own frames and
+    neither dispatches. The casualty is _on_emission_proof, which fires for the
+    wrong command_id, so a cover waiting on a specific command for restore-time
+    anchor verification never gets its proof.
+
+    The tolerance is therefore ranked, not just added: a capture that fits a
+    window on its own terms outranks one that only fits by spending the lag
+    budget the late anchor might not even have needed.
+    """
+    ledger, action = _sequential_same_signature_ledger()
+
+    assert ledger.match(action, _REPEAT_FIRST_ECHO_TIME) == (
+        "confirmed",
+        "cmd-first",
+        _BRIDGE_A,
+    )
+    # The newer command still owns captures that fit it on its own terms.
+    assert ledger.match(action, _REPEAT_SECOND_HANDOFF + 1.0) == (
+        "confirmed",
+        "cmd-second",
+        _BRIDGE_A,
+    )
+
+
+def test_emission_proof_reaches_the_command_that_emitted_the_frame() -> None:
+    """The consumer proves emission for the older command, not its successor."""
+    ledger, _action = _sequential_same_signature_ledger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    consumer = _consumer(ledger, dispatched, proofs, [_REPEAT_SECOND_HANDOFF])
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_REPEAT_FIRST_ECHO_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "DOWN"),
+        _REPEAT_FIRST_ECHO_TIME,
+    )
+
+    assert dispatched == []
+    assert proofs == ["cmd-first"]

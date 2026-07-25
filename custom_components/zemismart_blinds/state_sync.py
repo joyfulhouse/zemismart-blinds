@@ -258,9 +258,18 @@ class LiveCommand:
 
 @dataclass(frozen=True, slots=True)
 class _LedgerWindow:
-    """Hold one confirmed signature's inclusive HA-time window."""
+    """Hold one confirmed signature's inclusive HA-time window.
+
+    Two lower edges, because they are different strengths of evidence.
+    ``nominal_starts_at`` is where the frame belongs if its anchor was honest;
+    ``starts_at`` additionally spends _LEDGER_ANCHOR_LAG_SECONDS on the chance
+    that it was not. Sequential commands for one cover share a signature, so
+    the spent-budget region of a newer window reaches back over an older
+    command's honest one and match() has to prefer the honest fit.
+    """
 
     signature: FrameSignature
+    nominal_starts_at: float
     starts_at: float
     ends_at: float
 
@@ -398,6 +407,7 @@ class CommandLedger:
                 # every other confirmed window gets. (Firmware stamping age_ms
                 # on "displaced" as it does on "started" would let this be
                 # measured instead of budgeted.)
+                nominal_starts_at=now - _LEDGER_WINDOW_SLACK_SECONDS,
                 starts_at=(now - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS),
                 ends_at=(now + _DISPLACED_STOP_DRAIN_SECONDS + _LEDGER_WINDOW_SLACK_SECONDS),
             )
@@ -411,18 +421,35 @@ class CommandLedger:
         return flushed
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
-        """Return the newest pending or windowed confirmed command match."""
-        for command_id in reversed(self._entries):
-            entry = self._entries[command_id]
-            if entry.phase == "pending" and any(
-                frame.signature == signature for frame in entry.frames
-            ):
-                return "pending", entry.command_id, entry.bridge_id
-            if entry.phase == "confirmed" and any(
-                window.signature == signature and window.starts_at <= heard_at <= window.ends_at
-                for window in entry.windows
-            ):
-                return "confirmed", entry.command_id, entry.bridge_id
+        """Return the best-fitting pending or windowed confirmed command match.
+
+        Ranked, not merely newest-first. Repeating one cover's command gives
+        two entries the same signature, and the anchor-lag budget on the newer
+        window reaches back across the older command's nominal window -- so
+        newest-first credits the older command's own echo to its successor.
+        Both are ours and neither dispatches, but the emission proof goes to
+        the wrong command_id, and a cover awaiting proof for one specific
+        command after a restart never gets it.
+
+        So a capture that fits a window WITHOUT spending the anchor-lag budget
+        wins outright; only when nothing fits on those terms does the budget
+        get spent, newest-first as before.
+        """
+        for spend_anchor_lag in (False, True):
+            for command_id in reversed(self._entries):
+                entry = self._entries[command_id]
+                if entry.phase == "pending" and any(
+                    frame.signature == signature for frame in entry.frames
+                ):
+                    return "pending", entry.command_id, entry.bridge_id
+                if entry.phase == "confirmed" and any(
+                    window.signature == signature
+                    and (window.starts_at if spend_anchor_lag else window.nominal_starts_at)
+                    <= heard_at
+                    <= window.ends_at
+                    for window in entry.windows
+                ):
+                    return "confirmed", entry.command_id, entry.bridge_id
         early_flush = self._early_flushed_stop(signature, heard_at)
         if early_flush is not None:
             return early_flush
@@ -542,6 +569,7 @@ class CommandLedger:
         frame_handoff = handoff + frame.offset_ms / _MILLISECONDS_PER_SECOND
         return _LedgerWindow(
             signature=frame.signature,
+            nominal_starts_at=frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS,
             # Asymmetric by design -- a frame can be heard well BEFORE the
             # window its own late anchor implies. Most acutely a stop_raw
             # frame, which fires stop_after_ms after the action frame and so is
