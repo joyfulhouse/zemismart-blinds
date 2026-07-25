@@ -1152,10 +1152,24 @@ _FLUSH_HEARD_TIME: Final = 305.0
 _FLUSH_DISPLACED_TIME: Final = 306.2
 # 15 s past the displacer's admission, still deep inside its armed span.
 _LATE_HUMAN_STOP_TIME: Final = 320.0
+_DEFAULT_TRAIN_AIRTIME_MS: Final = 3_000
+# A remote at repeats=15 -- config_flow allows up to MAX_REPEATS = 20 -- makes
+# _ledger_airtime_ms return max(2000, 15*1000). The whole owed STOP train has
+# to drain before the displacer's own action frame can be reported started, so
+# the flush occupies the fifteen seconds BELOW that admission.
+_HIGH_REPEAT_TRAIN_AIRTIME_MS: Final = 15_000
+_HIGH_REPEAT_ADMISSION: Final = 315.0
+_HIGH_REPEAT_FIRST_FLUSH_TIME: Final = 300.5
 
 
-def _timed_move_ledger() -> tuple[CommandLedger, FrameSignature]:
-    """Build a ledger holding one confirmed timed move with a queued STOP."""
+def _timed_move_ledger(
+    airtime_ms: int = _DEFAULT_TRAIN_AIRTIME_MS,
+) -> tuple[CommandLedger, FrameSignature]:
+    """Build a ledger holding one confirmed timed move with a queued STOP.
+
+    ``airtime_ms`` is the frame's full repeat train, exactly as
+    ``_ledger_airtime_ms`` computes it from the remote's configured repeats.
+    """
     ledger = CommandLedger()
     action = _required_signature((1,), "DOWN")
     stop = _required_signature((1,), "STOP")
@@ -1165,15 +1179,18 @@ def _timed_move_ledger() -> tuple[CommandLedger, FrameSignature]:
         (1,),
         "DOWN",
         [
-            LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
-            LedgerFrameSpec(stop, offset_ms=_FLUSH_STOP_OFFSET_MS, airtime_ms=3_000),
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=airtime_ms),
+            LedgerFrameSpec(stop, offset_ms=_FLUSH_STOP_OFFSET_MS, airtime_ms=airtime_ms),
         ],
     )
     ledger.confirm("timed-move", _FLUSH_HANDOFF)
     return ledger, stop
 
 
-def _register_displacing_command(ledger: CommandLedger) -> None:
+def _register_displacing_command(
+    ledger: CommandLedger,
+    handoff: float | None = _DISPLACER_HANDOFF,
+) -> None:
     """Confirm the newer overlapping command that makes the bridge flush.
 
     Itself a TIMED move, with a two-minute deadline of its own. That is the
@@ -1195,7 +1212,8 @@ def _register_displacing_command(ledger: CommandLedger) -> None:
             ),
         ],
     )
-    ledger.confirm("displacer", _DISPLACER_HANDOFF)
+    if handoff is not None:
+        ledger.confirm("displacer", handoff)
 
 
 def test_early_flushed_stop_heard_before_its_displaced_status_stays_ours() -> None:
@@ -1401,11 +1419,17 @@ def test_timed_displacer_does_not_own_a_stop_long_after_its_admission() -> None:
 def test_capture_held_against_a_newer_pending_twin_resolves_to_its_own_command() -> None:
     """A lag-funded capture parked behind a same-signature successor is not stranded.
 
-    Ranking nominal fits above lag-funded ones (#17) means a newer PENDING entry
-    with the same signature is still reached first — it has no window to rank at
-    all — so the capture is held rather than credited. It must not be lost there:
-    once that successor resolves, the capture re-classifies and the emission proof
-    reaches the command whose lag budget it actually needed.
+    A hold/resume regression guard, NOT coverage of the #17 ranking: it passes
+    against the pre-#17 single-window match() too, because the property it
+    asserts — that holding a capture against a newer same-signature entry
+    cannot lose it — was already true then. It is pinned here because that
+    property had only ever been argued, never measured, and the ranking change
+    made it load-bearing enough to be worth measuring.
+
+    #17's actual pins are
+    test_overlapping_windows_credit_the_command_that_actually_emitted and
+    test_emission_proof_reaches_the_command_that_emitted_the_frame, both of
+    which do fail against the original.
     """
     ledger = CommandLedger()
     action = _required_signature((1,), "DOWN")
@@ -1446,3 +1470,72 @@ def test_capture_held_against_a_newer_pending_twin_resolves_to_its_own_command()
 
     assert dispatched == []
     assert proofs == ["cmd-anchored-late"]
+
+
+def test_whole_flushed_stop_train_below_the_admission_stays_ours() -> None:
+    """The flush is a TRAIN, and every repeat of it precedes the admission.
+
+    `schedule()` moves the owed STOP copies to `flush_stops_` and `next()`
+    rotates them ahead of the replacement action, so the displacer's `started`
+    cannot be reported until that drain permits it. The flush therefore
+    occupies the whole `_ledger_airtime_ms(repeats)` BELOW the admission, not
+    just the one frame ahead of it — the same train length `_window()` already
+    budgets on the `ends_at` side, for the same reason.
+
+    A flat tolerance is enough at the production default of 3 repeats but not
+    at the 20 `config_flow` allows: the early repeats of our own genuinely
+    flushed STOP fall outside it and dispatch as a phantom press. Recognising
+    a later repeat does not undo the takeover the first one already triggered.
+    """
+    ledger, stop = _timed_move_ledger(_HIGH_REPEAT_TRAIN_AIRTIME_MS)
+    _register_displacing_command(ledger, _HIGH_REPEAT_ADMISSION)
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(ledger, dispatched, [], [_HIGH_REPEAT_FIRST_FLUSH_TIME])
+
+    assert ledger.match(stop, _HIGH_REPEAT_FIRST_FLUSH_TIME) == (
+        "confirmed",
+        "timed-move",
+        _BRIDGE_A,
+    )
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_HIGH_REPEAT_FIRST_FLUSH_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        _HIGH_REPEAT_FIRST_FLUSH_TIME,
+    )
+
+    assert dispatched == []
+
+
+def test_hold_against_a_pending_timed_displacer_resolves_without_a_phantom_press() -> None:
+    """Deferring to a pending displacer only helps if the bound is right after.
+
+    A timed displacer registers its own stop_raw, so a flushed capture shares
+    that pending entry's signature and is HELD rather than dispatched. That
+    defers the decision; it does not make it. When the displacer confirms and
+    the hold resumes, the admission bound is what finally classifies the
+    capture — so a bound too short for the drain turns the deferral into a
+    LATER phantom press rather than no phantom press at all.
+    """
+    ledger, _stop = _timed_move_ledger(_HIGH_REPEAT_TRAIN_AIRTIME_MS)
+    _register_displacing_command(ledger, handoff=None)
+    dispatched: list[HeardEvent] = []
+    now_value = [_HIGH_REPEAT_FIRST_FLUSH_TIME]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_HIGH_REPEAT_FIRST_FLUSH_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        _HIGH_REPEAT_FIRST_FLUSH_TIME,
+    )
+    assert dispatched == []  # held against the pending displacer
+
+    now_value[0] = _HIGH_REPEAT_ADMISSION
+    ledger.confirm("displacer", _HIGH_REPEAT_ADMISSION)
+    consumer.resume_holds("displacer")
+
+    assert dispatched == []

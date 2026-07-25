@@ -272,6 +272,11 @@ class _LedgerWindow:
     nominal_starts_at: float
     starts_at: float
     ends_at: float
+    # How long this frame's full repeat train occupies the air. Already
+    # implied by ends_at, but needed on its own by _early_flushed_stop: a
+    # displaced STOP train drains BELOW the admission that flushed it, so the
+    # same length has to be budgeted downwards from a different anchor.
+    train_seconds: float
 
 
 @dataclass(slots=True)
@@ -412,6 +417,7 @@ class CommandLedger:
                 # every other confirmed window gets. (Firmware stamping age_ms
                 # on "displaced" as it does on "started" would let this be
                 # measured instead of budgeted.)
+                train_seconds=window.train_seconds,
                 nominal_starts_at=now - _LEDGER_WINDOW_SLACK_SECONDS,
                 starts_at=(now - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS),
                 ends_at=(now + _DISPLACED_STOP_DRAIN_SECONDS + _LEDGER_WINDOW_SLACK_SECONDS),
@@ -487,30 +493,43 @@ class CommandLedger:
         stop_after_ms and leave the model travelling while the blind stands
         still. Ownership needs a displacement actually in flight.
         """
+        if signature[2] != "STOP":
+            return None
         for entry in reversed(tuple(self._entries.values())):
             if entry.phase != "confirmed" or entry.displaced or not entry.windows:
                 continue
-            armed_from = min(window.starts_at for window in entry.windows)
-            if heard_at < armed_from or not any(
-                window.signature == signature
-                and signature[2] == "STOP"
-                # Still queued: a STOP already inside or past its own window
-                # was matched above and needs no help here.
-                and heard_at < window.starts_at
-                for window in entry.windows
-            ):
+            # An armed frame cannot have emitted before its own command did.
+            if heard_at < min(window.starts_at for window in entry.windows):
                 continue
-            if self._flushed_at_a_newer_admission(entry, heard_at):
+            queued = next(
+                (
+                    window
+                    for window in entry.windows
+                    # Still queued: a STOP already inside or past its own
+                    # window was matched above and needs no help here.
+                    if window.signature == signature and heard_at < window.starts_at
+                ),
+                None,
+            )
+            if queued is None:
+                continue
+            if self._flushed_at_a_newer_admission(entry, heard_at, queued.train_seconds):
                 return "confirmed", entry.command_id, entry.bridge_id
         return None
 
-    def _flushed_at_a_newer_admission(self, entry: _LedgerEntry, heard_at: float) -> bool:
+    def _flushed_at_a_newer_admission(
+        self,
+        entry: _LedgerEntry,
+        heard_at: float,
+        drain_seconds: float,
+    ) -> bool:
         """Report whether a newer command's admission flushed this one's RF then.
 
         Displacement is a ONE-TIME event. The bridge flushes an older command's
         armed frames as it admits a newer one and never again, so the newer
         command's HANDOFF -- the measured instant its own first frame went on
-        air -- is the flush instant, give or take the frame ahead of it.
+        air -- is where the flush ENDS. The owed copies drain in full ahead of
+        it, so the flush spans the victim's own train length below that.
 
         The displacer's own liveness is emphatically NOT the bound. A displacer
         that is itself a timed move stays armed until its own deadline, which
@@ -523,17 +542,22 @@ class CommandLedger:
         Only same-bridge overlaps count: armed scheduler state lives in the
         selected bridge's RAM, so a command routed elsewhere cannot flush it.
 
-        A still-PENDING newer command is deliberately not trusted. Its flush
-        instant is unknown, and the only anchor available would be a local
-        registration time no measurement backs. Little is lost: a timed
-        displacer registers its own stop_raw, so the flushed capture shares
-        that pending entry's signature and is HELD against it, then
-        re-classified once it confirms. What remains uncovered is an untimed
-        displacer whose peer-heard /rx overtakes its own "started" status --
-        and the peer must receive the entire frame before it can publish, so
-        its report is generated strictly later than that status. That residue
-        fails to the safe side: the capture dispatches as a press, exactly as
-        it did before any of this existed.
+        A still-PENDING newer command is deliberately not trusted, because
+        its admission instant is precisely what has not happened yet. A TIMED
+        displacer registers its own stop_raw, so a flushed capture shares that
+        pending entry's signature and is held against it and re-decided once it
+        confirms -- but that only defers the decision to this bound, it does
+        not make it, so the bound has to be right for the deferral to help.
+
+        An UNTIMED pending displacer has no such signature and the capture
+        simply falls through and dispatches as a press. No ordering guarantee
+        is claimed for that case: generation order and delivery order diverge
+        under MQTT transport delay -- that divergence is the premise of this
+        whole module -- and the peer is reporting the victim's flushed frame,
+        not the displacer's own, so nothing sequences the two. It is left
+        uncovered because it fails to the SAFE side: a press dispatches, a
+        takeover happens, and the outcome is no worse than before any of this
+        existed.
         """
         newer = False
         for candidate in self._entries.values():
@@ -549,12 +573,16 @@ class CommandLedger:
                 or set(candidate.channels).isdisjoint(entry.channels)
             ):
                 continue
-            # The flushed frame goes on air immediately BEFORE the frame whose
-            # admission flushed it, and that admission anchor carries the same
-            # late bias as every other -- hence lag tolerance below, slack only
-            # above.
+            # The owed STOP copies drain in full before the frame whose
+            # admission flushed them, so the flush occupies drain_seconds BELOW
+            # that admission -- not one frame's worth. The admission anchor also
+            # carries the same late bias as every other, hence lag tolerance
+            # below and slack only above.
             if (
-                admitted_at - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS
+                admitted_at
+                - drain_seconds
+                - _LEDGER_WINDOW_SLACK_SECONDS
+                - _LEDGER_ANCHOR_LAG_SECONDS
                 <= heard_at
                 <= admitted_at + _LEDGER_WINDOW_SLACK_SECONDS
             ):
@@ -606,6 +634,7 @@ class CommandLedger:
         return _LedgerWindow(
             signature=frame.signature,
             nominal_starts_at=frame_handoff - _LEDGER_WINDOW_SLACK_SECONDS,
+            train_seconds=frame.airtime_ms / _MILLISECONDS_PER_SECOND,
             # Asymmetric by design -- a frame can be heard well BEFORE the
             # window its own late anchor implies. Most acutely a stop_raw
             # frame, which fires stop_after_ms after the action frame and so is
