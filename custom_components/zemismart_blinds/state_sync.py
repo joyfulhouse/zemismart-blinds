@@ -390,7 +390,15 @@ class CommandLedger:
         entry.windows = tuple(
             _LedgerWindow(
                 signature=window.signature,
-                starts_at=now - _LEDGER_WINDOW_SLACK_SECONDS,
+                # `now` is the receipt of the "displaced" status, and that
+                # status carries no age_ms -- so unlike started_at it is not
+                # even corrected for the firmware's own queueing, let alone the
+                # MQTT leg. The flush always precedes this receipt and never
+                # follows it, so the drain takes the same lower-edge tolerance
+                # every other confirmed window gets. (Firmware stamping age_ms
+                # on "displaced" as it does on "started" would let this be
+                # measured instead of budgeted.)
+                starts_at=(now - _LEDGER_WINDOW_SLACK_SECONDS - _LEDGER_ANCHOR_LAG_SECONDS),
                 ends_at=(now + _DISPLACED_STOP_DRAIN_SECONDS + _LEDGER_WINDOW_SLACK_SECONDS),
             )
             if window.signature[2] == "STOP"
@@ -415,8 +423,80 @@ class CommandLedger:
                 for window in entry.windows
             ):
                 return "confirmed", entry.command_id, entry.bridge_id
+        early_flush = self._early_flushed_stop(signature, heard_at)
+        if early_flush is not None:
+            return early_flush
         self._log_near_miss(signature, heard_at)
         return None
+
+    def _early_flushed_stop(
+        self,
+        signature: FrameSignature,
+        heard_at: float,
+    ) -> LedgerMatch | None:
+        """Return a command whose armed STOP a newer command has just flushed.
+
+        A timed move's stop_raw sits armed on the bridge from handoff until its
+        deadline, and latest-command-wins flushes it the instant an overlapping
+        newer command lands there -- anywhere inside that span, not at the
+        deadline the confirmed window describes. displace() re-windows for
+        exactly this, but only once the "displaced" status arrives, and nothing
+        orders that status before a peer bridge's report of the flushed frame:
+        both cross the same broker, and the queueing that biases "started" late
+        biases "displaced" too.
+
+        So the flush is recognised from the command that CAUSES it instead. The
+        displacing command is registered locally before it is even published,
+        which beats any status over the wire by construction.
+
+        Deliberately NOT a blanket widening of the armed span. Our stop_raw is
+        byte-identical to the frame a person's remote puts on air, so owning
+        that span whenever a STOP is heard would bypass takeover for the whole
+        stop_after_ms and leave the model travelling while the blind stands
+        still. Ownership needs a displacement actually in flight.
+        """
+        for entry in reversed(tuple(self._entries.values())):
+            if entry.phase != "confirmed" or entry.displaced or not entry.windows:
+                continue
+            armed_from = min(window.starts_at for window in entry.windows)
+            if heard_at < armed_from or not any(
+                window.signature == signature
+                and signature[2] == "STOP"
+                # Still queued: a STOP already inside or past its own window
+                # was matched above and needs no help here.
+                and heard_at < window.starts_at
+                for window in entry.windows
+            ):
+                continue
+            if self._displacement_in_flight(entry, heard_at):
+                return "confirmed", entry.command_id, entry.bridge_id
+        return None
+
+    def _displacement_in_flight(self, entry: _LedgerEntry, now: float) -> bool:
+        """Report whether a newer command can be flushing this one's RF.
+
+        Only same-bridge overlaps count: armed scheduler state lives in the
+        selected bridge's RAM, so a command routed elsewhere cannot flush it.
+        Liveness is re-derived per call rather than latched, so a displacing
+        command that is rejected or retired withdraws the tolerance it lent
+        instead of leaving the older STOP owned until its deadline.
+        """
+        newer = False
+        for candidate in self._entries.values():
+            if candidate.command_id == entry.command_id:
+                newer = True
+                continue
+            if (
+                not newer
+                or candidate.bridge_id != entry.bridge_id
+                or set(candidate.channels).isdisjoint(entry.channels)
+            ):
+                continue
+            if candidate.phase == "pending" or any(
+                window.ends_at >= now for window in candidate.windows
+            ):
+                return True
+        return False
 
     def _log_near_miss(self, signature: FrameSignature, heard_at: float) -> None:
         """Report a capture we own the signature of but classified as a press.

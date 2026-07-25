@@ -12,6 +12,7 @@ from custom_components.zemismart_blinds.codec import encode_b0, make_payload
 from custom_components.zemismart_blinds.state_sync import (
     BridgeClock,
     CommandLedger,
+    FrameSignature,
     HeardEvent,
     LedgerFrameSpec,
     StateSyncConsumer,
@@ -1133,3 +1134,132 @@ def test_own_stop_echo_is_not_dispatched_as_a_press_through_the_consumer() -> No
     )
 
     assert dispatched == []
+
+
+# The bridge holds a timed move's stop_raw armed from handoff until its
+# deadline. A newer overlapping command displaces the old one and the armed
+# STOP is flushed immediately -- long before the deadline the ledger windowed
+# it at. Both the flushed frame's /rx and the transmitting bridge's
+# "displaced" status then race over MQTT, and the status has no age_ms to
+# correct its own transport leg.
+_FLUSH_HANDOFF: Final = 300.0
+_FLUSH_STOP_OFFSET_MS: Final = 60_000
+_FLUSH_HEARD_TIME: Final = 305.0
+_FLUSH_DISPLACED_TIME: Final = 306.2
+
+
+def _timed_move_ledger() -> tuple[CommandLedger, FrameSignature]:
+    """Build a ledger holding one confirmed timed move with a queued STOP."""
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed-move",
+        _BRIDGE_A,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(action, offset_ms=0, airtime_ms=3_000),
+            LedgerFrameSpec(stop, offset_ms=_FLUSH_STOP_OFFSET_MS, airtime_ms=3_000),
+        ],
+    )
+    ledger.confirm("timed-move", _FLUSH_HANDOFF)
+    return ledger, stop
+
+
+def _register_displacing_command(ledger: CommandLedger) -> None:
+    """Register the newer overlapping command that makes the bridge flush."""
+    ledger.register_pending(
+        "displacer",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(_required_signature((1,), "UP"), offset_ms=0, airtime_ms=3_000)],
+    )
+
+
+def test_early_flushed_stop_heard_before_its_displaced_status_stays_ours() -> None:
+    """The flushed STOP is ours whichever of /rx and "displaced" wins the race.
+
+    Nothing orders a peer bridge's report of the flushed frame after the
+    transmitting bridge's own status: both cross the same broker, and the same
+    queueing that biases "started" late by a measured 1.117 s biases
+    "displaced" too. In the losing order match() still sees the ORIGINAL
+    windows -- the STOP sitting a full stop_after_ms away, far outside any
+    anchor tolerance -- and our own flushed frame dispatches as a person
+    stopping the blind, which then displaces the very command that caused the
+    flush.
+
+    The displacement is knowable without waiting for the status, because WE
+    caused it: latest-command-wins means the newer overlapping command already
+    registered for this bridge is what flushes the older one's armed STOP. That
+    signal is local and lag-free, so it always wins the race.
+    """
+    ledger, _stop = _timed_move_ledger()
+    _register_displacing_command(ledger)
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    consumer = _consumer(ledger, dispatched, proofs, [_FLUSH_HEARD_TIME])
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_FLUSH_HEARD_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        _FLUSH_HEARD_TIME,
+    )
+
+    assert dispatched == []
+    # Heard on a peer bridge: still proof the frame reached the air.
+    assert proofs == ["timed-move"]
+
+    # The status finally lands and narrows the STOP to its drain.
+    ledger.displace("timed-move", _FLUSH_DISPLACED_TIME)
+    consumer.resume_holds("timed-move")
+
+    assert dispatched == []
+
+
+def test_stop_heard_mid_travel_without_a_displacement_is_still_a_press() -> None:
+    """No displacing command means a mid-travel STOP is a person, as before.
+
+    This is the bound on the fix above and the reason the queued STOP is not
+    simply owned for its whole armed span. A timed move registers its own
+    stop_raw, so somebody pressing STOP on the physical remote produces a
+    capture IDENTICAL to a frame we have registered. Owning that span
+    unconditionally would bypass the takeover machinery for the entire
+    stop_after_ms, leaving the model travelling while the blind stands still.
+    """
+    ledger, _stop = _timed_move_ledger()
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(ledger, dispatched, [], [_FLUSH_HEARD_TIME])
+
+    consumer.handle_rx(
+        _BRIDGE_B,
+        _BOOT,
+        int(_FLUSH_HEARD_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "STOP"),
+        _FLUSH_HEARD_TIME,
+    )
+
+    assert [event.button for event in dispatched] == ["STOP"]
+
+
+def test_displaced_stop_window_absorbs_the_displaced_status_transport_lag() -> None:
+    """The displaced anchor is a receipt time and carries the same late bias.
+
+    "displaced" has no age_ms, so displace() anchors on pure wall-clock
+    receipt -- strictly worse than started_at, which at least removes the
+    firmware's own queueing. The flush happened before that receipt, never
+    after, so the drain window needs the identical lower-edge tolerance every
+    other confirmed window already gets.
+    """
+    ledger, stop = _timed_move_ledger()
+
+    assert ledger.displace("timed-move", _FLUSH_DISPLACED_TIME)
+
+    assert ledger.match(stop, _FLUSH_HEARD_TIME) == (
+        "confirmed",
+        "timed-move",
+        _BRIDGE_A,
+    )

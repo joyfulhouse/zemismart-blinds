@@ -1536,6 +1536,10 @@ class ZemismartHub:
                 # resolved future first so displace() re-windows the flushed
                 # STOPs instead of retiring the still-pending entry.
                 self._ledger.confirm(command_id, displaced_pending.started.result())
+        # Unlike "started" this payload carries no age_ms, so the only anchor
+        # available is raw receipt and the ledger has to budget the transport
+        # lag instead of measuring it. Firmware stamping age_ms here would let
+        # this call pass a corrected instant, as _handle_started_status does.
         flushed = self._ledger.displace(command_id, self._now())
         self._state_sync.resume_holds(command_id)
         disarm_request = self._disarm_requests.get((bridge_id, command_id))
