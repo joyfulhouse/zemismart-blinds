@@ -29,8 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   16-cover house cannot actually produce. Both are down roughly 2x from 0.5.4 thanks to the
   memoisation above.
 
-  These are dev-machine numbers. **They have not been measured on the Raspberry Pi this runs on**,
-  and no claim is made that they hold there.
+  These are dev-machine numbers. **They have not been measured on the target**, and no claim is
+  made that they hold there — the SSH add-on exposes no Python runtime and no way into the core
+  container, so benchmarking there needs instrumentation this change does not justify. For
+  calibration when someone does measure it: the deployment this was found on runs a **Raspberry Pi
+  Compute Module 5**, which is a considerably faster machine than the Pi 3-class hardware "a Pi"
+  usually implies.
 
   Found by adversarial review, which reproduced the discrepancy rather than accepting the figure.
 
