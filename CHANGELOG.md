@@ -35,6 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reanchor` is exactly that — or the cover goes `unknown`. It is deliberately kept separate from
   the `unverified_anchor_*` restore-time provenance markers, which track a different doubt.
 
+  Three boundaries hardened by adversarial review before shipping:
+
+  - **`verified` requires an *observed* completion.** A travel that finished during Home
+    Assistant's own downtime lands on its target as before, but earns no `verified` and settles
+    no `suspect`: no RX listener ran while it travelled, so a press in that gap — real or phantom
+    — was invisible. The same reasoning is why `verified` deliberately does **not** survive a
+    restart: restoring it verbatim would overclaim across exactly the window the integration was
+    blind. Covers re-earn it with their next observed completed travel. (Residual even when
+    observed: a listener is deaf for roughly one slot after each capture, so a press *can* be
+    missed; that risk is identical for commanded and heard travels, which is why both earn
+    `verified` rather than only our own commands.)
+  - **An unknown member caps its group at `assumed`.** It cannot vote on which known value wins,
+    but reporting `verified` over a broken sibling would hide exactly the member an automation
+    gating on this attribute needs to fix.
+
 ## [0.5.5] - 2026-07-26
 
 ### Fixed

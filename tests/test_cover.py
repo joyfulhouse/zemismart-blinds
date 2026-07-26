@@ -5155,6 +5155,105 @@ async def test_suspect_survives_a_restart(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.asyncio
+async def test_downtime_completion_earns_no_verified_and_keeps_suspect(
+    hass: HomeAssistant,
+) -> None:
+    """A travel that finished while HA was down settles nothing (review).
+
+    Nobody was listening while it ran: any press in that gap, real or phantom,
+    was invisible. The position lands on the target -- that part is unchanged
+    -- but it must not earn `verified`, and a restored suspect must stay.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "closing",
+        {
+            ATTR_CURRENT_POSITION: 45,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": config.role.value,
+            "motion_direction": -1,
+            "motion_target": 0.0,
+            "motion_started": now - 60.0,
+            "motion_deadline": now - 30.0,
+            "motion_start_position": 45,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "downtime-close",
+            "motion_timed": False,
+            "motion_absolute_anchor": True,
+            "position_suspect": True,
+        },
+    )
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        # Position completes to the target as before...
+        assert entity.current_cover_position == 0
+        # ...but an unobserved completion earns no verified and keeps the doubt.
+        assert entity._position_verified is False
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_deliberately_does_not_survive_a_restart(
+    hass: HomeAssistant,
+) -> None:
+    """A restart downgrades verified to assumed, by design (review).
+
+    During HA's downtime no RX listener runs, so a physical press in that gap
+    is invisible -- restoring `verified` verbatim would overclaim across
+    exactly the window in which the integration was blind. A cover re-earns it
+    with its next observed completed travel.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    config = cover_config()
+    restored_state = State(
+        "cover.living_room_left",
+        "closed",
+        {
+            ATTR_CURRENT_POSITION: 0,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": config.role.value,
+            "motion_direction": 0,
+            "position_confidence": "verified",
+            "position_suspect": False,
+        },
+    )
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert entity.current_cover_position == 0
+        assert entity.position_confidence == "assumed"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_suspect_cleared_by_a_completed_endpoint_travel(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -5191,9 +5290,10 @@ async def test_aggregate_confidence_is_the_worst_of_its_members(
 ) -> None:
     """Aggregate confidence derives from members: suspect > assumed > verified.
 
-    Unknown members are excluded (the same set the position average uses), so
-    one unknown member neither hides a suspect sibling nor drags the group off
-    `verified`; only an all-unknown group is itself unknown.
+    An unknown member cannot vote on which known value wins, but it caps the
+    group at `assumed` -- reporting verified over a broken sibling would hide
+    exactly the member an automation gating on this attribute needs to fix
+    (review finding). Only an all-unknown group is itself unknown.
     """
 
     async def quiet_publish(_topic: str, _payload: str) -> None:
@@ -5217,13 +5317,12 @@ async def test_aggregate_confidence_is_the_worst_of_its_members(
         leaf_two._suspect = True
         assert aggregate.position_confidence == "suspect"
 
-        # An unknown member is excluded, not counted as doubt: with leaf_one
-        # verified again and leaf_two unknown, the group reads through to
-        # verified rather than being dragged unknown.
+        # An unknown member caps the group at assumed: it cannot vote on the
+        # known values, but verified over a broken sibling would overclaim.
         leaf_one._position, leaf_one._position_verified = 0.0, True
         leaf_two._position, leaf_two._suspect = None, False
         assert leaf_two.position_confidence == "unknown"
-        assert aggregate.position_confidence == "verified"
+        assert aggregate.position_confidence == "assumed"
 
         # No member has a position -> the aggregate is itself unknown.
         leaf_one._position = None

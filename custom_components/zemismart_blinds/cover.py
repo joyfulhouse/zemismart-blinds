@@ -477,9 +477,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._position = target
             self._clear_motion()
             if absolute_anchor or target in {0.0, 100.0}:
-                # A travel that finished during downtime reached its hard limit
-                # just like one completed by _async_track_motion.
-                self._anchor_if_at_limit()
+                # A travel that finished during downtime reached its hard
+                # limit for POSITION purposes, but nobody was listening while
+                # it ran -- no verified, and a restored suspect stays.
+                self._anchor_if_at_limit(observed=False)
             elif (
                 timed
                 and not self._bridge_seen_online(bridge)
@@ -601,7 +602,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._unverified_anchor_command_id = None
         self._unverified_anchor_offline = False
 
-    def _anchor_if_at_limit(self) -> None:
+    def _anchor_if_at_limit(self, *, observed: bool = True) -> None:
         """Re-anchor a motion that actually ENDED against a hard limit.
 
         Both endpoints are physical stops: a cover that ran a travel out to 0
@@ -628,12 +629,24 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """
         if self._position in (0.0, 100.0):
             self._clear_unverified_anchor()
-            # A completed travel to a hard limit is the ONLY thing that earns
-            # `verified`, and it also settles any suspect doubt: whatever a heard
-            # STOP left ambiguous, the blind has now physically reached and rests
-            # against its limit switch.
-            self._position_verified = True
-            self._suspect = False
+            if observed:
+                # A completed travel to a hard limit is the ONLY thing that
+                # earns `verified`, and it also settles any suspect doubt:
+                # whatever a heard STOP left ambiguous, the blind has now
+                # physically reached and rests against its limit switch.
+                #
+                # OBSERVED means RX was live for the whole travel, so a real
+                # STOP press would have been heard and turned into suspect or
+                # an interruption. A completion that happened during HA's own
+                # downtime carries no such witness -- any press in that gap,
+                # real or phantom, was invisible -- so it keeps the position
+                # but earns no verified and settles no doubt. (Residual even
+                # when observed: a listener is deaf ~one slot after each
+                # capture, so a press CAN be missed. That risk is identical
+                # for commanded and heard travels, which is why both earn
+                # verified rather than only our own.)
+                self._position_verified = True
+                self._suspect = False
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
         """Return whether this bridge has explicitly announced itself online."""
@@ -1350,23 +1363,28 @@ class ZemismartAggregateCover(CoverEntity):
 
     @property
     def position_confidence(self) -> str:
-        """Derive confidence from members -- the worst contributing value wins.
+        """Derive confidence from members -- the worst known value wins.
 
-        Considers only members that contribute a known position (the same set
-        ``current_cover_position`` averages), so an unknown member neither hides
-        a suspect sibling nor drags the whole group off `verified`. With no
-        member position the aggregate state is itself unknown.
+        A suspect member marks the whole group suspect. A member with no
+        position cannot vote on which known value wins, but its absence is
+        itself information: the group caps at `assumed`, because `verified`
+        over a broken sibling would hide exactly the member that needs fixing.
+        Only an all-unknown group is itself unknown.
         """
+        members = list(self._members())
         confidences = [
             member.position_confidence
-            for member in self._members()
+            for member in members
             if member.current_cover_position is not None
         ]
         if not confidences:
             return CONFIDENCE_UNKNOWN
         if CONFIDENCE_SUSPECT in confidences:
             return CONFIDENCE_SUSPECT
-        if CONFIDENCE_ASSUMED in confidences:
+        if CONFIDENCE_ASSUMED in confidences or len(confidences) != len(members):
+            # A member with no position at all caps the group at assumed:
+            # reporting verified while a sibling is broken would hide exactly
+            # the member an automation gating on this attribute needs to fix.
             return CONFIDENCE_ASSUMED
         return CONFIDENCE_VERIFIED
 
