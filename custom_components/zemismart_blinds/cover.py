@@ -546,7 +546,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         A group member whose own travel clamps to its limit reaches that hard
         stop even when the group was aimed somewhere in between, and it was
         previously left questioned because ``absolute_anchor`` records the
-        group's intent (see _commit_group_motion).
+        group's intent (see ``_start_member_motion``).
+
+        That shape is currently UNREACHABLE: the only production caller passes
+        a ``group_target`` of 0 or 100, so ``absolute_anchor`` is already true
+        whenever a member lands on a limit, and the previous intent-based gate
+        covered every live case. This keeps the guarantee keyed on the physical
+        fact rather than on that caller's argument staying an endpoint.
 
         Equally deliberately NOT applied to a position that merely reads 0 or
         100 without a travel behind it -- a restored estimate from a

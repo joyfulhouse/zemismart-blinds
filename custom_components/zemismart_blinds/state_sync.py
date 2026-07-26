@@ -495,10 +495,11 @@ class CommandLedger:
         widen a window at most sixteen-fold, never without limit.
         """
         span = self._nominal_span(entry)
-        if span is None:
+        if span is None or not entry.frames:
             return 1
         start, end = span
-        concurrency = 1
+        train_seconds = max(frame.airtime_ms for frame in entry.frames) / _MILLISECONDS_PER_SECOND
+        peers: list[tuple[float, float]] = []
         for other in self._entries.values():
             if (
                 other.command_id == entry.command_id
@@ -507,23 +508,58 @@ class CommandLedger:
             ):
                 continue
             other_span = self._nominal_span(other)
-            if other_span is None:
-                continue
-            other_start, other_end = other_span
-            if other_start <= end and start <= other_end:
-                concurrency += 1
-        return min(concurrency, _LEDGER_MAX_CONCURRENT_TARGETS)
+            if other_span is not None:
+                peers.append(other_span)
+        if not peers:
+            return 1
 
-    def _effective_ends_at(self, entry: _LedgerEntry, window: _LedgerWindow) -> float:
+        # Fixed point, because the question is circular: whether a peer shares
+        # the antenna with us depends on how long we are really on it, which
+        # depends on how many peers share it. Comparing nominal span against
+        # nominal span answers a strictly smaller question and undercounts a
+        # STAGGERED burst -- peers admitted after our nominal window closes but
+        # while the firmware is demonstrably still interleaving us. Start from
+        # no stretch, widen by what the current count implies, recount, and
+        # settle. The count only ever grows, so this converges, and the cap
+        # bounds the passes.
+        concurrency = 1
+        for _pass in range(_LEDGER_MAX_CONCURRENT_TARGETS):
+            reach = _round_robin_stretch_seconds(train_seconds, concurrency)
+            counted = min(
+                1
+                + sum(
+                    1
+                    for other_start, other_end in peers
+                    if other_start <= end + reach and start <= other_end + reach
+                ),
+                _LEDGER_MAX_CONCURRENT_TARGETS,
+            )
+            if counted == concurrency:
+                break
+            concurrency = counted
+        return concurrency
+
+    def _effective_ends_at(
+        self,
+        entry: _LedgerEntry,
+        window: _LedgerWindow,
+        concurrency: int | None = None,
+    ) -> float:
         """Return one window's upper edge, stretched for observed round-robin.
 
         A displaced entry's window already describes a flush drain rather
         than a normal repeat train, so it is excluded here exactly as it is
         in ``_round_robin_concurrency``.
+
+        ``concurrency`` may be supplied by a caller that already counted it for
+        this entry, so a multi-window entry counts once per classification
+        rather than once per window -- this runs inside match(), on every
+        received capture.
         """
         if entry.displaced:
             return window.ends_at
-        concurrency = self._round_robin_concurrency(entry)
+        if concurrency is None:
+            concurrency = self._round_robin_concurrency(entry)
         return window.ends_at + _round_robin_stretch_seconds(window.train_seconds, concurrency)
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
