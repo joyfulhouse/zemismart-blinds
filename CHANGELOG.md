@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`zemismart_blinds.reanchor` service.** An explicit recovery action — operator- or
+  automation-driven, never autonomous and never on a timer — that drives a cover (or group) to a
+  chosen hard endpoint (`open` or `close`) and re-anchors its position estimate there. It reuses
+  the normal full-travel command path (ledger registration, commanded-start, air arbitration and
+  coalescing all apply), so the endpoint completion re-anchors through the same outcome-based
+  logic a manual full open/close uses. It needs no prior estimate — which is the point: it
+  recovers a cover whose position is `unknown`. On an aggregate it is exactly one group frame.
+
+- **`position_confidence` attribute on covers and groups.** Lets an automation ask whether a
+  position is trustworthy — especially of an aggregate, which previously exposed only
+  `channels`/`remote`/`role`. Values: `verified` (last travel completed to a hard limit and no
+  doubt has been raised since), `assumed` (the normal modelled-from-travel-time state), and
+  `suspect`. `unknown` is read from the entity state itself rather than duplicated in the
+  attribute. An aggregate derives its value from the members that contribute a position — the
+  worst wins (`suspect` > `assumed` > `verified`), and an unknown member is excluded rather than
+  counted as doubt.
+
+  `suspect` marks the one narrow, genuinely ambiguous case from the freeze incidents: an
+  **untimed full travel** cut short by an **uncorroborated heard STOP**. Such a travel runs to the
+  motor's own limit switch, so a genuine STOP leaves the blind at the frozen estimate while a
+  phantom one leaves it at the endpoint — opposite ground truths the integration cannot tell
+  apart. The doubt **survives a Home Assistant restart** (the incident's wrong estimate did, so
+  the doubt about it must too) and clears only when a later travel completes to a hard limit — a
+  `reanchor` is exactly that — or the cover goes `unknown`. It is deliberately kept separate from
+  the `unverified_anchor_*` restore-time provenance markers, which track a different doubt.
+
 ## [0.5.5] - 2026-07-26
 
 ### Fixed

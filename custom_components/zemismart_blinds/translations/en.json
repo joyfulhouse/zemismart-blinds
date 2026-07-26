@@ -228,6 +228,12 @@
       "options": {
         "automatic": "Automatic"
       }
+    },
+    "endpoint": {
+      "options": {
+        "open": "Open (drive fully up)",
+        "close": "Close (drive fully down)"
+      }
     }
   },
   "services": {
@@ -252,6 +258,16 @@
     "new_virtual_remote": {
       "name": "Allocate virtual remote",
       "description": "Generate an unused remote identity with a complete synthesized calibration. The response's prefix, remote ID, and UP base go straight into the manual add-integration flow; pair the motor by sending OPEN while it is in its RF pairing mode."
+    },
+    "reanchor": {
+      "name": "Re-anchor position",
+      "description": "Drive a cover (or group) to a hard endpoint and re-anchor its position estimate there. Explicit recovery only: use it after a heard STOP or a restart has left the position untrustworthy or unknown.",
+      "fields": {
+        "endpoint": {
+          "name": "Endpoint",
+          "description": "Which hard limit to drive to. Both the fully open and fully closed endpoints are physical stops the estimate re-anchors against; pick whichever is safer to reach right now."
+        }
+      }
     }
   }
 }

@@ -20,7 +20,9 @@ from custom_components.zemismart_blinds.cover import ZemismartCover
 from custom_components.zemismart_blinds.models import (
     BlindConfig,
     BridgeRegistry,
+    RemoteConfig,
     RemoteIdentity,
+    RemoteRuntime,
     ZemismartHub,
 )
 from custom_components.zemismart_blinds.state_sync import HeardEvent, LedgerFrameSpec
@@ -4927,3 +4929,410 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
         await leaf.async_will_remove_from_hass()
         await group.async_will_remove_from_hass()
         hub.close()
+
+
+# --- Explicit reanchor recovery service + position_confidence (issue #23) ---
+
+
+@pytest.mark.asyncio
+async def test_reanchor_service_drives_leaf_to_endpoint_from_unknown(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reanchor recovers a cover whose position is unknown -- its whole point.
+
+    A full travel needs no prior estimate, so the service works from the exact
+    state (`unknown`) it exists to repair, and the endpoint completion anchors
+    the estimate through the normal outcome-based path.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    try:
+        assert entity.current_cover_position is None
+        assert entity.position_confidence == "unknown"
+
+        await entity.async_reanchor("close")
+        assert entity.is_closing
+        await asyncio.sleep(0.02 + 0.01 + 0.06)
+
+        assert entity.current_cover_position == 0
+        assert entity.position_confidence == "verified"
+        assert entity._suspect is False
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_on_aggregate_is_one_group_frame(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reanchor on an aggregate re-anchors it exactly like a full open on it."""
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+    tx_frames: list[str] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            body = json.loads(payload)
+            tx_frames.append(body["raw"])
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=0.02)
+    try:
+        await aggregate.async_reanchor("open")
+        # ONE frame addressed to the whole channel set -- not one per member.
+        assert len(tx_frames) == 1
+        assert tx_frames[0] == encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP", bases=TEST_ACTION_BASES)
+        )
+        await asyncio.sleep(0.02 + 0.01 + 0.06)
+
+        assert leaf_one.current_cover_position == 100
+        assert leaf_two.current_cover_position == 100
+        assert aggregate.current_cover_position == 100
+        assert aggregate.position_confidence == "verified"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+async def _commanded_untimed_full_close(
+    hass: HomeAssistant,
+    clock: dict[str, float],
+) -> tuple[ZemismartCover, ZemismartHub]:
+    """Attach a leaf at 100 and start a commanded untimed full close on it.
+
+    Frozen-clock: the completion task never fires, so the caller controls
+    exactly where in the travel a heard STOP lands.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish, now=lambda: clock["now"])
+    entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    entity._position = 100.0
+    await entity.async_close_cover()
+    assert entity.is_closing
+    assert not entity._motion_timed
+    assert entity._motion_target == 0.0
+    return entity, hub
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_early_in_untimed_full_travel_marks_suspect(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heard STOP early in an untimed full close leaves the estimate suspect."""
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    try:
+        started = entity._motion_started
+        duration = entity._motion_duration
+        # STOP heard near the START of travel: the blind is still near open.
+        clock["now"] = started + 0.1 * duration
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+        position = entity.current_cover_position
+        assert position is not None
+        assert position > 50
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_late_in_untimed_full_travel_marks_suspect(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same doubt when the STOP is heard LATE -- a different timing shape.
+
+    A fix that only tried one STOP position would miss the opposite ground
+    truth here: heard late, a phantom STOP means the motor already ran nearly
+    to its limit while the model froze near it.
+    """
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    try:
+        started = entity._motion_started
+        duration = entity._motion_duration
+        # STOP heard near the END of travel: the blind is nearly closed.
+        clock["now"] = started + 0.9 * duration
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+        position = entity.current_cover_position
+        assert position is not None
+        assert position < 50
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_move_interrupted_by_heard_stop_is_not_suspect(
+    hass: HomeAssistant,
+) -> None:
+    """A TIMED move cut short by a heard STOP is not suspect -- it stops near here.
+
+    Only an untimed full travel runs to the motor's own limit; a timed partial
+    move was going to stop near the freeze anyway, so the ground truths do not
+    diverge and the estimate stays merely `assumed`.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 30})
+        assert entity._motion_timed
+
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=cover_module.WALL_CLOCK())
+
+        assert entity._suspect is False
+        assert entity.position_confidence == "assumed"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_suspect_survives_a_restart(hass: HomeAssistant) -> None:
+    """The doubt must outlive a restart, just as the wrong estimate itself did."""
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    config = cover_config()
+    restored_state = State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 45,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": config.role.value,
+            "motion_direction": 0,
+            "position_suspect": True,
+        },
+    )
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    entity = await attach_cover(
+        hass,
+        hub,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert entity.current_cover_position == 45
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_suspect_cleared_by_a_completed_endpoint_travel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed hard-limit travel (a reanchor) settles the suspect doubt."""
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    try:
+        started = entity._motion_started
+        duration = entity._motion_duration
+        clock["now"] = started + 0.5 * duration
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+
+        # Reanchor: a fresh full close that runs to the limit clears the doubt.
+        await entity.async_reanchor("close")
+        assert entity.is_closing
+        clock["now"] = entity._motion_deadline + 1.0
+        await asyncio.sleep(0.4)
+
+        assert entity.current_cover_position == 0
+        assert entity._suspect is False
+        assert entity.position_confidence == "verified"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_confidence_is_the_worst_of_its_members(
+    hass: HomeAssistant,
+) -> None:
+    """Aggregate confidence derives from members: suspect > assumed > verified.
+
+    Unknown members are excluded (the same set the position average uses), so
+    one unknown member neither hides a suspect sibling nor drags the group off
+    `verified`; only an all-unknown group is itself unknown.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=1.0)
+    try:
+        # All members verified -> verified.
+        leaf_one._position, leaf_one._position_verified = 0.0, True
+        leaf_two._position, leaf_two._position_verified = 0.0, True
+        assert aggregate.position_confidence == "verified"
+
+        # One merely assumed drags it down to assumed.
+        leaf_two._position_verified, leaf_two._position = False, 50.0
+        assert aggregate.position_confidence == "assumed"
+
+        # Suspect outranks assumed even when BOTH are present at once: leaf_one
+        # is assumed, leaf_two suspect, and suspect must win (order matters).
+        leaf_one._position_verified, leaf_one._position = False, 20.0
+        leaf_two._suspect = True
+        assert aggregate.position_confidence == "suspect"
+
+        # An unknown member is excluded, not counted as doubt: with leaf_one
+        # verified again and leaf_two unknown, the group reads through to
+        # verified rather than being dragged unknown.
+        leaf_one._position, leaf_one._position_verified = 0.0, True
+        leaf_two._position, leaf_two._suspect = None, False
+        assert leaf_two.position_confidence == "unknown"
+        assert aggregate.position_confidence == "verified"
+
+        # No member has a position -> the aggregate is itself unknown.
+        leaf_one._position = None
+        assert aggregate.position_confidence == "unknown"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_heard_stop_through_handle_rx_marks_suspect(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The incident end to end: a genuine STOP, decoded from a real frame and
+    delivered through the production RX path while a commanded untimed full
+    close runs, leaves the estimate suspect."""
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(online_registry(), publish, now=lambda: clock["now"])
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=BlindConfig(
+            name="Office channel 3",
+            remote=cover_config().remote,
+            channels=(3,),
+            travel_up=100.0,
+            travel_down=100.0,
+            area_id="living_room",
+            repeats=2,
+        ),
+        entity_id="cover.office_channel_3",
+    )
+    entity._position = 100.0
+    try:
+        await entity.async_close_cover()
+        assert entity.is_closing
+        assert not entity._motion_timed
+
+        # A real STOP heard AFTER our RF started: record_commanded_start (set by
+        # the hub on `started`) cannot dismiss it as our own late echo, and its
+        # STOP signature matches no armed window, so it is dispatched as a press.
+        clock["now"] += 2.0
+        stop_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "STOP", bases=TEST_ACTION_BASES)
+        )
+        hub.handle_rx("bridge-peer", {"frame": stop_frame, "t": 0, "boot": 1})
+
+        assert entity._stopped_by_heard is True
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_reanchor_entity_service_registers_on_the_platform(
+    hass: HomeAssistant,
+) -> None:
+    """Platform setup wires `reanchor` to the entity method under a live context.
+
+    Locks the positive branch of the context guard in ``async_setup_entry``: it
+    must register the entity service (not silently skip it) whenever HA drives
+    platform setup with the platform context set.
+    """
+    from homeassistant.helpers import entity_platform
+
+    registered: list[tuple[str, str]] = []
+
+    class RecordingPlatform:
+        def async_register_entity_service(self, name: str, schema: object, func: str) -> None:
+            registered.append((name, func))
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    runtime = RemoteRuntime(
+        remote=RemoteConfig(
+            name="Remote",
+            remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
+            area_id="living_room",
+            repeats=2,
+        ),
+        hub=hub,
+    )
+    entry = cast(
+        "Any",
+        SimpleNamespace(
+            runtime_data=runtime,
+            entry_id="entry-1",
+            async_on_unload=lambda _cb: None,
+        ),
+    )
+
+    token = entity_platform.current_platform.set(cast("Any", RecordingPlatform()))
+    try:
+        await cover_module.async_setup_entry(hass, entry, lambda *_a, **_k: None)
+    finally:
+        entity_platform.current_platform.reset(token)
+        hub.close()
+
+    assert ("reanchor", "async_reanchor") in registered

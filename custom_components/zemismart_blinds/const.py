@@ -66,10 +66,17 @@ MQTT_RX_FIELD_FRAME: Final = "frame"
 
 SERVICE_SEND_RAW: Final = "send_raw"
 SERVICE_NEW_VIRTUAL_REMOTE: Final = "new_virtual_remote"
+SERVICE_REANCHOR: Final = "reanchor"
 
 ATTR_BRIDGE: Final = "bridge"
 ATTR_RAW: Final = "raw"
 ATTR_REPEATS: Final = "repeats"
+ATTR_ENDPOINT: Final = "endpoint"
+
+# reanchor drives a cover to one hard endpoint; the motor's own limit switch is
+# the physical reference the outcome-based anchor logic re-verifies against.
+ENDPOINT_OPEN: Final = "open"
+ENDPOINT_CLOSE: Final = "close"
 
 MANUAL_REMOTE: Final = "manual"
 VIRTUAL_REMOTE: Final = "virtual"
