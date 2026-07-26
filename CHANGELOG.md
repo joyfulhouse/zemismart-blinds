@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-07-26
+
+### Fixed
+
+- **Concurrency counting is now actually shared between the callers that need it.** 0.5.4 added a
+  parameter to pass a precomputed count into the window calculation and then never wired it to a
+  single caller — dead code. It is now supplied by all three call sites and memoised across
+  `match()`'s two anchor-lag passes, so an entry is counted once per classification instead of
+  once per pass.
+
+### Changed
+
+- **Corrected the performance figure published in 0.5.4.** That entry quoted ~47 µs for a
+  full-miss `match()`. The benchmark behind it measured a capture whose signature *nobody had
+  registered*, which short-circuits before the count is ever reached — it made **zero** calls to
+  the counting function, so it measured the one path this work cannot slow down.
+
+  Measured against the case that matters — a capture whose signature we *do* own, landing outside
+  every window, which is exactly the near-miss the WARNING exists for — at the 64-entry per-bridge
+  cap: **140 µs** for a realistic spread (covers across distinct channels), and **1.4 ms** for an
+  adversarial shape (all 64 entries contending on one channel) that the 16-channel protocol and a
+  16-cover house cannot actually produce. Both are down roughly 2x from 0.5.4 thanks to the
+  memoisation above.
+
+  These are dev-machine numbers. **They have not been measured on the Raspberry Pi this runs on**,
+  and no claim is made that they hold there.
+
+  Found by adversarial review, which reproduced the discrepancy rather than accepting the figure.
+
 ## [0.5.4] - 2026-07-26
 
 ### Fixed
@@ -23,9 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start with no stretch, widen by what the current count implies, recount, and settle. The count
   only grows, so it converges, and the sixteen-target cap bounds the passes.
 
-  Concurrency is counted once per entry per classification rather than once per window, since this
-  runs inside every capture's classification. At the per-bridge cap that is ~17 µs per count and
-  ~47 µs for a full-miss match.
+  Concurrency is counted once per entry per classification — memoised across `match()`'s two
+  anchor-lag passes — rather than once per window.
 
   Found by adversarial review. Every test shipped with 0.5.3 registered its peers at a single
   handoff, which is exactly why none of them caught it.

@@ -577,6 +577,10 @@ class CommandLedger:
         wins outright; only when nothing fits on those terms does the budget
         get spent, newest-first as before.
         """
+        # match() sweeps the ledger twice -- once refusing the anchor-lag
+        # budget, once spending it -- so without this an entry considered in
+        # both passes pays for the same peer scan twice.
+        counts: dict[str, int] = {}
         for spend_anchor_lag in (False, True):
             for command_id in reversed(self._entries):
                 entry = self._entries[command_id]
@@ -584,11 +588,22 @@ class CommandLedger:
                     frame.signature == signature for frame in entry.frames
                 ):
                     return "pending", entry.command_id, entry.bridge_id
-                if entry.phase == "confirmed" and any(
+                if entry.phase != "confirmed" or not any(
+                    window.signature == signature for window in entry.windows
+                ):
+                    continue
+                # Counted once for this entry, not once per window: a
+                # multi-window entry that does not win outright would
+                # otherwise repeat the whole peer scan per window, and that
+                # is exactly the near-miss case this runs hottest in.
+                concurrency = counts.get(command_id)
+                if concurrency is None:
+                    concurrency = counts[command_id] = self._round_robin_concurrency(entry)
+                if any(
                     window.signature == signature
                     and (window.starts_at if spend_anchor_lag else window.nominal_starts_at)
                     <= heard_at
-                    <= self._effective_ends_at(entry, window)
+                    <= self._effective_ends_at(entry, window, concurrency)
                     for window in entry.windows
                 ):
                     return "confirmed", entry.command_id, entry.bridge_id
@@ -744,7 +759,9 @@ class CommandLedger:
                 # Report the bounds match() actually judged against, including
                 # any round-robin stretch -- logging the nominal edge would
                 # understate the miss and send a reader hunting the wrong gap.
-                ends_at = self._effective_ends_at(entry, window)
+                ends_at = self._effective_ends_at(
+                    entry, window, self._round_robin_concurrency(entry)
+                )
                 _LOGGER.warning(
                     "state_sync: %s capture outside command %s window "
                     "[%.3f, %.3f] by %.3fs; treating as a physical press",
@@ -809,8 +826,10 @@ class CommandLedger:
                 return False
             if entry.displaced or not entry.windows:
                 return True
+            concurrency = self._round_robin_concurrency(entry)
             latest_effective_end = max(
-                self._effective_ends_at(entry, window) for window in entry.windows
+                self._effective_ends_at(entry, window, concurrency)
+                for window in entry.windows
             )
             return now > latest_effective_end + _LEDGER_ENTRY_TTL_SECONDS
         return (
