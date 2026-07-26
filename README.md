@@ -196,10 +196,16 @@ These are real behaviours worth knowing before you rely on the integration for s
 important.
 
 - **Position is assumed, never measured.** See [About position](#about-position).
-- **More RF repeats trades reliability for responsiveness.** While the integration is transmitting,
-  it treats matching signals as its own — so a physical remote press right after a command can go
-  unnoticed for roughly **9.5 s** at the default `repeats: 3`, or **26.5 s** at the maximum of 20.
-  Several blinds moving at once through one bridge extends that further.
+- **More RF repeats trades reliability for responsiveness.** While the integration is
+  transmitting, it treats matching signals as its own — so a physical remote press right after a
+  command can go **unnoticed by Home Assistant** for roughly **9.5 s** at the default `repeats: 3`,
+  or **26.5 s** at the maximum of 20. Several blinds moving at once through one bridge stretches
+  that too — about **21 s** at the default with seven moving together.
+
+  **Your blind still stops.** The remote talks straight to the motor; nothing here sits in
+  between. What lags is only Home Assistant noticing you took over, so its position estimate can
+  be wrong until the next command. This also only applies to *partial* position moves — a plain
+  open or close is recognised immediately, however many blinds are moving.
 - **A bridge that loses Wi-Fi mid-command** still runs its already-armed stop timer locally. Other
   bridges take over meanwhile, and that late stop can still reach the motor. Re-issue the movement
   if a blind stops unexpectedly.

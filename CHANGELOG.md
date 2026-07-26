@@ -93,10 +93,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded by the firmware's sixteen-target limit so a miscount cannot widen a window without end.
   The lower edge, and its anchor-lag tolerance from 0.5.2, are untouched.
 
-  The cost is honest and bounded: while the window is open a genuine same-signature press is
-  absorbed, so takeover detection at seven concurrent targets is suppressed for about 15.7 s
-  rather than 3.75 s. Widening remains the safe direction — the alternative is asserting a
-  takeover we cannot distinguish from our own transmission.
+  The cost is honest and bounded: while a window is open a genuine same-signature press is
+  absorbed rather than recognised as a takeover. Measured on the frame's own window, seven
+  concurrent targets hold it open about 15.7 s instead of 3.75 s. Counted the way the `repeats`
+  help text counts it — the full span a real press can be missed, including the anchor-lag
+  tolerance below the window — the same case moves from about 9.5 s to about 21 s.
+
+  Note what is and is not affected. Only a press matching a frame we actually own can be absorbed,
+  so this reaches **timed partial moves**, which carry an armed `stop_raw`. A plain open or close
+  owns no STOP frame, so a physical STOP during one is still recognised immediately at any
+  concurrency. And nothing here sits between the remote and the motor: the blind stops either way,
+  it is Home Assistant's model that lags.
+
+  Widening remains the safe direction — the alternative is asserting a takeover we cannot
+  distinguish from our own transmission.
 
 - **A travel that ends against a hard limit re-anchors itself** (#23). Both endpoints are
   physical stops, so a cover that ran a travel out to 0 or 100 is held there by the motor's own
