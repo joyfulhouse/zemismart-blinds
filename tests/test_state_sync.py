@@ -1539,3 +1539,300 @@ def test_hold_against_a_pending_timed_displacer_resolves_without_a_phantom_press
     consumer.resume_holds("displacer")
 
     assert dispatched == []
+
+
+# #21: a bridge holding several targets dispatches them ROUND-ROBIN, one slot
+# each, so a command's own repeats are spread across the OTHER targets' slots
+# too -- not sent back-to-back the way `_ledger_airtime_ms` assumes. Reproduces
+# the office-bridge sweep from the issue: seven covers on one bridge, admitted
+# at effectively the same instant (repeats=3, the production default).
+_ROUND_ROBIN_BRIDGE: Final = "bridge-office"
+_ROUND_ROBIN_PEER: Final = "bridge-peer"
+_ROUND_ROBIN_TARGET_COUNT: Final = 7
+_ROUND_ROBIN_TRAIN_MS: Final = 3_000
+_ROUND_ROBIN_HANDOFF: Final = 0.0
+# Measured on air (#21) for repeats=3 at this concurrency: an own repeat heard
+# at +8.1 s, well outside the un-stretched 3.75 s window (3 s train + 0.75 s
+# slack) but inside the round-robin-stretched one this fix computes:
+# (repeats - 1) * (targets - 1) * 1 s + 3.75 s = 2 * 6 * 1 + 3.75 = 15.75 s.
+_ROUND_ROBIN_LATE_OWN_REPEAT: Final = 8.1
+_ROUND_ROBIN_STRETCHED_CLOSE: Final = 15.75
+# Comfortably past the stretched close above: proves the window is bounded,
+# not merely widened until nothing fires.
+_ROUND_ROBIN_GENUINE_PRESS_TIME: Final = 20.0
+
+
+# The real Mode: Away sweep admitted its covers about two seconds apart over
+# roughly eleven seconds, not all at once -- see the logbook reconstruction in
+# issue #21. Concurrency has to be counted for that shape too.
+_ROUND_ROBIN_STAGGER_SECONDS: Final = 2.0
+
+
+def _register_staggered_round_robin_burst(
+    ledger: CommandLedger,
+    consumer: StateSyncConsumer,
+) -> None:
+    """Confirm seven same-bridge commands admitted two seconds apart."""
+    for index in range(_ROUND_ROBIN_TARGET_COUNT):
+        channels = (index + 1,)
+        command_id = f"sweep-{index}"
+        handoff = _ROUND_ROBIN_HANDOFF + index * _ROUND_ROBIN_STAGGER_SECONDS
+        ledger.register_pending(
+            command_id,
+            _ROUND_ROBIN_BRIDGE,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    _required_signature(channels, "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=_ROUND_ROBIN_TRAIN_MS,
+                ),
+            ],
+        )
+        consumer.record_commanded_start(_REMOTE_KEY, frozenset(channels), handoff)
+        ledger.confirm(command_id, handoff)
+
+
+def test_staggered_burst_counts_concurrency_past_its_nominal_span() -> None:
+    """A sweep admitted gradually must still be recognised as concurrent.
+
+    Counting a peer only when its UNSTRETCHED span overlaps ours answers a
+    strictly smaller question than the one that matters, because stretch is
+    precisely what makes real occupancy exceed the nominal span. At the real
+    sweep's two-second cadence that undercounted seven concurrent targets as
+    two, closing the window at +5.75 s and dispatching this command's own
+    +8.1 s repeat as a physical press -- the very failure #21 shipped to fix,
+    for the admission shape the incident actually had.
+
+    Consumer level, through ``handle_rx`` WITH ``record_commanded_start``.
+    """
+    ledger = CommandLedger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_ROUND_ROBIN_HANDOFF]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+    _register_staggered_round_robin_burst(ledger, consumer)
+
+    assert ledger._round_robin_concurrency(ledger._entries["sweep-0"]) == (
+        _ROUND_ROBIN_TARGET_COUNT
+    )
+
+    heard_at = _ROUND_ROBIN_HANDOFF + 8.1
+    now_value[0] = heard_at
+    consumer.handle_rx(
+        _ROUND_ROBIN_PEER,
+        _BOOT,
+        int(heard_at * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "DOWN"),
+        heard_at,
+    )
+
+    assert dispatched == []
+    assert "sweep-0" in proofs
+
+
+def _register_round_robin_burst(ledger: CommandLedger, consumer: StateSyncConsumer) -> None:
+    """Confirm seven same-bridge, distinct-channel commands at one instant."""
+    for index in range(_ROUND_ROBIN_TARGET_COUNT):
+        channels = (index + 1,)
+        command_id = f"office-{index}"
+        ledger.register_pending(
+            command_id,
+            _ROUND_ROBIN_BRIDGE,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    _required_signature(channels, "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=_ROUND_ROBIN_TRAIN_MS,
+                ),
+            ],
+        )
+        consumer.record_commanded_start(
+            _REMOTE_KEY,
+            frozenset(channels),
+            _ROUND_ROBIN_HANDOFF,
+        )
+        ledger.confirm(command_id, _ROUND_ROBIN_HANDOFF)
+
+
+def test_round_robin_burst_late_own_repeat_is_not_dispatched_as_press() -> None:
+    """A same-bridge concurrent burst must not phantom-press its own repeats.
+
+    Driven through ``handle_rx`` WITH ``record_commanded_start``, exactly like
+    the pinned STOP-echo regression above: the commanded-start guard cannot
+    help here either, because this late copy arrives well AFTER our own
+    recorded start, not before it. Before this fix, ``_ledger_airtime_ms``
+    charged this command's train as if it ran alone on the bridge, closing its
+    window at +3.75 s; the office bridge's real round-robin scheduling among
+    seven targets pushes the true last repeat out to +8.1 s, well past that,
+    and the frame dispatched as a physical press on a cover HA still believed
+    it was driving.
+    """
+    ledger = CommandLedger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_ROUND_ROBIN_HANDOFF]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+    _register_round_robin_burst(ledger, consumer)
+
+    # Command index 2's own late repeat, overheard by a peer bridge.
+    now_value[0] = _ROUND_ROBIN_LATE_OWN_REPEAT
+    consumer.handle_rx(
+        _ROUND_ROBIN_PEER,
+        _BOOT,
+        int(_ROUND_ROBIN_LATE_OWN_REPEAT * _MILLISECONDS_PER_SECOND),
+        _frame((3,), "DOWN"),
+        _ROUND_ROBIN_LATE_OWN_REPEAT,
+    )
+
+    assert dispatched == []
+    assert "office-2" in proofs
+
+
+def test_genuine_press_after_round_robin_burst_window_still_dispatches() -> None:
+    """The round-robin stretch is bounded, not an unbounded widening.
+
+    Requirement, not a nicety: an over-wide window would suppress genuine
+    takeover detection for its whole span. This proves detection resumes once
+    a capture is genuinely past the round-robin-stretched close -- the fix
+    widens proportionally to the SEVEN observed concurrent targets, it does
+    not simply stop firing forever.
+    """
+    ledger = CommandLedger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_ROUND_ROBIN_HANDOFF]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+    _register_round_robin_burst(ledger, consumer)
+
+    assert _ROUND_ROBIN_GENUINE_PRESS_TIME > _ROUND_ROBIN_STRETCHED_CLOSE
+
+    now_value[0] = _ROUND_ROBIN_GENUINE_PRESS_TIME
+    consumer.handle_rx(
+        _ROUND_ROBIN_PEER,
+        _BOOT,
+        int(_ROUND_ROBIN_GENUINE_PRESS_TIME * _MILLISECONDS_PER_SECOND),
+        _frame((3,), "DOWN"),
+        _ROUND_ROBIN_GENUINE_PRESS_TIME,
+    )
+
+    assert [event.button for event in dispatched] == ["DOWN"]
+
+
+# A direct (ledger-internal) check of the 16-target cap itself: twenty commands
+# sharing one channel and bridge would imply concurrency=20 if uncounted, but
+# the firmware can never round-robin more than sixteen targets (a 1..16
+# channel field), so the stretch must be computed as if only sixteen were
+# live. This supplements, and does not replace, the consumer-level tests
+# above: it pins the specific bound from requirement 3, which those two
+# black-box captures cannot distinguish from an unbounded count.
+_CAP_TARGET_COUNT: Final = 20
+# repeats=3 (production default) so (repeats - 1) = 2 actually scales with
+# concurrency; repeats=1 would zero the stretch term regardless of any cap.
+_CAP_TRAIN_MS: Final = 3_000
+_CAP_HANDOFF: Final = 0.0
+# Capped at 16 targets: (repeats=3 - 1) * (16 - 1) * 1 s + (3 s train + 0.75 s
+# slack) = 30 + 3.75 = 33.75 s. Uncapped at all twenty: (3 - 1) * (20 - 1) * 1
+# s + 3.75 s = 38 + 3.75 = 41.75 s.
+_CAP_BETWEEN_CAPPED_AND_UNCAPPED: Final = 37.0
+
+
+def test_round_robin_concurrency_is_capped_at_the_firmware_target_limit() -> None:
+    """More confirmed peers than the firmware could ever hold stop counting."""
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "DOWN")
+    for index in range(_CAP_TARGET_COUNT):
+        ledger.register_pending(
+            f"cap-{index}",
+            _BRIDGE_A,
+            (1,),
+            "DOWN",
+            [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=_CAP_TRAIN_MS)],
+        )
+        ledger.confirm(f"cap-{index}", _CAP_HANDOFF)
+
+    assert ledger.match(signature, _CAP_BETWEEN_CAPPED_AND_UNCAPPED) is None
+
+
+# #22 coherence check: a TIMED move's action frame is deliberately truncated
+# below the full repeat train (models.py::_ledger_registration computes
+# `action_ms = min(train_ms, stop_after_ms + _LEDGER_REPEAT_AIRTIME_MS)`,
+# unchanged by this fix) because its fail-safe STOP promotes and preempts
+# the remaining action repeats at its wall-clock deadline. The round-robin
+# stretch must compose with that truncation rather than fight it: it is
+# applied per-window from THAT window's own `train_seconds`, so the
+# (already-shorter) action window is stretched using its own smaller
+# effective repeat count, while the untruncated STOP window -- a separate
+# window on a separate signature -- is stretched using the full count. This
+# pins that composition with a concrete number rather than only reasoning
+# about it.
+_TIMED_ROUND_ROBIN_HANDOFF: Final = 0.0
+_TIMED_ROUND_ROBIN_TARGET_COUNT: Final = 7
+_TIMED_ROUND_ROBIN_TRAIN_MS: Final = 3_000  # repeats=3, the production default
+# Chosen to avoid an exact .5 s boundary (Python's round() is round-half-to-
+# even, which would make the effective repeat count ambiguous at one).
+_TIMED_ROUND_ROBIN_STOP_AFTER_MS: Final = 1_200
+# action_ms = min(3000, 1200 + 1000) = 2200 -> train_seconds=2.2 -> repeats=2.
+# Nominal action window closes at 2.2 + 0.75 = 2.95 s. Stretched by
+# concurrency=7: (2 - 1) * (7 - 1) * 1 s = 6 s -> closes at 8.95 s.
+_TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO: Final = 5.0
+
+
+def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window() -> None:
+    """A timed move's shortened action window still stretches correctly (#22).
+
+    Without this composition, a timed move's own late-but-legitimate action
+    repeat -- already narrowed by the fail-safe-STOP truncation -- would be
+    doubly disadvantaged under concurrency: narrowed AND unstretched. This
+    proves the stretch still reaches a truncated window using that window's
+    own (smaller) repeat count, exactly as it does for an untruncated one.
+    """
+    ledger = CommandLedger()
+    action = _required_signature((1,), "DOWN")
+    stop = _required_signature((1,), "STOP")
+    ledger.register_pending(
+        "timed-office",
+        _ROUND_ROBIN_BRIDGE,
+        (1,),
+        "DOWN",
+        [
+            LedgerFrameSpec(
+                action,
+                offset_ms=0,
+                airtime_ms=(
+                    _TIMED_ROUND_ROBIN_STOP_AFTER_MS + state_sync_module._LEDGER_REPEAT_AIRTIME_MS
+                ),
+            ),
+            LedgerFrameSpec(
+                stop,
+                offset_ms=_TIMED_ROUND_ROBIN_STOP_AFTER_MS,
+                airtime_ms=_TIMED_ROUND_ROBIN_TRAIN_MS,
+            ),
+        ],
+    )
+    ledger.confirm("timed-office", _TIMED_ROUND_ROBIN_HANDOFF)
+    for index in range(_TIMED_ROUND_ROBIN_TARGET_COUNT - 1):
+        channels = (index + 10,)
+        ledger.register_pending(
+            f"peer-{index}",
+            _ROUND_ROBIN_BRIDGE,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    _required_signature(channels, "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=_TIMED_ROUND_ROBIN_TRAIN_MS,
+                ),
+            ],
+        )
+        ledger.confirm(f"peer-{index}", _TIMED_ROUND_ROBIN_HANDOFF)
+
+    assert ledger.match(action, _TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO) == (
+        "confirmed",
+        "timed-office",
+        _ROUND_ROBIN_BRIDGE,
+    )

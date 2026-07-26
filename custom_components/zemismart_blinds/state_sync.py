@@ -46,6 +46,15 @@ _LEDGER_PENDING_TTL_SECONDS: Final = 30.0
 _DISPLACED_STOP_DRAIN_SECONDS: Final = 30.0
 _LEDGER_PER_BRIDGE_CAP: Final = 64
 _LEDGER_GLOBAL_CAP: Final = 256
+# Mirrors models._LEDGER_REPEAT_AIRTIME_MS: this module is imported BY
+# models.py and must not import back, so the shared calibration is
+# duplicated rather than centralized -- keep both in step.
+_LEDGER_REPEAT_AIRTIME_MS: Final = 1_000
+# The firmware's channel field is a 1..16 range (validate_channels in
+# codec.py), so one bridge can never be round-robining more targets than
+# that. Caps the concurrency counted at match() time so a counting bug
+# cannot stretch a window past a known bound (#21).
+_LEDGER_MAX_CONCURRENT_TARGETS: Final = 16
 
 _EXACT_EVENT_TTL_SECONDS: Final = 60.0
 _EXACT_EVENT_CAP: Final = 1_024
@@ -299,6 +308,30 @@ class _LedgerEntry:
     handoff: float | None = None
 
 
+def _round_robin_stretch_seconds(train_seconds: float, concurrency: int) -> float:
+    """Return extra tail seconds one train gains when interleaved with peers.
+
+    A command alone on its bridge sends its whole repeat train back-to-back --
+    ``train_seconds`` already models exactly that contiguous case, and this
+    returns 0 for it, collapsing to today's exact behaviour whenever a bridge
+    serves only one target.
+
+    With ``concurrency`` total targets sharing the bridge, the firmware's
+    TargetScheduler round-robins every currently-armed target one slot each
+    (rf433_scheduler.h), so only the FIRST of the command's own repeats keeps
+    its native timing: each of the remaining repeats is pushed out behind
+    (concurrency - 1) other targets' slots instead of behind none. One slot
+    is charged _LEDGER_REPEAT_AIRTIME_MS, the same conservative per-copy
+    envelope the contiguous case already uses, so this stays proportional to
+    OBSERVED concurrency rather than a blanket multiplier of the whole train.
+    """
+    if concurrency <= 1 or train_seconds <= 0:
+        return 0.0
+    repeats = max(1, round(train_seconds * _MILLISECONDS_PER_SECOND / _LEDGER_REPEAT_AIRTIME_MS))
+    extra_ms = (repeats - 1) * (concurrency - 1) * _LEDGER_REPEAT_AIRTIME_MS
+    return extra_ms / _MILLISECONDS_PER_SECOND
+
+
 class CommandLedger:
     """Correlate known command frames with received RF captures."""
 
@@ -431,6 +464,104 @@ class CommandLedger:
         entry.displaced = True
         return flushed
 
+    @staticmethod
+    def _nominal_span(entry: _LedgerEntry) -> tuple[float, float] | None:
+        """Return one CONFIRMED command's own contiguous transmission span.
+
+        Ignores any round-robin stretch: this is the span the command would
+        occupy if it were the bridge's only target, used purely to detect
+        whether another command's own train was scheduled to run at the same
+        time -- the condition that makes the firmware interleave them.
+        """
+        if entry.handoff is None or not entry.frames:
+            return None
+        latest_end_ms = max(frame.offset_ms + frame.airtime_ms for frame in entry.frames)
+        return entry.handoff, entry.handoff + latest_end_ms / _MILLISECONDS_PER_SECOND
+
+    def _round_robin_concurrency(self, entry: _LedgerEntry) -> int:
+        """Count same-bridge commands whose own trains overlapped this one's.
+
+        Evaluated fresh on every call rather than once at registration: a
+        command confirmed while it is alone must still pick up concurrency
+        from a peer that is only admitted (and only then gets a ``handoff``)
+        afterward, and the reverse — an earlier peer's own count growing once
+        this command joins it — has to hold too, since the firmware round-
+        robins EVERY currently-armed target, not just ones queued after this
+        one. Only non-displaced, CONFIRMED peers count: a displaced entry's
+        window describes a flush drain (see ``displace``), a different
+        mechanism that round-robin stretch does not apply to.
+
+        Bounded by the firmware's 1..16 channel range so a counting bug can
+        widen a window at most sixteen-fold, never without limit.
+        """
+        span = self._nominal_span(entry)
+        if span is None or not entry.frames:
+            return 1
+        start, end = span
+        train_seconds = max(frame.airtime_ms for frame in entry.frames) / _MILLISECONDS_PER_SECOND
+        peers: list[tuple[float, float]] = []
+        for other in self._entries.values():
+            if (
+                other.command_id == entry.command_id
+                or other.bridge_id != entry.bridge_id
+                or other.displaced
+            ):
+                continue
+            other_span = self._nominal_span(other)
+            if other_span is not None:
+                peers.append(other_span)
+        if not peers:
+            return 1
+
+        # Fixed point, because the question is circular: whether a peer shares
+        # the antenna with us depends on how long we are really on it, which
+        # depends on how many peers share it. Comparing nominal span against
+        # nominal span answers a strictly smaller question and undercounts a
+        # STAGGERED burst -- peers admitted after our nominal window closes but
+        # while the firmware is demonstrably still interleaving us. Start from
+        # no stretch, widen by what the current count implies, recount, and
+        # settle. The count only ever grows, so this converges, and the cap
+        # bounds the passes.
+        concurrency = 1
+        for _pass in range(_LEDGER_MAX_CONCURRENT_TARGETS):
+            reach = _round_robin_stretch_seconds(train_seconds, concurrency)
+            counted = min(
+                1
+                + sum(
+                    1
+                    for other_start, other_end in peers
+                    if other_start <= end + reach and start <= other_end + reach
+                ),
+                _LEDGER_MAX_CONCURRENT_TARGETS,
+            )
+            if counted == concurrency:
+                break
+            concurrency = counted
+        return concurrency
+
+    def _effective_ends_at(
+        self,
+        entry: _LedgerEntry,
+        window: _LedgerWindow,
+        concurrency: int | None = None,
+    ) -> float:
+        """Return one window's upper edge, stretched for observed round-robin.
+
+        A displaced entry's window already describes a flush drain rather
+        than a normal repeat train, so it is excluded here exactly as it is
+        in ``_round_robin_concurrency``.
+
+        ``concurrency`` may be supplied by a caller that already counted it for
+        this entry, so a multi-window entry counts once per classification
+        rather than once per window -- this runs inside match(), on every
+        received capture.
+        """
+        if entry.displaced:
+            return window.ends_at
+        if concurrency is None:
+            concurrency = self._round_robin_concurrency(entry)
+        return window.ends_at + _round_robin_stretch_seconds(window.train_seconds, concurrency)
+
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the best-fitting pending or windowed confirmed command match.
 
@@ -446,6 +577,10 @@ class CommandLedger:
         wins outright; only when nothing fits on those terms does the budget
         get spent, newest-first as before.
         """
+        # match() sweeps the ledger twice -- once refusing the anchor-lag
+        # budget, once spending it -- so without this an entry considered in
+        # both passes pays for the same peer scan twice.
+        counts: dict[str, int] = {}
         for spend_anchor_lag in (False, True):
             for command_id in reversed(self._entries):
                 entry = self._entries[command_id]
@@ -453,11 +588,22 @@ class CommandLedger:
                     frame.signature == signature for frame in entry.frames
                 ):
                     return "pending", entry.command_id, entry.bridge_id
-                if entry.phase == "confirmed" and any(
+                if entry.phase != "confirmed" or not any(
+                    window.signature == signature for window in entry.windows
+                ):
+                    continue
+                # Counted once for this entry, not once per window: a
+                # multi-window entry that does not win outright would
+                # otherwise repeat the whole peer scan per window, and that
+                # is exactly the near-miss case this runs hottest in.
+                concurrency = counts.get(command_id)
+                if concurrency is None:
+                    concurrency = counts[command_id] = self._round_robin_concurrency(entry)
+                if any(
                     window.signature == signature
                     and (window.starts_at if spend_anchor_lag else window.nominal_starts_at)
                     <= heard_at
-                    <= window.ends_at
+                    <= self._effective_ends_at(entry, window, concurrency)
                     for window in entry.windows
                 ):
                     return "confirmed", entry.command_id, entry.bridge_id
@@ -592,9 +738,17 @@ class CommandLedger:
     def _log_near_miss(self, signature: FrameSignature, heard_at: float) -> None:
         """Report a capture we own the signature of but classified as a press.
 
-        _LEDGER_ANCHOR_LAG_SECONDS is calibrated against a single measurement.
-        If real skew ever exceeds it this is the only warning: the capture
-        becomes a phantom physical press and silently takes a cover over.
+        Emitted at WARNING because it really is the only warning: the capture
+        becomes a phantom physical press and takes a cover over, and every
+        other symptom of that is silent -- no error, no unavailable, just a
+        position that stops matching the window. It stayed invisible at DEBUG
+        through two production freezes on 2026-07-25 (#21, #23), which is
+        precisely the evidence this line exists to provide.
+
+        A genuine press landing just outside a window we own logs here too.
+        That false positive is worth accepting: it is rare, it names the
+        command and the miss distance, and the alternative is the phantom
+        takeover staying undiagnosable.
         """
         for entry in self._entries.values():
             if entry.phase != "confirmed":
@@ -602,14 +756,20 @@ class CommandLedger:
             for window in entry.windows:
                 if window.signature != signature:
                     continue
-                _LOGGER.debug(
+                # Report the bounds match() actually judged against, including
+                # any round-robin stretch -- logging the nominal edge would
+                # understate the miss and send a reader hunting the wrong gap.
+                ends_at = self._effective_ends_at(
+                    entry, window, self._round_robin_concurrency(entry)
+                )
+                _LOGGER.warning(
                     "state_sync: %s capture outside command %s window "
                     "[%.3f, %.3f] by %.3fs; treating as a physical press",
                     signature[2],
                     entry.command_id,
                     window.starts_at,
-                    window.ends_at,
-                    min(abs(heard_at - window.starts_at), abs(heard_at - window.ends_at)),
+                    ends_at,
+                    min(abs(heard_at - window.starts_at), abs(heard_at - ends_at)),
                 )
                 return
 
@@ -647,11 +807,31 @@ class CommandLedger:
             ),
         )
 
-    @staticmethod
-    def _is_expired(entry: _LedgerEntry, now: float) -> bool:
-        """Return whether one entry exceeded its phase-specific lifetime."""
+    def _is_expired(self, entry: _LedgerEntry, now: float) -> bool:
+        """Return whether one entry exceeded its phase-specific lifetime.
+
+        ``expires_at`` is computed once, at ``confirm()``, from that command's
+        OWN windows only -- it cannot yet know about a peer that stretches its
+        round-robin concurrency by confirming later. So a confirmed entry past
+        its nominal ``expires_at`` gets one more look at its CURRENT
+        round-robin-stretched close before eviction: without it, GC could
+        delete the entry -- and with it, match()'s stretched window -- before
+        a legitimately late own-repeat ever reached this ledger to be
+        classified by it.
+        """
         if entry.phase == "confirmed":
-            return entry.expires_at is not None and now > entry.expires_at
+            if entry.expires_at is None:
+                return False
+            if now <= entry.expires_at:
+                return False
+            if entry.displaced or not entry.windows:
+                return True
+            concurrency = self._round_robin_concurrency(entry)
+            latest_effective_end = max(
+                self._effective_ends_at(entry, window, concurrency)
+                for window in entry.windows
+            )
+            return now > latest_effective_end + _LEDGER_ENTRY_TTL_SECONDS
         return (
             entry.pending_since is not None
             and now - entry.pending_since > _LEDGER_PENDING_TTL_SECONDS

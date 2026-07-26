@@ -8,6 +8,39 @@ All line references are against `main` at the time of writing (commit `aca64cc`)
 
 ---
 
+## SUPERSEDED, 2026-07-25 (same day) — do not implement §3
+
+§6 closed with "I would not ship any of this without bridge-side TX evidence." That evidence
+was then obtained, without moving a blind, by transmitting to **bogus identities** (`A1B2Cx:4x`)
+and reading the frames back off six idle peer bridges' `/rx` stamps. Full data in issue #19.
+It refutes the premise of §3:
+
+- **Trains interleave round-robin, one 609 ms slot per target — but nothing is dropped.**
+  Every admitted repeat reaches the air.
+- **One dispatch is already a complete press.** The B0 frame carries **8 embedded OEM repeats**
+  (`AAB0 4D 04 08 …`, ~76 ms each, 609 ms total). Interleaving changes *when* presses land,
+  never what they contain, so Candidate 1's starvation mechanism (§2) cannot work as described.
+- **An armed STOP truncates nothing** (§2 Candidate 2), it is merely late — ~0.94 s at N=2.
+
+**Therefore Options A and B (§3.2, §3.3) should NOT be implemented.** They would add ~1.8 s per
+consecutive same-bridge movement, and up to +11.0 s on a single-bridge 7-cover sweep, to suppress
+an overlap now measured to be benign. §3.5's "do not raise `repeats`" is likewise **withdrawn**:
+it rested on overlap being harmful, so raising repeats is back on the table as the correct,
+directly-targeted mitigation for a marginal motor, costing only the #20 tradeoff.
+
+Two findings survive and are strengthened:
+
+1. **§4's peer-corroboration signal is weaker than assessed.** The control run showed an idle,
+   in-range peer hears only **~50%** of frames — it is deaf for roughly one slot after each
+   capture. "Zero peers heard it" is a far likelier innocent outcome than §4 assumed.
+2. **The real defect the measurement exposed is #21**, and it is the opposite of what §3 targeted:
+   not that concurrency starves a motor, but that concurrency stretches our own train past the
+   ledger's **upper** emission window, so our own repeats get classified as physical presses.
+   `_ledger_airtime_ms` assumes a contiguous train, which holds only at N=1. §5.1 was right that
+   ledger windows were the thing to re-test — just not for the reason it gave.
+
+---
+
 ## 0. TL;DR
 
 - **Publication is serialized for movements, but NOT for STOPs, and NEVER to train completion.** The one global worker (`models.py:2186`) awaits only `started` (`models.py:2653`), which fires ~0.14 s into a train that lasts **~1.9 s at repeats=3** (measured, §1.4). Fast-lane STOPs (`models.py:1968`, `1984-1990`) publish *concurrently* with the worker. So on-air trains on one bridge overlap by design.

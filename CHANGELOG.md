@@ -5,7 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.5] - 2026-07-26
+
+### Fixed
+
+- **Concurrency counting is now actually shared between the callers that need it.** 0.5.4 added a
+  parameter to pass a precomputed count into the window calculation and then never wired it to a
+  single caller — dead code. It is now supplied by all three call sites and memoised across
+  `match()`'s two anchor-lag passes, so an entry is counted once per classification instead of
+  once per pass.
+
+### Changed
+
+- **Corrected the performance figure published in 0.5.4.** That entry quoted ~47 µs for a
+  full-miss `match()`. The benchmark behind it measured a capture whose signature *nobody had
+  registered*, which short-circuits before the count is ever reached — it made **zero** calls to
+  the counting function, so it measured the one path this work cannot slow down.
+
+  Measured against the case that matters — a capture whose signature we *do* own, landing outside
+  every window, which is exactly the near-miss the WARNING exists for — at the 64-entry per-bridge
+  cap: **140 µs** for a realistic spread (covers across distinct channels), and **1.4 ms** for an
+  adversarial shape (all 64 entries contending on one channel) that the 16-channel protocol and a
+  16-cover house cannot actually produce. Both are down roughly 2x from 0.5.4 thanks to the
+  memoisation above.
+
+  These are dev-machine numbers. **They have not been measured on the target**, and no claim is
+  made that they hold there — the SSH add-on exposes no Python runtime and no way into the core
+  container, so benchmarking there needs instrumentation this change does not justify. For
+  calibration when someone does measure it: the deployment this was found on runs a **Raspberry Pi
+  Compute Module 5**, which is a considerably faster machine than the Pi 3-class hardware "a Pi"
+  usually implies.
+
+  Found by adversarial review, which reproduced the discrepancy rather than accepting the figure.
+
+## [0.5.4] - 2026-07-26
+
+### Fixed
+
+- **Round-robin concurrency is now counted for a gradual sweep, not just a simultaneous one**
+  (#21). The count in 0.5.3 asked whether a peer's *unstretched* span overlapped this command's.
+  That is a strictly smaller question than the one that matters, because stretch is precisely what
+  makes real occupancy exceed the nominal span. At the real sweep's cadence — covers admitted about
+  two seconds apart, the shape the 2026-07-25 incident actually had — it counted seven concurrent
+  targets as two, closed the window at 5.75 s, and dispatched the command's own 8.1 s repeat as a
+  physical press. That is the failure 0.5.3 shipped to prevent, still reachable for the admission
+  shape that caused it.
+
+  The question is circular: whether a peer shares the antenna depends on how long this command is
+  really on it, which depends on how many peers share it. It is now resolved by fixed point —
+  start with no stretch, widen by what the current count implies, recount, and settle. The count
+  only grows, so it converges, and the sixteen-target cap bounds the passes.
+
+  Concurrency is counted once per entry per classification — memoised across `match()`'s two
+  anchor-lag passes — rather than once per window.
+
+  Found by adversarial review. Every test shipped with 0.5.3 registered its peers at a single
+  handoff, which is exactly why none of them caught it.
+
+- **The near-miss warning now reports the bounds it actually judged against**, including any
+  round-robin stretch. Logging the nominal edge understated the miss and would send a reader
+  hunting the wrong gap.
+
+## [0.5.3] - 2026-07-25
+
+### Documentation
+
+- **README and INSTALL rewritten for people who just bought some blinds.** Both opened on
+  protocol architecture and hardware caveats before answering "is this for me?". The README now
+  leads with that question, states the one piece of hardware needed up front, and folds the
+  depth — air arbitration, virtual remotes, restart edge cases — into disclosure sections that
+  stay available without being in the way. Visible prose is down to about 40% of before with
+  nothing removed. INSTALL is now a four-step path with a what-you-need checklist and an explicit
+  "it's working when" check at the end of each step.
 
 ### Fixed
 
@@ -65,6 +136,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on one specific command for post-restart proof never received it. Window fit is now
   ranked: a capture that fits without spending the anchor-lag budget wins outright, and
   only when nothing fits on those terms is the budget spent.
+
+- **Our own repeats are no longer read as a physical press when one bridge serves several
+  blinds** (#21). A bridge holding more than one target dispatches them round-robin, one slot
+  each, so a command's own repeat train is spread out rather than sent back-to-back. The
+  own-emission window's upper edge was computed as if the train were always contiguous, so past
+  four concurrent targets our own later repeats fell outside it and were dispatched as a physical
+  remote press — invalidating the in-flight commanded motion and either re-anchoring travel at a
+  wrong instant or marking the cover unknown. Measured on air: at seven concurrent targets our own
+  frames were still going out 8.1 s after their handoff, against a window that closed at 3.75 s.
+
+  The upper edge now stretches by the round-robin concurrency actually observed, counted at
+  classification time from ledger state — not fixed at registration, because the peers that
+  stretch a train are usually admitted after it. Only the first repeat keeps native timing, so the
+  widening is `(repeats - 1) x (concurrent - 1)` slots rather than a blanket multiply of the whole
+  train, and it collapses to exactly today's behaviour when a bridge serves one target. It is
+  bounded by the firmware's sixteen-target limit so a miscount cannot widen a window without end.
+  The lower edge, and its anchor-lag tolerance from 0.5.2, are untouched.
+
+  The cost is honest and bounded: while a window is open a genuine same-signature press is
+  absorbed rather than recognised as a takeover. Measured on the frame's own window, seven
+  concurrent targets hold it open about 15.7 s instead of 3.75 s. Counted the way the `repeats`
+  help text counts it — the full span a real press can be missed, including the anchor-lag
+  tolerance below the window — the same case moves from about 9.5 s to about 21 s.
+
+  Note what is and is not affected. Only a press matching a frame we actually own can be absorbed,
+  so this reaches **timed partial moves**, which carry an armed `stop_raw`. A plain open or close
+  owns no STOP frame, so a physical STOP during one is still recognised immediately at any
+  concurrency. And nothing here sits between the remote and the motor: the blind stops either way,
+  it is Home Assistant's model that lags.
+
+  Widening remains the safe direction — the alternative is asserting a takeover we cannot
+  distinguish from our own transmission.
+
+- **A travel that ends against a hard limit re-anchors itself** (#23). Both endpoints are
+  physical stops, so a cover that ran a travel out to 0 or 100 is held there by the motor's own
+  limit switch and its estimate is corroborated by the hardware. That already settled a
+  questioned restore-time anchor, but only when the *commanded* target was an endpoint. A group
+  member whose own travel clamps to its limit while the group aims somewhere in between reaches
+  the same hard stop and was left questioned anyway, because `absolute_anchor` records the
+  group's intent rather than the member's outcome. Re-anchoring now keys on where the motion
+  actually ended.
+
+  Deliberately not applied to a position that merely *reads* 0 or 100 without a completed travel
+  behind it: a restored estimate from a questioned origin would then launder itself into a
+  verified one, which is what marking it unknown exists to prevent.
+
+### Documentation
+
+- **The RF-repeats selector now states the takeover-responsiveness tradeoff** (#20). `repeats`
+  is the number of complete press bursts the bridge puts on air — each already a full OEM burst
+  of embedded frame repeats, not a single frame. Raising it improves reliability for distant or
+  obstructed blinds, but each extra burst the bridge owes widens the interval in which a genuine
+  physical STOP press near a just-issued overlapping command is classified as our own flushed
+  emission instead of a takeover — about 9.5 s at the default 3, growing to about 26.5 s at the
+  maximum 20. That coupling was invisible at the point of choice; the `repeats` field's help
+  text in the add and reconfigure flows now quantifies it. This is documentation only: widening
+  the window is the correct, physically honest direction (see #16), so the fix is to inform the
+  choice, not bound it. The README note added after 0.5.2 covers the same tradeoff for readers
+  who never open the dialog.
 
 ## [0.5.2] - 2026-07-25
 

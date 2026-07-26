@@ -92,7 +92,7 @@
               "coalesce_window_ms": "Group coalescing window"
             },
             "data_description": {
-              "repeats": "How many times each RF frame is sent.",
+              "repeats": "How many times the full button press is retransmitted on air. Each transmission is already a complete OEM press burst, so this multiplies whole presses, not individual frames. More repeats improve reliability for distant or obstructed blinds, but they lengthen the interval in which a physical remote press near a just-issued command goes unrecognised as a takeover: about 9.5 s at the default 3, about 26.5 s at the maximum 20. Several blinds moving at once through one bridge extend that further.",
               "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
             }
           }
@@ -149,7 +149,7 @@
               "coalesce_window_ms": "Group coalescing window"
             },
             "data_description": {
-              "repeats": "How many times each RF frame is sent.",
+              "repeats": "How many times the full button press is retransmitted on air. Each transmission is already a complete OEM press burst, so this multiplies whole presses, not individual frames. More repeats improve reliability for distant or obstructed blinds, but they lengthen the interval in which a physical remote press near a just-issued command goes unrecognised as a takeover: about 9.5 s at the default 3, about 26.5 s at the maximum 20. Several blinds moving at once through one bridge extend that further.",
               "coalesce_window_ms": "Near-simultaneous commands for blinds on this remote merge into one group frame within this window. 0 disables coalescing."
             }
           }

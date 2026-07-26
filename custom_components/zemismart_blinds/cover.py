@@ -409,10 +409,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if now >= deadline:
             self._position = target
             self._clear_motion()
-            if absolute_anchor:
-                # A full travel that finished during downtime reached its hard
-                # limit just like one completed by _async_track_motion.
-                self._clear_unverified_anchor()
+            if absolute_anchor or target in {0.0, 100.0}:
+                # A travel that finished during downtime reached its hard limit
+                # just like one completed by _async_track_motion.
+                self._anchor_if_at_limit()
             elif (
                 timed
                 and not self._bridge_seen_online(bridge)
@@ -533,6 +533,34 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._unverified_anchor_bridge = None
         self._unverified_anchor_command_id = None
         self._unverified_anchor_offline = False
+
+    def _anchor_if_at_limit(self) -> None:
+        """Re-anchor a motion that actually ENDED against a hard limit.
+
+        Both endpoints are physical stops: a cover that ran a travel out to 0
+        or 100 is held there by the motor's own limit switch, so the estimate
+        is corroborated by the hardware no matter what the command asked for.
+        Any questioned anchor is settled by arriving there.
+
+        Deliberately keyed on the OUTCOME rather than the commanded target.
+        A group member whose own travel clamps to its limit reaches that hard
+        stop even when the group was aimed somewhere in between, and it was
+        previously left questioned because ``absolute_anchor`` records the
+        group's intent (see ``_start_member_motion``).
+
+        That shape is currently UNREACHABLE: the only production caller passes
+        a ``group_target`` of 0 or 100, so ``absolute_anchor`` is already true
+        whenever a member lands on a limit, and the previous intent-based gate
+        covered every live case. This keeps the guarantee keyed on the physical
+        fact rather than on that caller's argument staying an endpoint.
+
+        Equally deliberately NOT applied to a position that merely reads 0 or
+        100 without a travel behind it -- a restored estimate from a
+        questioned origin would then launder itself into a verified one, which
+        is exactly what _mark_unknown exists to prevent.
+        """
+        if self._position in (0.0, 100.0):
+            self._clear_unverified_anchor()
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
         """Return whether this bridge has explicitly announced itself online."""
@@ -903,11 +931,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if self._motion_token is not token:
             return
         self._position = self._motion_target
-        if self._motion_absolute_anchor:
-            # A commanded full travel ran its whole configured duration plus
-            # margin and is now at the hard limit: the questioned restore
-            # anchor is settled by a genuine physical reference.
-            self._clear_unverified_anchor()
+        # Ran its whole configured duration plus margin. If that landed on a
+        # limit the estimate now has a genuine physical reference behind it.
+        self._anchor_if_at_limit()
         self._motion_token = None
         self._motion_task = None
         self._clear_motion()

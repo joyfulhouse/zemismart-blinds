@@ -1,118 +1,149 @@
-# Installation Guide
+# Setup guide
 
-Complete setup takes three parts: an MQTT broker, at least one RF bridge, and this integration.
+Four steps. The only hard one is step 2 — it involves soldering two wires.
 
-## Prerequisites
+**Time:** about an hour for your first bridge, then ten minutes per remote.
 
-| Requirement | Details |
+---
+
+## What you need
+
+| | |
 |---|---|
-| **Home Assistant** | 2026.5 or newer with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) configured |
-| **MQTT broker** | Any broker works — the [Mosquitto add-on](https://www.home-assistant.io/addons/mosquitto/) is the easiest |
-| **RF bridge** | One or more Sonoff RF Bridge R2 units flashed with [joyfulhouse/esphome-rf433-mqtt-bridge][bridge-repo] — see [Step 2](#step-2--build-your-rf-bridges) |
-| **Blinds** | AOK OEM 433.92 MHz tubular motors (commonly sold as Zemismart) |
+| ☐ **Home Assistant** | 2026.5 or newer, with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) set up |
+| ☐ **An MQTT broker** | The [Mosquitto add-on](https://www.home-assistant.io/addons/mosquitto/) is easiest |
+| ☐ **A Sonoff RF Bridge R2** | 433 MHz variant — **revision matters**, see [step 2](#step-2--build-a-bridge) |
+| ☐ **Your blinds** | AOK 433.92 MHz tubular motors, usually sold as Zemismart |
+| ☐ **A stopwatch** | To time how long each blind takes to open and close |
+
+---
 
 ## Step 1 — MQTT broker
 
-If you don't already run a broker, install the Mosquitto add-on
-(**Settings → Add-ons → Add-on store → Mosquitto broker**), start it, and let Home Assistant's
-MQTT integration discover it. Any other broker (standalone Mosquitto, EMQX, NanoMQ, a NAS
-container) works the same way — this integration publishes through whatever broker Home
-Assistant's MQTT integration is connected to.
+Already running one? Skip ahead.
 
-## Step 2 — Build your RF bridge(s)
+Otherwise: **Settings → Add-ons → Add-on store → Mosquitto broker**, install it, start it, and let
+Home Assistant's MQTT integration discover it.
 
-Home Assistant has no 433 MHz radio, so every command reaches your blinds through a **Sonoff RF
-Bridge R2** running open firmware. This is the one part of the setup that involves hardware.
+Any broker works — standalone Mosquitto, EMQX, NanoMQ, something on a NAS. This integration just
+uses whatever broker Home Assistant's MQTT integration is connected to.
 
-### Buying the hardware
+---
+
+## Step 2 — Build a bridge
+
+Home Assistant can't speak 433 MHz on its own, so every command goes out through a small radio
+bridge.
+
+### Buy the right board
 
 | | |
 |---|---|
 | **What** | Sonoff RF Bridge R2, **433 MHz** variant |
-| **Where** | [itead.cc](https://itead.cc/product/sonoff-rf-bridge-433/) and the usual marketplaces |
-| **Validated on** | R2 **V1.0 / V2.0** (Silicon Labs **EFM8BB1** coprocessor) |
-| **Not supported** | R2 **V2.2** (2022+, **OB38S003** coprocessor) |
+| **Works** | R2 **V1.0 / V2.0** — Silicon Labs **EFM8BB1** chip |
+| **Does not work** | R2 **V2.2** (2022 onward) — **OB38S003** chip |
 
-> **Check the revision before you buy.** Sonoff swapped the RF coprocessor in 2022. This project
-> is validated only on the older **EFM8BB1** boards; the newer **OB38S003** cannot run the
-> Portisch firmware everything here depends on. Current stock from any seller — including the
-> link above — may ship either revision without saying so, so a new purchase is a gamble unless
-> the seller confirms the chip or you can return it. Secondhand R2 V1.0/V2.0 units are the safe
-> buy.
+> ⚠️ **Sonoff changed the radio chip in 2022 without changing the product name.**
+>
+> The newer chip can't run the firmware this project depends on. Sellers rarely state which
+> revision they're shipping, so buying new is a coin flip unless the seller confirms the chip or
+> you can return it. **Secondhand V1.0/V2.0 units are the safe buy.**
 
-### Flashing
+### Flash it
 
-Each bridge needs **two** firmwares — Portisch on the RF coprocessor, then the ESPHome package on
-the Wi-Fi chip. **[The bridge repo's HARDWARE.md][bridge-hardware] is the complete walkthrough**:
-identifying your board, soldering the two programming jumpers, using Tasmota as a one-time tool to
-flash Portisch, then replacing it with the ESPHome package.
+Each bridge needs **two** firmwares: one for the radio chip, one for the Wi-Fi chip.
 
-Two things worth knowing before you start: the coprocessor flash requires **soldering two short
-wires**, and although Tasmota is the practical way to perform that one step, **a Tasmota bridge
-cannot drive this integration** — the integration speaks the ESPHome package's MQTT contract
-(correlated acknowledgements, bridge-held fail-safe STOP deadlines, idle-listen receive), which
-Tasmota's `RfRaw` topics do not provide.
+👉 **[Full walkthrough: the bridge repo's HARDWARE.md][bridge-hardware]** — identifying your board,
+soldering the two programming jumpers, flashing the radio chip, then the ESPHome package.
 
-### Per-bridge configuration
+Two things to know going in:
 
-Point every bridge at the same broker Home Assistant uses, tag it with the Home Assistant **area
-ID** it lives in, and set `default_bridge: "true"` on exactly one.
+- **You will need to solder two short wires** to flash the radio chip.
+- **Tasmota is only a temporary tool** for that one step. A bridge left running Tasmota *cannot*
+  drive this integration — it speaks a different MQTT contract.
 
-A healthy bridge shows retained `rf433/<bridge_id>/availability` = `online` on the broker.
+### Configure it
 
-### How many bridges?
+Point the bridge at the same broker Home Assistant uses, tag it with the Home Assistant **area ID**
+of the room it sits in, and set `default_bridge: "true"` on exactly one bridge.
 
-One is enough to start. Add more when rooms are out of RF range of the first — the integration
-routes each command to a bridge in the cover's own area, falls back automatically when one is
-offline, and schedules transmissions across bridges so they do not talk over each other on the
-shared 433 MHz channel.
+✅ **It's working when** the retained topic `rf433/<bridge_id>/availability` reads `online`.
+
+### How many do I need?
+
+**Start with one.** Add more only when a room turns out to be out of range. Commands automatically
+route to a bridge in the cover's own area and fall back when one is offline.
+
+---
 
 ## Step 3 — Install the integration
 
-### HACS (recommended)
+**Via HACS (recommended)**
 
-1. In HACS, add `https://github.com/joyfulhouse/zemismart-blinds` as a **custom repository**
-   (category: Integration).
+1. In HACS, add `https://github.com/joyfulhouse/zemismart-blinds` as a **custom repository**,
+   category **Integration**.
 2. Install **Zemismart Blinds**.
 3. Restart Home Assistant.
 
-### Manual
+**Manually**
 
-1. Copy `custom_components/zemismart_blinds` into your Home Assistant `/config/custom_components/`
-   directory.
+1. Copy `custom_components/zemismart_blinds` into your `/config/custom_components/` directory.
 2. Restart Home Assistant.
 
-## Step 4 — Calibrate and add your first remote
+---
 
-Each run of the add-integration flow creates one **remote** device; the remote's blinds and
-groups are added as its cover entities in the same run.
+## Step 4 — Add your first remote
 
-1. Open **Settings → Devices & services → Add integration → Zemismart Blinds**, then choose
-   **Learn from remote**.
-2. Name the remote, select its Home Assistant area, and accept the automatically selected online
-   RF bridge or choose another one.
-3. During the 30-second capture window, press **Up**, **Down**, or **Stop** on the physical remote.
-   The flow detects the remote prefix, remote ID, channels, and button automatically.
-4. Confirm the detected identity and the remote's transport settings, then add covers one at a
-   time: a cover name, one channel (`1`) or an arbitrary group (`1,2,3`), and the up/down
-   full-travel seconds. Channels 1–16 are supported. Add every blind and group the remote
-   controls, then finish.
-5. Repeat for the next remote. Under **Advanced**, manual capture entry and virtual remotes are
-   available.
+Each run of this flow sets up **one physical remote** and all the blinds it controls.
 
-Everything about an existing remote lives in its entry's **Reconfigure** menu: **Relearn from
-remote** replaces the identity or calibration, **Edit remote settings** covers name/area/RF
-options, and **Add / Edit / Remove cover** manage its covers without touching their entity IDs.
+1. **Settings → Devices & services → Add integration → Zemismart Blinds**
+2. Choose **Learn from remote**.
+3. Name the remote, pick its area, and accept the suggested bridge.
+4. **Press Up, Down, or Stop on your physical remote** during the 30-second window. The integration
+   works out the rest by itself.
+5. Confirm what it detected, then add your blinds one at a time:
 
-## Verify
+   | Field | What to enter |
+   |---|---|
+   | **Name** | e.g. "Living Room Left" |
+   | **Channels** | `1` for one blind, `1,2,3` for a group (channels 1–16) |
+   | **Travel time** | Stopwatch seconds, fully up and fully down — time each direction separately |
 
-- The cover entity responds to OPEN/CLOSE/STOP.
-- `zemismart_blinds.send_raw` (Developer tools → Actions) can replay a captured frame through a
-  named bridge for debugging.
+6. Repeat for your next remote.
 
-## Troubleshooting
+✅ **It's working when** the cover responds to open, close, and stop.
 
-Enable debug logging in `configuration.yaml`:
+<details>
+<summary><b>Changing things later</b></summary>
+
+Everything lives in the entry's **Reconfigure** menu: **Relearn from remote** replaces the identity
+or calibration, **Edit remote settings** covers name/area/RF options, and **Add / Edit / Remove
+cover** manage covers without disturbing their entity IDs, history, or automations.
+
+Under **Advanced**, you can also enter a remote manually or mint a virtual one — see the
+[README](README.md#setting-up-a-blind).
+
+</details>
+
+---
+
+## If something's wrong
+
+**Blind doesn't respond at all** → check the bridge is `online` (step 2), and that Home Assistant's
+MQTT integration uses the *same* broker as the bridge.
+
+**Command accepted but nothing moves** → most often the wrong channel. A motor paired to channel 3
+ignores a channel-1 command.
+
+**Position slowly goes wrong** → normal drift; send a full open or close to re-anchor, then tune
+the travel seconds.
+
+More detail in the [README troubleshooting section](README.md#troubleshooting). Bridge hardware
+problems — a failed flash, a bridge that never comes online — are covered in
+[the bridge repo][bridge-troubleshooting].
+
+<details>
+<summary><b>Debug logging</b></summary>
 
 ```yaml
 logger:
@@ -121,10 +152,7 @@ logger:
     custom_components.zemismart_blinds: debug
 ```
 
-See the [README troubleshooting section](README.md#troubleshooting) for common issues. Problems
-with the bridge hardware itself — a failed coprocessor flash, a bridge that never comes online —
-are covered in [the bridge repo's troubleshooting section][bridge-troubleshooting].
+</details>
 
-[bridge-repo]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge
 [bridge-hardware]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/blob/main/HARDWARE.md
 [bridge-troubleshooting]: https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/blob/main/HARDWARE.md#troubleshooting

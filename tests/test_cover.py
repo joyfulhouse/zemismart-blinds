@@ -23,7 +23,7 @@ from custom_components.zemismart_blinds.models import (
     RemoteIdentity,
     ZemismartHub,
 )
-from custom_components.zemismart_blinds.state_sync import HeardEvent
+from custom_components.zemismart_blinds.state_sync import HeardEvent, LedgerFrameSpec
 from tests.synthetic import TEST_ACTION_BASES, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
@@ -3473,6 +3473,62 @@ async def test_set_position_aborts_when_started_preparatory_stop_is_displaced(
 
 
 @pytest.mark.asyncio
+async def test_group_member_clamped_to_its_limit_re_anchors(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaching a hard limit settles the anchor even when the GROUP did not.
+
+    ``absolute_anchor`` records the group's intent, so a member whose own
+    travel clamps to its endpoint while the group aims somewhere in between
+    was left questioned despite physically resting against its limit switch.
+    Re-anchoring keys on where the motion actually ENDED.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    # An empty registry: bridge-a is never seen online, so the questioned
+    # anchor survives the restore and only reaching a limit can settle it.
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    travel = 0.02
+    hub = ZemismartHub(BridgeRegistry(), quiet_publish)
+    config = cover_config(travel=travel)
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(stopped_unverified_anchor_state()),
+    )
+    try:
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+        entity._position = 20.0
+        # The group aims at 50 -- NOT an endpoint, so absolute_anchor is False --
+        # but this member's own travel overshoots and clamps to 0.
+        entity._start_member_motion(
+            cover_module._MotionStart(
+                source="commanded",
+                started_at=cover_module.WALL_CLOCK(),
+                deadline=None,
+                bridge_id="bridge-b",
+                command_id="group-down",
+            ),
+            ack=None,
+            direction=-1,
+            duration=travel,
+            group_target=50.0,
+        )
+        assert entity._motion_target == 0.0
+        assert entity._motion_absolute_anchor is False
+        await asyncio.sleep(travel + 0.01 + 0.05)
+
+        assert entity.current_cover_position == 0
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
 async def test_partial_move_keeps_the_unverified_anchor_revocable(
     hass: HomeAssistant,
 ) -> None:
@@ -4662,3 +4718,212 @@ async def test_broker_drop_rerenders_cover_availability(
 
     # ...and every callback is released on teardown.
     assert len(unsubscribed) == 3
+
+
+# #21: a bridge holding several targets dispatches them round-robin, one slot
+# each, so a command's own repeats are spread across the OTHER targets' slots
+# too -- not sent back-to-back the way a solo train would be. Past four
+# concurrent same-bridge targets, our own later repeats used to fall outside
+# the (contiguous-assuming) confirmed window and dispatch as a physical
+# press. `_on_heard_press` (cover.py:475-491) has two distinct consequences
+# once that happens: it ALWAYS bumps `_intent_generation` (dropping the
+# in-flight commanded motion's ownership), then either re-anchors travel at
+# the wrong instant (a cover fully covered by the phantom press) or marks the
+# cover unknown (a cover only partially covered). The two tests below drive a
+# REAL command through the hub -- so `record_commanded_start` and the
+# ledger's confirmed window come from production code, not a synthetic
+# stand-in -- and feed the phantom echo through `hub.handle_rx` with a
+# genuinely encoded frame, exactly as a peer bridge would report it.
+_ROUND_ROBIN_BRIDGE_ID: Final = "bridge-office"
+_ROUND_ROBIN_TARGET_COUNT: Final = 7
+_ROUND_ROBIN_TRAIN_REPEATS: Final = 3  # the production default
+_ROUND_ROBIN_TRAIN_MS: Final = 3_000
+# Measured on air in #21 at this concurrency and repeat count: an own repeat
+# heard at +8.1 s, well outside the un-stretched 3.75 s window but inside the
+# round-robin-stretched one this fix computes: (repeats - 1) * (targets - 1)
+# * 1 s + 3.75 s = 2 * 6 * 1 + 3.75 = 15.75 s.
+_ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS: Final = 8.1
+
+
+def _register_round_robin_peers(
+    hub: ZemismartHub,
+    remote_key: str,
+    handoff: float,
+    *,
+    count: int = _ROUND_ROBIN_TARGET_COUNT - 1,
+    first_channel: int = 20,
+) -> None:
+    """Confirm same-bridge peer commands so a real command picks up concurrency.
+
+    `CommandLedger._round_robin_concurrency` counts confirmed same-bridge
+    entries purely from `bridge_id`/`handoff`/`frames` -- exactly the state a
+    real peer command leaves behind -- so registering peers straight into the
+    ledger alongside one genuinely commanded cover reproduces the concurrency
+    a busy bridge produces without standing up seven full entities.
+    """
+    for index in range(count):
+        channels = (first_channel + index,)
+        hub._ledger.register_pending(
+            f"peer-{index}",
+            _ROUND_ROBIN_BRIDGE_ID,
+            channels,
+            "DOWN",
+            [
+                LedgerFrameSpec(
+                    (remote_key, frozenset(channels), "DOWN"),
+                    offset_ms=0,
+                    airtime_ms=_ROUND_ROBIN_TRAIN_MS,
+                ),
+            ],
+        )
+        hub._ledger.confirm(f"peer-{index}", handoff)
+
+
+@pytest.mark.asyncio
+async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-bridge burst's own late repeat must not re-anchor travel (#21).
+
+    Reproduces the FIRST `_on_heard_press` consequence shape: a fully
+    covered cover re-anchors travel at `heard_at` -- the wrong instant, since
+    the frame is our own late repeat, not a physical press -- producing a
+    wrong final position while the motor runs on. `_intent_generation` and
+    `_motion_command_id` are checked directly because `_on_heard_press`
+    changes BOTH unconditionally the moment it runs at all; equality after
+    the phantom frame is direct proof the callback never ran.
+    """
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(_ROUND_ROBIN_BRIDGE_ID),
+        publish,
+        now=lambda: clock["now"],
+    )
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=BlindConfig(
+            name="Office channel 3",
+            remote=cover_config().remote,
+            channels=(3,),
+            travel_up=100.0,
+            travel_down=100.0,
+            area_id="living_room",
+            repeats=_ROUND_ROBIN_TRAIN_REPEATS,
+        ),
+    )
+    try:
+        await entity.async_close_cover()
+        assert entity.is_closing
+        real_command_id = entity._motion_command_id
+        assert real_command_id is not None
+        handoff = clock["now"]
+        generation_before = entity._intent_generation
+
+        _register_round_robin_peers(hub, entity._config.remote_key, handoff)
+
+        clock["now"] += _ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "DOWN", bases=TEST_ACTION_BASES)
+        )
+        hub.handle_rx("bridge-peer", {"frame": raw_frame, "t": 0, "boot": 1})
+
+        assert entity._intent_generation == generation_before
+        assert entity._motion_command_id == real_command_id
+        assert entity.is_closing
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-bridge burst's own late repeat must not mark a wider cover unknown (#21).
+
+    Reproduces the SECOND `_on_heard_press` consequence shape: a press whose
+    channels only partially cover a multi-channel cover takes the
+    `_mark_unknown()` branch instead -- the exposure the team flagged for
+    aggregates, where a leaf's own command only intersects a wider cover
+    spanning it plus another channel. `group` is a plain two-channel
+    `ZemismartCover` (role defaults to LEAF), matching the existing
+    `test_partially_addressed_heard_press_marks_group_unknown` config shape;
+    only channel 2 of its (2, 3) is ever driven by a real command, exactly
+    like an aggregate whose displayed state spans more channels than any one
+    contributing leaf command addresses.
+    """
+    clock = {"now": cover_module.WALL_CLOCK()}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(
+        online_registry(_ROUND_ROBIN_BRIDGE_ID),
+        publish,
+        now=lambda: clock["now"],
+    )
+    group = await attach_cover(
+        hass,
+        hub,
+        config=BlindConfig(
+            name="Office channels 2+3",
+            remote=cover_config().remote,
+            channels=(2, 3),
+            travel_up=100.0,
+            travel_down=100.0,
+            area_id="living_room",
+            repeats=_ROUND_ROBIN_TRAIN_REPEATS,
+        ),
+    )
+    leaf = await attach_cover(
+        hass,
+        hub,
+        config=BlindConfig(
+            name="Office channel 2",
+            remote=cover_config().remote,
+            channels=(2,),
+            travel_up=100.0,
+            travel_down=100.0,
+            area_id="living_room",
+            repeats=_ROUND_ROBIN_TRAIN_REPEATS,
+        ),
+        entry_id="entry-2",
+        entity_id="cover.office_channel_2",
+    )
+    group._position = 50.0
+    try:
+        await leaf.async_close_cover()
+        assert leaf.is_closing
+        handoff = clock["now"]
+        group_generation_before = group._intent_generation
+
+        _register_round_robin_peers(hub, leaf._config.remote_key, handoff)
+
+        clock["now"] += _ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS
+        raw_frame = encode_b0(
+            make_payload(TEST_PREFIX, TEST_REMOTE_ID, (2,), "DOWN", bases=TEST_ACTION_BASES)
+        )
+        hub.handle_rx("bridge-peer", {"frame": raw_frame, "t": 0, "boot": 1})
+
+        assert group._intent_generation == group_generation_before
+        assert group.current_cover_position == 50
+        assert not group._degraded
+    finally:
+        await leaf.async_will_remove_from_hass()
+        await group.async_will_remove_from_hass()
+        hub.close()
