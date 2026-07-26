@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-07-26
+
+### Fixed
+
+- **Round-robin concurrency is now counted for a gradual sweep, not just a simultaneous one**
+  (#21). The count in 0.5.3 asked whether a peer's *unstretched* span overlapped this command's.
+  That is a strictly smaller question than the one that matters, because stretch is precisely what
+  makes real occupancy exceed the nominal span. At the real sweep's cadence — covers admitted about
+  two seconds apart, the shape the 2026-07-25 incident actually had — it counted seven concurrent
+  targets as two, closed the window at 5.75 s, and dispatched the command's own 8.1 s repeat as a
+  physical press. That is the failure 0.5.3 shipped to prevent, still reachable for the admission
+  shape that caused it.
+
+  The question is circular: whether a peer shares the antenna depends on how long this command is
+  really on it, which depends on how many peers share it. It is now resolved by fixed point —
+  start with no stretch, widen by what the current count implies, recount, and settle. The count
+  only grows, so it converges, and the sixteen-target cap bounds the passes.
+
+  Concurrency is counted once per entry per classification rather than once per window, since this
+  runs inside every capture's classification. At the per-bridge cap that is ~17 µs per count and
+  ~47 µs for a full-miss match.
+
+  Found by adversarial review. Every test shipped with 0.5.3 registered its peers at a single
+  handoff, which is exactly why none of them caught it.
+
+- **The near-miss warning now reports the bounds it actually judged against**, including any
+  round-robin stretch. Logging the nominal edge understated the miss and would send a reader
+  hunting the wrong gap.
+
 ## [0.5.3] - 2026-07-25
 
 ### Documentation

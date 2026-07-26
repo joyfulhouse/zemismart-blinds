@@ -741,14 +741,18 @@ class CommandLedger:
             for window in entry.windows:
                 if window.signature != signature:
                     continue
+                # Report the bounds match() actually judged against, including
+                # any round-robin stretch -- logging the nominal edge would
+                # understate the miss and send a reader hunting the wrong gap.
+                ends_at = self._effective_ends_at(entry, window)
                 _LOGGER.warning(
                     "state_sync: %s capture outside command %s window "
                     "[%.3f, %.3f] by %.3fs; treating as a physical press",
                     signature[2],
                     entry.command_id,
                     window.starts_at,
-                    window.ends_at,
-                    min(abs(heard_at - window.starts_at), abs(heard_at - window.ends_at)),
+                    ends_at,
+                    min(abs(heard_at - window.starts_at), abs(heard_at - ends_at)),
                 )
                 return
 
