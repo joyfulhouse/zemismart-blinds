@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, cast
 
+import voluptuous as vol
 from homeassistant.components.cover import (
     ATTR_CURRENT_POSITION,
     ATTR_POSITION,
@@ -17,13 +18,18 @@ from homeassistant.components.cover import (
 )
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
+    ATTR_ENDPOINT,
     DOMAIN,
+    ENDPOINT_CLOSE,
+    ENDPOINT_OPEN,
     FULL_TRAVEL_MARGIN_SECONDS,
     POSITION_UPDATE_INTERVAL_SECONDS,
+    SERVICE_REANCHOR,
 )
 from .coordinator import RemoteCoordinator
 from .models import (
@@ -64,6 +70,18 @@ _ATTR_MOTION_TIMED = "motion_timed"
 _ATTR_UNVERIFIED_ANCHOR = "unverified_anchor_bridge"
 _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID = "unverified_anchor_command_id"
 _ATTR_UNVERIFIED_ANCHOR_OFFLINE = "unverified_anchor_offline"
+_ATTR_POSITION_CONFIDENCE = "position_confidence"
+# A dedicated persisted flag, kept separate from the derived confidence string
+# so the suspect DOUBT survives a restart the way unverified_anchor_* does --
+# and deliberately NOT reusing that trio, which tracks restore-time anchor
+# provenance rather than a mid-flight interruption.
+_ATTR_POSITION_SUSPECT = "position_suspect"
+# Closed confidence vocabulary. `unknown` is derived from the entity state
+# (no position) rather than stored, so it is intentionally not a stored value.
+CONFIDENCE_VERIFIED: Final = "verified"
+CONFIDENCE_ASSUMED: Final = "assumed"
+CONFIDENCE_SUSPECT: Final = "suspect"
+CONFIDENCE_UNKNOWN: Final = "unknown"
 WALL_CLOCK = time.time
 _UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
 
@@ -110,6 +128,21 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create one entity per stored cover row of this remote."""
+    # reanchor is an EXPLICIT recovery action (operator or automation): it drives
+    # a full travel to a hard endpoint through the normal command path so the
+    # existing outcome-based anchor logic re-verifies against the motor's own
+    # limit switch. No autonomous motion, no timer -- it moves only when asked.
+    # Registered on the cover platform so HA routes it to these entities; the
+    # context is always set when HA drives platform setup. It is unset only when
+    # a test invokes this coroutine directly to exercise entity construction, and
+    # those exercise no service, so skipping the wiring there is correct.
+    if (platform := entity_platform.current_platform.get()) is not None:
+        platform.async_register_entity_service(
+            SERVICE_REANCHOR,
+            {vol.Required(ATTR_ENDPOINT): vol.In((ENDPOINT_OPEN, ENDPOINT_CLOSE))},
+            "async_reanchor",
+        )
+
     runtime = entry.runtime_data
     covers: dict[str, CoverConfig] = {cover.cover_id: cover for cover in runtime.remote.covers}
     coordinator = RemoteCoordinator(hass, covers)
@@ -206,6 +239,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_command_id: str | None = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
+        # position_confidence signals. `_position_verified` is set only when a
+        # travel actually COMPLETES against a hard limit; `_suspect` records an
+        # untimed full travel cut short by an uncorroborated heard STOP and is
+        # the one confidence signal that survives a restart. Both are cleared by
+        # reaching a limit or going unknown -- they never overlap in practice.
+        self._position_verified = False
+        self._suspect = False
         self._unverified_anchor_bridge: str | None = None
         self._unverified_anchor_command_id: str | None = None
         self._unverified_anchor_offline = False
@@ -265,6 +305,25 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         return position == 0 if position is not None else None
 
     @property
+    def position_confidence(self) -> str:
+        """Report how far the current position estimate can be trusted.
+
+        `unknown` is deliberately derived from the entity state (no position)
+        rather than tracked separately, so it is never a stored value. `suspect`
+        -- an untimed full travel interrupted by an uncorroborated heard STOP --
+        outranks `verified`; the two never coexist, but suspect wins if they
+        somehow did. See ``_apply_stop`` for how it is raised and
+        ``_anchor_if_at_limit`` / ``_mark_unknown`` for how it clears.
+        """
+        if self._position is None:
+            return CONFIDENCE_UNKNOWN
+        if self._suspect:
+            return CONFIDENCE_SUSPECT
+        if self._position_verified:
+            return CONFIDENCE_VERIFIED
+        return CONFIDENCE_ASSUMED
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose routing plus restart-safe started motion metadata."""
         return {
@@ -285,6 +344,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             _ATTR_UNVERIFIED_ANCHOR: self._unverified_anchor_bridge,
             _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID: self._unverified_anchor_command_id,
             _ATTR_UNVERIFIED_ANCHOR_OFFLINE: self._unverified_anchor_offline,
+            _ATTR_POSITION_CONFIDENCE: self.position_confidence,
+            _ATTR_POSITION_SUSPECT: self._suspect,
         }
 
     async def async_added_to_hass(self) -> None:
@@ -348,6 +409,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._unverified_anchor_bridge is not None
             and state.attributes.get(_ATTR_UNVERIFIED_ANCHOR_OFFLINE) is True
         )
+        # The incident's wrong estimate survived a restart verbatim; the doubt
+        # about it must too. A suspect estimate always persists with direction 0
+        # (a heard STOP froze it), so restoring it here in the common block --
+        # before the direction branches -- is correct; any path that then marks
+        # the cover unknown clears it, which is a strictly stronger statement.
+        self._suspect = state.attributes.get(_ATTR_POSITION_SUSPECT) is True
         self._replay_emission_proof()
 
         raw_direction = state.attributes.get(_ATTR_MOTION_DIRECTION, 0)
@@ -410,9 +477,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             self._position = target
             self._clear_motion()
             if absolute_anchor or target in {0.0, 100.0}:
-                # A travel that finished during downtime reached its hard limit
-                # just like one completed by _async_track_motion.
-                self._anchor_if_at_limit()
+                # A travel that finished during downtime reached its hard
+                # limit for POSITION purposes, but nobody was listening while
+                # it ran -- no verified, and a restored suspect stays.
+                self._anchor_if_at_limit(observed=False)
             elif (
                 timed
                 and not self._bridge_seen_online(bridge)
@@ -534,7 +602,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._unverified_anchor_command_id = None
         self._unverified_anchor_offline = False
 
-    def _anchor_if_at_limit(self) -> None:
+    def _anchor_if_at_limit(self, *, observed: bool = True) -> None:
         """Re-anchor a motion that actually ENDED against a hard limit.
 
         Both endpoints are physical stops: a cover that ran a travel out to 0
@@ -561,6 +629,24 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         """
         if self._position in (0.0, 100.0):
             self._clear_unverified_anchor()
+            if observed:
+                # A completed travel to a hard limit is the ONLY thing that
+                # earns `verified`, and it also settles any suspect doubt:
+                # whatever a heard STOP left ambiguous, the blind has now
+                # physically reached and rests against its limit switch.
+                #
+                # OBSERVED means RX was live for the whole travel, so a real
+                # STOP press would have been heard and turned into suspect or
+                # an interruption. A completion that happened during HA's own
+                # downtime carries no such witness -- any press in that gap,
+                # real or phantom, was invisible -- so it keeps the position
+                # but earns no verified and settles no doubt. (Residual even
+                # when observed: a listener is deaf ~one slot after each
+                # capture, so a press CAN be missed. That risk is identical
+                # for commanded and heard travels, which is why both earn
+                # verified rather than only our own.)
+                self._position_verified = True
+                self._suspect = False
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
         """Return whether this bridge has explicitly announced itself online."""
@@ -671,6 +757,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._sync_position(at)
         self._cancel_motion_task()
         self._clear_motion()
+        # Any interruption ends the moving estimate BEFORE it reaches a limit, so
+        # the prior `verified` no longer holds. Runs only on interruption:
+        # clean completion goes through _async_track_motion, never here, so the
+        # anchor it just set survives. `_suspect` is intentionally untouched --
+        # it clears only at a completed limit or unknown, not when a fresh
+        # travel starts over the doubtful estimate.
+        self._position_verified = False
 
     def _mark_unknown(self) -> None:
         """Discard ambiguous motion after a lifecycle timeout or recovery gap."""
@@ -678,6 +771,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._position = None
         self._clear_motion()
         self._clear_unverified_anchor()
+        self._position_verified = False
+        self._suspect = False
         self._degraded = True
 
     def _record_ack(self, ack: CommandAck) -> None:
@@ -1002,14 +1097,46 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         async with self._command_lock:
             await self._async_move_full("DOWN", -1, 0.0)
 
+    async def async_reanchor(self, endpoint: str) -> None:
+        """Re-anchor by driving a full travel to a hard endpoint (recovery).
+
+        Deliberately no parallel motion path: it reuses the normal full-travel
+        command internals, so ledger registration, commanded-start, air
+        arbitration and coalescing all apply, and completion re-anchors through
+        the same outcome-based _anchor_if_at_limit. It needs no known estimate,
+        which is the whole point -- it recovers a cover whose position is
+        unknown.
+        """
+        if endpoint == ENDPOINT_OPEN:
+            await self.async_open_cover()
+        else:
+            await self.async_close_cover()
+
     def _apply_stop(self, at: float, *, provenance: str) -> None:
         """Freeze this cover at one commanded or heard STOP."""
         if provenance not in {"commanded", "heard"}:
             msg = f"unsupported STOP provenance: {provenance}"
             raise ValueError(msg)
+        # Read the interrupted motion's shape BEFORE _interrupt_motion clears it.
+        # An UNTIMED full travel runs to the motor's own limit switch; a heard
+        # STOP we cannot corroborate leaves the blind either frozen here or
+        # resting at that limit -- opposite ground truths. A timed move was
+        # going to stop near here anyway, so it is far less suspect.
+        suspect_travel = (
+            provenance == "heard"
+            and self._direction != 0
+            and not self._motion_timed
+            and self._motion_target in (0.0, 100.0)
+        )
         # A live freeze also supersedes a still-pending restore snapshot.
         self._restore_epoch += 1
         self._interrupt_motion(at)
+        if suspect_travel:
+            # Survives a restart via _ATTR_POSITION_SUSPECT; clears only at a
+            # completed hard limit (_anchor_if_at_limit) or unknown
+            # (_mark_unknown), which _reconcile_unverified_anchor may trigger
+            # next -- and unknown is the stronger, correct statement there.
+            self._suspect = True
         self._reconcile_unverified_anchor()
         self.async_write_ha_state()
         if provenance == "heard":
@@ -1235,12 +1362,40 @@ class ZemismartAggregateCover(CoverEntity):
         return None
 
     @property
+    def position_confidence(self) -> str:
+        """Derive confidence from members -- the worst known value wins.
+
+        A suspect member marks the whole group suspect. A member with no
+        position cannot vote on which known value wins, but its absence is
+        itself information: the group caps at `assumed`, because `verified`
+        over a broken sibling would hide exactly the member that needs fixing.
+        Only an all-unknown group is itself unknown.
+        """
+        members = list(self._members())
+        confidences = [
+            member.position_confidence
+            for member in members
+            if member.current_cover_position is not None
+        ]
+        if not confidences:
+            return CONFIDENCE_UNKNOWN
+        if CONFIDENCE_SUSPECT in confidences:
+            return CONFIDENCE_SUSPECT
+        if CONFIDENCE_ASSUMED in confidences or len(confidences) != len(members):
+            # A member with no position at all caps the group at assumed:
+            # reporting verified while a sibling is broken would hide exactly
+            # the member an automation gating on this attribute needs to fix.
+            return CONFIDENCE_ASSUMED
+        return CONFIDENCE_VERIFIED
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose topology metadata for diagnostics and restore discrimination."""
         return {
             "channels": list(self._config.channels),
             "remote": self._config.remote_key,
             "role": self._config.role.value,
+            _ATTR_POSITION_CONFIDENCE: self.position_confidence,
         }
 
     @callback
@@ -1358,6 +1513,18 @@ class ZemismartAggregateCover(CoverEntity):
         self._cancel_fanout()
         async with self._command_lock:
             await self._async_move_full("DOWN", -1, 0.0)
+
+    async def async_reanchor(self, endpoint: str) -> None:
+        """Re-anchor the whole group with one endpoint frame (recovery).
+
+        Reuses the aggregate's own full open/close, so it is exactly one group
+        frame and every member re-anchors through its own outcome-based logic --
+        identical to a manual full travel on the aggregate.
+        """
+        if endpoint == ENDPOINT_OPEN:
+            await self.async_open_cover()
+        else:
+            await self.async_close_cover()
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
         """Cancel fan-out, stop every channel with one frame, freeze members."""

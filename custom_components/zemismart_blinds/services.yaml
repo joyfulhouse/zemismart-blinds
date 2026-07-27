@@ -36,3 +36,25 @@ new_virtual_remote:
     add-integration flow; pair the motor by sending OPEN while it is in its
     RF pairing mode.
 
+reanchor:
+  name: Re-anchor position
+  description: >-
+    Drive a cover (or group) to a hard endpoint and re-anchor its position
+    estimate there. Explicit recovery only: use it after a heard STOP or a
+    restart has left the position untrustworthy or unknown.
+  target:
+    entity:
+      integration: zemismart_blinds
+      domain: cover
+  fields:
+    endpoint:
+      name: Endpoint
+      description: Which hard limit to drive to (fully open or fully closed).
+      required: true
+      selector:
+        select:
+          translation_key: endpoint
+          options:
+            - open
+            - close
+

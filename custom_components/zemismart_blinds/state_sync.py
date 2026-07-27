@@ -828,8 +828,7 @@ class CommandLedger:
                 return True
             concurrency = self._round_robin_concurrency(entry)
             latest_effective_end = max(
-                self._effective_ends_at(entry, window, concurrency)
-                for window in entry.windows
+                self._effective_ends_at(entry, window, concurrency) for window in entry.windows
             )
             return now > latest_effective_end + _LEDGER_ENTRY_TTL_SECONDS
         return (
