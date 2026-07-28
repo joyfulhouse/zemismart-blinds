@@ -130,7 +130,7 @@ much the current estimate is worth. The ranking, weakest first:
 | Value | What it means |
 | --- | --- |
 | `unknown` | No position at all. Read from the entity state, never stored. |
-| `suspect` | A full travel was cut short by a physical STOP nobody could corroborate, so the blind is either frozen where the estimate says or resting at the endpoint — opposite ground truths. Survives a restart. |
+| `suspect` | The estimate rests on evidence nobody could corroborate: a full travel cut short by an unconfirmed physical STOP (frozen where the estimate says, or resting at the endpoint — opposite ground truths), or a travel whose completion was inferred purely from wall time elapsed while Home Assistant was down. Survives a restart. |
 | `assumed` | The normal state: modelled from travel time since the last anchor. |
 | `anchored` | The strongest claim available: a full travel was transmitted, its timer ran to completion, and no contradicting RF press was heard while it ran. |
 

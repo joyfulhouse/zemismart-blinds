@@ -357,6 +357,85 @@ async def test_wall_step_restore_projects_remaining_duration_once(
 
 
 @pytest.mark.asyncio
+async def test_restore_completion_is_suspect_but_in_flight_restore_is_assumed(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a restore completion inferred from wall time is suspect."""
+    config = cover_config(travel=10.0)
+    wall = {"now": 1_700_000_000.0}
+    monotonic = {"now": 200.0}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
+    monkeypatch.setattr(
+        cover_module,
+        "MONOTONIC_CLOCK",
+        lambda: monotonic["now"],
+        raising=False,
+    )
+
+    def moving_state(*, deadline: float, command_id: str) -> State:
+        return State(
+            "cover.living_room_left",
+            "opening",
+            {
+                ATTR_CURRENT_POSITION: 44,
+                "remote": config.remote_key,
+                "channels": list(config.channels),
+                "motion_direction": 1,
+                "motion_target": 80,
+                "motion_started": wall["now"] - 4.0,
+                "motion_deadline": deadline,
+                "motion_start_position": 20,
+                "motion_bridge": "bridge-a",
+                "motion_command_id": command_id,
+                "motion_timed": True,
+            },
+        )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    in_flight_hub = ZemismartHub(online_registry(), quiet_publish)
+    in_flight = await attach_cover(
+        hass,
+        in_flight_hub,
+        config=config,
+        cover_type=restored_cover_type(
+            moving_state(
+                deadline=wall["now"] + 6.0,
+                command_id="in-flight-restore",
+            )
+        ),
+    )
+    try:
+        assert in_flight.is_opening
+        assert in_flight.position_confidence == "assumed"
+    finally:
+        await in_flight.async_will_remove_from_hass()
+        in_flight_hub.close()
+
+    completed_hub = ZemismartHub(online_registry(), quiet_publish)
+    completed = await attach_cover(
+        hass,
+        completed_hub,
+        config=config,
+        cover_type=restored_cover_type(
+            moving_state(
+                deadline=wall["now"] - 1.0,
+                command_id="completed-restore",
+            )
+        ),
+    )
+    try:
+        assert not completed.is_opening
+        assert completed.current_cover_position == 80
+        assert completed.extra_state_attributes["position_confidence"] == "suspect"
+    finally:
+        await completed.async_will_remove_from_hass()
+        completed_hub.close()
+
+
+@pytest.mark.asyncio
 async def test_coalesced_covers_share_started_ack_but_keep_own_travel_times(
     hass: HomeAssistant,
 ) -> None:

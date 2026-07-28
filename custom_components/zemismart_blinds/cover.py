@@ -470,9 +470,11 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
 
         `unknown` is deliberately derived from the entity state (no position)
         rather than tracked separately, so it is never a stored value. `suspect`
-        -- an untimed full travel interrupted by an uncorroborated heard STOP --
-        outranks `anchored`; the two never coexist, but suspect wins if they
-        somehow did. See ``_apply_stop`` for how it is raised and
+        marks unresolved evidence: an untimed full travel interrupted by an
+        uncorroborated heard STOP, or a downtime completion inferred solely
+        from wall time. It outranks `anchored`; the two never coexist, but
+        suspect wins if they somehow did. See ``_apply_stop`` and
+        ``_async_restore_state`` for how it is raised, and
         ``_anchor_if_at_limit`` / ``_mark_unknown`` for how it clears.
         """
         if self._position is None:
@@ -587,7 +589,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._suspect = state.attributes.get(_ATTR_POSITION_SUSPECT) is True
 
     async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
-        """Restore one stopped estimate or complete started motion."""
+        """Restore a stopped estimate, or resume or clock-complete motion."""
         state = await self.async_get_last_state()
         if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
             return
@@ -675,6 +677,12 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
                 # the anchor is invalidated.
                 self._set_unverified_anchor(bridge, command_id)
             self._reconcile_unverified_anchor()
+            # The target conclusion trusts persisted wall time across the
+            # restart. A wall-clock step is indistinguishable from genuine
+            # downtime, so this branch cannot honestly retain assumed
+            # confidence. Apply the doubt last so it explicitly outranks the
+            # existing anchor and unverified-anchor bookkeeping above.
+            self._suspect = True
             return
         # Prefer the persisted motion origin: interpolating from the original
         # start keeps the transient estimate accurate across the restart gap
@@ -697,7 +705,9 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # This is the one deliberate wall→monotonic boundary. A reboot resets
         # the monotonic epoch, so persisted wall timestamps are interpreted
         # once as durations relative to this restore instant; every later live
-        # comparison stays on the fresh monotonic axis.
+        # comparison stays on the fresh monotonic axis. The elapsed-deadline
+        # branch above cannot make this projection and therefore treats its
+        # clock-trusting completion as suspect.
         remaining = deadline - wall_now
         self._motion_deadline_monotonic = monotonic_now + remaining
         self._motion_started_monotonic = monotonic_now - (wall_now - motion_started_wall)
