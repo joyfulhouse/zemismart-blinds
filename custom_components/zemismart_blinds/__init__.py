@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import secrets
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, cast
+from datetime import timedelta
+from typing import TYPE_CHECKING, Final, cast
 
 import voluptuous as vol
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers.event import async_track_time_interval
 
 from .air import AirMode
 from .codec import CommandBases, synthesize_bases
@@ -47,6 +50,8 @@ from .models import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from homeassistant.components.mqtt.models import ReceiveMessage
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
@@ -55,7 +60,12 @@ if TYPE_CHECKING:
     type ZemismartConfigEntry = ConfigEntry[RemoteRuntime]
 
 
+_LOGGER = logging.getLogger(__name__)
 _AIR_MODE_DATA_KEY = f"{DOMAIN}_air_arbitration_mode"
+# Frequent enough that a held capture is classified while its heard_at is
+# still meaningful, rare enough to be free: with nothing expired the sweep
+# is a few empty scans.
+MAINTENANCE_INTERVAL: Final = timedelta(seconds=15)
 CONFIG_SCHEMA = vol.Schema(
     {
         vol.Optional(DOMAIN): vol.Schema(
@@ -148,14 +158,29 @@ def _handle_rx(runtime: DomainRuntime, message: ReceiveMessage) -> None:
     bridge_id = _bridge_id(message.topic, "rx")
     if bridge_id is None:
         return
+    # Two single-exception blocks, like _handle_info above, rather than one
+    # multi-exception clause: the bare PEP 758 form the formatter normalizes to
+    # is a SyntaxError below Python 3.14, so a manual (non-HACS) install onto
+    # an older core would fail at import with no version message, and
+    # manifest.json has no version floor to prevent that.
     try:
-        decoded: object = json.loads(_payload_text(message.payload))
-    except UnicodeDecodeError, json.JSONDecodeError:
+        text = _payload_text(message.payload)
+    except UnicodeDecodeError:
+        return
+    try:
+        decoded: object = json.loads(text)
+    except json.JSONDecodeError:
         return
     if not isinstance(decoded, Mapping):
         return
     payload = {str(key): value for key, value in decoded.items()}
     runtime.hub.handle_rx(bridge_id, payload)
+
+
+@callback
+def _handle_maintenance(runtime: DomainRuntime, _now: datetime) -> None:
+    """Drive the hub's periodic RX maintenance from HA's clock."""
+    runtime.hub.maintain()
 
 
 def _create_domain_runtime(hass: HomeAssistant) -> DomainRuntime:
@@ -199,6 +224,20 @@ async def _async_initialize_domain_runtime(
     try:
         for topic, handler in subscriptions:
             runtime.unsubscribers.append(await mqtt.async_subscribe(hass, topic, handler, qos=1))
+        # The RX consumer's TTL sweep otherwise runs ONLY when a capture
+        # arrives or a command resumes its holds, so a held capture whose
+        # command never resumes waits for unrelated RF traffic before it is
+        # classified -- and is then dispatched with an arbitrarily old
+        # heard_at. In a quiet house that is hours (#42). The consumer stays
+        # deliberately loop-free with an injected clock, so the timer lives
+        # here, in the HA layer, and is released with the subscriptions.
+        runtime.unsubscribers.append(
+            async_track_time_interval(
+                hass,
+                functools.partial(_handle_maintenance, runtime),
+                MAINTENANCE_INTERVAL,
+            )
+        )
     except BaseException:
         _clear_domain_registrations(hass, runtime)
         raise
@@ -263,18 +302,40 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def async_send_raw(call: ServiceCall) -> None:
         runtime = cast("DomainRuntime | None", hass.data.get(DOMAIN))
         if runtime is None or not runtime.initialized:
-            msg = "no Zemismart Blinds entry is loaded, so no bridge registry exists"
-            raise HomeAssistantError(msg)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="no_runtime_loaded",
+            )
         try:
             await runtime.hub.async_send_raw(
                 str(call.data[ATTR_BRIDGE]),
                 str(call.data[ATTR_RAW]),
                 int(call.data[ATTR_REPEATS]),
             )
-        except (ValueError, RuntimeError) as exc:
-            # Frame validation, routing, rejection, and timeout errors are
-            # user-actionable service failures, not tracebacks.
-            raise HomeAssistantError(str(exc)) from exc
+        # Frame validation, routing, rejection, and timeout errors are
+        # user-actionable service failures, not tracebacks. The two classes are
+        # split HERE because the hub's own exceptions carry no translation keys,
+        # so this boundary is the last place that still knows which kind of
+        # failure it was.
+        #
+        # The detail is LOGGED, not interpolated. Being an admin-only debug
+        # service does not make an English sentence inside a translated message
+        # acceptable -- the placeholder is still rendered to whatever locale the
+        # user runs, and #37 applies to every raise site, not just the pretty
+        # ones. The admin who needs the exact rejection has it one line away in
+        # the log, which is also where it is useful across repeated attempts.
+        except ValueError as exc:
+            _LOGGER.warning("send_raw rejected the frame: %s", exc)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="send_raw_invalid_frame",
+            ) from exc
+        except RuntimeError as exc:
+            _LOGGER.warning("send_raw could not transmit: %s", exc)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="send_raw_transport_failed",
+            ) from exc
 
     async def async_new_virtual_remote(_call: ServiceCall) -> ServiceResponse:
         prefix, remote_id, bases = new_virtual_remote_identity(hass)
@@ -329,8 +390,22 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Fold cover subentries into entry data (spec 2026-07-24, staged phases)."""
     from homeassistant.helpers import entity_registry as er
 
-    if entry.version != 1:
+    # An explicit ladder, not `!= 1: return True`: a version this code has never
+    # seen — a v3 entry written by a newer integration and then downgraded —
+    # would otherwise report "migrated successfully" and load with data this
+    # code cannot interpret. A downgrade is exactly when refusing cleanly
+    # matters most.
+    if entry.version > 2:
+        _LOGGER.error(
+            "Config entry version %s is newer than this integration supports; "
+            "downgrade is not supported",
+            entry.version,
+        )
+        return False
+    if entry.version == 2:
         return True
+    if entry.version != 1:
+        return False
     # Phase 0: legacy per-blind reference entries pass through byte-for-byte.
     if CONF_CHANNELS in entry.data:
         hass.config_entries.async_update_entry(entry, version=2)
@@ -528,11 +603,10 @@ async def async_setup_entry(
     if CONF_CHANNELS in entry.data:
         # Rev 4: legacy per-blind entries are kept only as migration
         # reference data — they never load. See the deployment runbook.
-        msg = (
-            "This entry uses the retired per-blind format. Add its remote "
-            "through the integration's new wizard, then delete this entry."
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="legacy_entry_format",
         )
-        raise ConfigEntryError(msg)
     if entry.version == 2:
         _repair_v2_registry_skew(hass, entry)
     while True:
@@ -556,6 +630,16 @@ async def async_setup_entry(
                     failed = False
                     return True
                 entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
+                # BEFORE the platform forward: runtime.initialized is already
+                # true, so send_raw is callable while no cover has registered
+                # its listener yet, and a raw command in that gap would resolve
+                # no bases at all.
+                entry.async_on_unload(
+                    runtime.hub.register_remote_bases(
+                        entry.runtime_data.remote.key,
+                        entry.runtime_data.remote.remote.bases,
+                    )
+                )
                 _ensure_remote_device(hass, entry)
                 await hass.config_entries.async_forward_entry_setups(entry, [Platform.COVER])
                 _prune_stale_cover_devices(hass, entry)

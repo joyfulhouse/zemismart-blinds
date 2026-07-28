@@ -8,10 +8,16 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
-from .codec import decode_rx_capture, infer_action_button
+from .codec import button_for_command, decode_rx_capture, infer_action_button
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from .codec import CommandBases
+
+    # Supplies one remote's configured calibration to the receive path, keyed
+    # by the same "prefix:remote_id" string a FrameSignature carries.
+    type BasesResolver = Callable[[str], CommandBases | None]
 
 FrameSignature = tuple[str, frozenset[int], str]
 LedgerMatch = tuple[Literal["pending", "confirmed"], str, str]
@@ -73,21 +79,45 @@ _MAX_NORMALIZED_FRAME_LENGTH: Final = 520
 _MAX_RAW_FRAME_LENGTH: Final = 4 * _MAX_NORMALIZED_FRAME_LENGTH
 
 
-def frame_signature(frame_hex: str) -> FrameSignature | None:
+def frame_signature(
+    frame_hex: str,
+    resolve_bases: BasesResolver | None = None,
+) -> FrameSignature | None:
     """Decode one movement frame into its remote, channels, and button.
 
     Captures use the trailer-tolerant RX decoder: physical remotes may put a
     truncated trailer on air, and our own transmitted frames (always nominal)
     still decode to the identical signature, so echo comparison is unaffected.
+
+    ``resolve_bases`` supplies the decoded remote's configured calibration.
+    When it yields one, the action comes from matching the WHOLE 16-bit
+    command against that remote's own measured bases and a frame matching none
+    of them is refused -- the opcode-high-byte inference used otherwise
+    accepts frames the motor would reject, and those still start a heard-motion
+    model, supersede queued commands, and disarm live takeovers (#30). The
+    signature itself is unchanged, so callers holding it need no edit.
+
+    Without a resolver it falls back to that inference. That is what the Learn
+    flow needs: there the bases are by definition not yet known.
     """
     try:
         decoded = decode_rx_capture(frame_hex)
-        button = infer_action_button(decoded["chans"], decoded["cmd"])
+        remote_key = f"{decoded['prefix']:06x}:{decoded['remote_id']:02x}"
+        bases = None if resolve_bases is None else resolve_bases(remote_key)
+        button = (
+            infer_action_button(decoded["chans"], decoded["cmd"])
+            if bases is None
+            else button_for_command(
+                decoded["chans"],
+                decoded["cmd"],
+                decoded["remote_id"],
+                bases,
+            )
+        )
     except ValueError:
         return None
     if button not in _MOVEMENT_BUTTONS:
         return None
-    remote_key = f"{decoded['prefix']:06x}:{decoded['remote_id']:02x}"
     return remote_key, frozenset(decoded["chans"]), button
 
 
@@ -773,6 +803,11 @@ class CommandLedger:
                 )
                 return
 
+    @property
+    def entry_count(self) -> int:
+        """Return how many commands the ledger is currently tracking."""
+        return len(self._entries)
+
     def gc(self, now: float) -> None:
         """Expire stale entries and reassert bridge and global bounds."""
         for entry in self._entries.values():
@@ -905,10 +940,12 @@ class StateSyncConsumer:
         dispatch: Callable[[HeardEvent], None],
         on_emission_proof: Callable[[str], None],
         now: Callable[[], float],
+        resolve_bases: BasesResolver | None = None,
     ) -> None:
         """Initialize the classifier with injected state and side effects."""
         self._ledger = ledger
         self._clock_resolver = clock_resolver
+        self._resolve_bases = resolve_bases
         self._dispatch = dispatch
         self._on_emission_proof = on_emission_proof
         self._now = now
@@ -941,7 +978,7 @@ class StateSyncConsumer:
         exact_key = (bridge_id, boot, t & _UINT32_MASK, normalized_frame)
         if self._remember_exact(exact_key, seen_at):
             return
-        signature = frame_signature(normalized_frame)
+        signature = frame_signature(normalized_frame, self._resolve_bases)
         if signature is None:
             return
         clock = self._clock_resolver(bridge_id)
@@ -955,6 +992,11 @@ class StateSyncConsumer:
             received_at=seen_at,
             hold_pending=True,
         )
+
+    @property
+    def held_count(self) -> int:
+        """Return how many captures are parked awaiting a command outcome."""
+        return len(self._holds)
 
     def resume_holds(self, command_id: str) -> None:
         """Re-run captures held for one command after its phase changes."""
@@ -979,6 +1021,21 @@ class StateSyncConsumer:
                 hold_pending=True,
             )
         self._maintain(seen_at)
+
+    def maintain(self) -> None:
+        """Collect expired state without waiting for the next RF capture.
+
+        `_maintain` otherwise runs only from `handle_rx` and `resume_holds`,
+        so a hold whose command never resumes at all sits until unrelated RF
+        traffic happens to arrive, and is then dispatched with an arbitrarily
+        old `heard_at` (#42). This consumer stays deliberately loop-free with
+        an injected clock, so the HA layer drives this on a timer instead.
+
+        Idempotent and cheap: with nothing expired it is a few empty scans.
+        """
+        if self._closed:
+            return
+        self._maintain(self._now())
 
     def record_commanded_start(
         self,
@@ -1118,8 +1175,6 @@ class StateSyncConsumer:
         seen_at: float,
     ) -> None:
         """Append one pending capture while preserving a strict queue cap."""
-        if len(self._holds) >= _HOLD_CAP:
-            self._holds.popleft()
         self._holds.append(
             _HeldCapture(
                 command_id=command_id,
@@ -1128,6 +1183,37 @@ class StateSyncConsumer:
                 bridge_id=bridge_id,
                 held_at=seen_at,
             ),
+        )
+        if len(self._holds) <= _HOLD_CAP:
+            return
+        # At the cap the oldest capture used to be discarded unclassified and
+        # unlogged: a real physical press parked behind a pending command was
+        # then lost permanently and its cover never re-synced (#42). Resolve
+        # it the conservative way TTL expiry already does instead.
+        #
+        # Recursion is bounded: `hold_pending=False` is precisely the branch
+        # of `_classify` that cannot reach `_hold` again. Appending BEFORE the
+        # eviction also matters -- `_classify` can dispatch a press, and a
+        # dispatch that re-enters this consumer (`resume_holds`) must see a
+        # complete `_holds`, not one missing the capture we are mid-way
+        # through recording.
+        evicted = self._holds.popleft()
+        _LOGGER.warning(
+            "state_sync: held-capture queue hit its cap of %d; classifying %s on channels %s "
+            "(held %.3fs for command %s) without waiting for that command to resolve",
+            _HOLD_CAP,
+            evicted.signature[2],
+            sorted(evicted.signature[1]),
+            seen_at - evicted.held_at,
+            evicted.command_id,
+        )
+        self._classify(
+            evicted.signature,
+            evicted.heard_at,
+            evicted.bridge_id,
+            seen_at,
+            received_at=evicted.held_at,
+            hold_pending=False,
         )
 
     def _superseding_commanded_start(

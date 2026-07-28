@@ -26,7 +26,7 @@ signals. Home Assistant has no 433 MHz radio of its own.
 
 - **Open, close, stop, and set position** — including partial positions
 - **Groups** — "all office blinds" is *one* radio command, not five competing ones
-- **One-press setup** — press a button on your remote and the integration works out the rest
+- **Guided setup** — press Up, Down and Stop when asked; each one is measured from your own remote
 - **Sees your physical remote** — press the wall remote and Home Assistant follows along
 - **Multiple bridges** — big houses work; commands route to the nearest bridge automatically
 
@@ -40,7 +40,8 @@ signals. Home Assistant has no 433 MHz radio of its own.
 [![Open in HACS][hacs-repo-shield]][hacs-repo]
 
 **3. Add your remote** — *Settings → Devices & services → Add integration → Zemismart Blinds*,
-choose **Learn from remote**, and press a button on your physical remote when asked.
+choose **Learn from remote**, and press Up, Down and Stop on your physical remote as it asks for
+each one.
 
 📖 **[Full setup guide → INSTALL.md](INSTALL.md)**
 
@@ -120,6 +121,37 @@ What that means day to day:
   re-anchors at 100 or 0.
 - A **partial position** drifts a little over time. Send a full open or close to true it up.
 - A brand-new blind reads `unknown` until you move it fully one way.
+
+### How much to trust it: `position_confidence`
+
+Every cover and group publishes a `position_confidence` attribute so an automation can ask how
+much the current estimate is worth. The ranking, weakest first:
+
+| Value | What it means |
+| --- | --- |
+| `unknown` | No position at all. Read from the entity state, never stored. |
+| `suspect` | A full travel was cut short by a physical STOP nobody could corroborate, so the blind is either frozen where the estimate says or resting at the endpoint — opposite ground truths. Survives a restart. |
+| `assumed` | The normal state: modelled from travel time since the last anchor. |
+| `anchored` | The strongest claim available: a full travel was transmitted, its timer ran to completion, and no contradicting RF press was heard while it ran. |
+
+**`anchored` is not motor confirmation.** Nothing comes back over the radio — the motor never
+reports that it received the frame, ran for the calibrated duration, or reached its limit switch.
+`anchored` says only what the integration itself witnessed. (This value used to be called
+`verified`, which claimed more than the system can know; automations matching the old word must be
+updated — see the changelog.)
+
+Two deliberate boundaries: a travel that completed while Home Assistant was **down** earns no
+`anchored` — no listener ran, so a press in that gap was invisible — and `anchored` does not
+survive a restart for the same reason.
+
+A group reports `unknown` whenever any of its members has no position, and whenever its members do
+not between them cover every one of the group's channels — in both cases the group has no position
+at all, and one rule holds throughout: no position means `unknown`. A `suspect` member still
+outranks that, because a blind frozen by a STOP nobody could corroborate says more about the group
+than a sibling merely being blank.
+
+`zemismart_blinds.reanchor` drives a cover to a hard endpoint on purpose, which is how you get
+back to `anchored` from `suspect` or `unknown`.
 
 <details>
 <summary><b>Why a blind can be "wrong" in Home Assistant</b></summary>

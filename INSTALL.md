@@ -99,8 +99,15 @@ Each run of this flow sets up **one physical remote** and all the blinds it cont
 1. **Settings → Devices & services → Add integration → Zemismart Blinds**
 2. Choose **Learn from remote**.
 3. Name the remote, pick its area, and accept the suggested bridge.
-4. **Press Up, Down, or Stop on your physical remote** during the 30-second window. The integration
-   works out the rest by itself.
+4. **Press Up, then Down, then Stop on your physical remote**, each during its own 30-second
+   window. Every button is measured from your remote rather than calculated from the others: the
+   opcode table that calculation relies on held for only 10 of the 11 remotes surveyed in #26, and
+   on the eleventh the calculated Up command was transmitted, heard by five bridges, and ignored by
+   the motor.
+
+   If a button genuinely cannot be captured — no such button, or a dead one — let its window time
+   out and choose **Derive the remaining buttons**. That fallback is offered only after a capture
+   has actually failed, and it tells you which buttons were calculated rather than measured.
 5. Confirm what it detected, then add your blinds one at a time:
 
    | Field | What to enter |

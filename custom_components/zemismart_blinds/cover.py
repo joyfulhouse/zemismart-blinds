@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -17,7 +18,7 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 from homeassistant.core import callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -37,8 +38,11 @@ from .models import (
     Button,
     CommandAck,
     CommandAckTimeoutError,
+    CommandQueueFullError,
+    CommandRejectedError,
     CommandStartedTimeoutError,
     CoverConfig,
+    NoOnlineBridgeError,
     RemoteRuntime,
     Role,
     TakeoverCoverState,
@@ -49,7 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, State
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
     from .state_sync import HeardEvent
@@ -78,12 +82,85 @@ _ATTR_POSITION_CONFIDENCE = "position_confidence"
 _ATTR_POSITION_SUSPECT = "position_suspect"
 # Closed confidence vocabulary. `unknown` is derived from the entity state
 # (no position) rather than stored, so it is intentionally not a stored value.
-CONFIDENCE_VERIFIED: Final = "verified"
+# `anchored` is deliberately NOT called `verified` (#31): nothing in a one-way
+# protocol confirms the motor, so the word must not promise more than "a full
+# travel was transmitted, a timer ran to completion, and no contradicting RF
+# press was heard".
+CONFIDENCE_ANCHORED: Final = "anchored"
 CONFIDENCE_ASSUMED: Final = "assumed"
 CONFIDENCE_SUSPECT: Final = "suspect"
 CONFIDENCE_UNKNOWN: Final = "unknown"
 WALL_CLOCK = time.time
 _UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
+# Intermediate travel progress reaches the STATE MACHINE at this rate, while
+# the estimate itself keeps integrating every POSITION_UPDATE_INTERVAL_SECONDS.
+# The 0.25 s tick is what makes the position smooth for anything reading the
+# entity; the recorder gains nothing from 4 Hz history of a dead-reckoned
+# estimate, and a 30 s travel used to write ~120 rows per cover.
+_PROGRESS_WRITE_INTERVAL_SECONDS: Final = 1.0
+# Motion and anchor internals: pure model state, rewritten throughout every
+# travel, that no history query would ever ask for. Excluded from the RECORDER
+# only -- homeassistant.helpers.restore_state references neither the recorder
+# nor _unrecorded_attributes (verified against the installed HA 2026.7.2); it
+# snapshots the state machine into its own store, so the unverified_anchor_*
+# trio and position_suspect still survive a restart with these listed here.
+_UNRECORDED_ATTRIBUTES: Final = frozenset(
+    {
+        _ATTR_MOTION_STARTED,
+        _ATTR_MOTION_DEADLINE,
+        _ATTR_MOTION_START_POSITION,
+        _ATTR_MOTION_BRIDGE,
+        _ATTR_MOTION_COMMAND_ID,
+        _ATTR_MOTION_TIMED,
+        _ATTR_MOTION_ABSOLUTE_ANCHOR,
+        _ATTR_MOTION_DIRECTION,
+        _ATTR_MOTION_TARGET,
+        _ATTR_UNVERIFIED_ANCHOR,
+        _ATTR_UNVERIFIED_ANCHOR_COMMAND_ID,
+        _ATTR_UNVERIFIED_ANCHOR_OFFLINE,
+    }
+)
+
+
+# The message used when a failure is not one of the defined transport types.
+# Reachable only through _failure_translation_key's fallback, never as a literal
+# at a raise site, so the catalogue test reads it from here.
+_DEFAULT_FAILURE_KEY: Final = "command_failed"
+_TRANSPORT_FAILURE_KEYS: Final = {
+    # Before NoOnlineBridgeError: both derive from RuntimeError, and isinstance
+    # order decides which message a caller sees.
+    CommandQueueFullError: "queue_full",
+    NoOnlineBridgeError: "no_bridge_online",
+    CommandRejectedError: "command_rejected",
+    OSError: "transport_failed",
+    ValueError: "invalid_frame",
+}
+# The defined transport failures, derived from the mapping above so the caught
+# set and the translated set cannot drift: a type added to only one of them is
+# either mapped but never caught, or caught but silently generic. Bound to a
+# name rather than written inline because `ruff format` rewrites a literal
+# `except (A, B):` back to the bare PEP 758 form.
+#
+# Deliberately narrow. A TypeError or AttributeError in the command path is a
+# programmer defect, and catching it turned a traceback into a bland service
+# failure with a `degraded` flag blaming the bridge. OSError stays: a broker
+# socket giving way mid-publish is a transport failure, not a defect.
+_TRANSPORT_FAILURES: Final[tuple[type[Exception], ...]] = tuple(_TRANSPORT_FAILURE_KEYS)
+
+
+def _failure_translation_key(exc: BaseException) -> str:
+    """Map one defined transport failure to its own translated message.
+
+    Interpolating `str(exc)` into a `{error}` placeholder left English model
+    text inside an otherwise translated message -- "no RF433 bridge is online"
+    reached every user in every language (#37). Each defined failure gets its
+    own key and carries no exception text; the technical detail is logged at the
+    raise site instead, where it is actually useful.
+    """
+    for failure_type, key in _TRANSPORT_FAILURE_KEYS.items():
+        if isinstance(exc, failure_type):
+            return key
+    return _DEFAULT_FAILURE_KEY
 
 
 def _rf_reachable(hass: HomeAssistant, hub: ZemismartHub) -> bool:
@@ -148,6 +225,7 @@ async def async_setup_entry(
     coordinator = RemoteCoordinator(hass, covers)
     runtime.coordinator = coordinator
     entry.async_on_unload(coordinator.detach)
+    entities: list[ZemismartCover | ZemismartAggregateCover] = []
     for cover_id, cover in covers.items():
         role = coordinator.roles[cover_id]
         try:
@@ -181,7 +259,10 @@ async def async_setup_entry(
                 runtime.hub,
                 coordinator,
             )
-        async_add_entities([entity])
+        entities.append(entity)
+    # One batched add, not one call per cover: each call schedules its own add
+    # pass, so a sixteen-cover remote paid sixteen of them at every reload.
+    async_add_entities(entities)
 
 
 def _number(value: object) -> float | None:
@@ -191,8 +272,15 @@ def _number(value: object) -> float | None:
     return float(value)
 
 
-class ZemismartCover(CoverEntity, RestoreEntity):
-    """An assumed-state cover committed only after first RF dispatch."""
+class _ZemismartCoverEntity(CoverEntity):
+    """The wiring both cover entities on a remote's device share.
+
+    Leaf and aggregate are both assumed-state shades that transmit OEM frames
+    and never poll, and both must keep the same high-rate motion attributes out
+    of the recorder. Those live here rather than being written twice so they
+    cannot drift: an attribute added to one class's extra_state_attributes can
+    no longer start silently recording at travel rate in the other.
+    """
 
     _attr_assumed_state = True
     _attr_device_class = CoverDeviceClass.SHADE
@@ -203,6 +291,89 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         | CoverEntityFeature.STOP
         | CoverEntityFeature.SET_POSITION
     )
+    # channels, remote, role, position_confidence, last_bridge, degraded and
+    # position_suspect stay recorded: those are the ones a user or an
+    # automation actually looks back at.
+    _unrecorded_attributes = _UNRECORDED_ATTRIBUTES
+
+    def __init__(
+        self,
+        cover_id: str,
+        remote_entry_id: str,
+        config: BlindConfig,
+        hub: ZemismartHub,
+    ) -> None:
+        """Bind one cover entity to its stored config, remote, and hub."""
+        self._config: BlindConfig = config
+        self._hub = hub
+        self._cover_id = cover_id
+        self._remote_entry_id = remote_entry_id
+        self._attr_unique_id = cover_id
+        # Full name, not a device-prefixed has_entity_name: deployed
+        # friendly names predate the shared-device layout and must not gain
+        # the remote's name as a prefix.
+        self._attr_name = config.name
+        self._stopped_by_heard = False
+        self._unsubscribe_rx_listener: Callable[[], None] | None = None
+        self._unsubscribe_mqtt_status: Callable[[], None] | None = None
+        # Serializes this entity's own commands. On a leaf, without it a
+        # set_position racing an unstarted open/close computes travel from a
+        # stale estimate and physically overshoots. On an aggregate it covers
+        # the single-frame commands only -- position fan-out deliberately runs
+        # OUTSIDE the lock so STOP never queues behind an in-flight fan-out
+        # (it cancels the fan-out instead).
+        self._command_lock = asyncio.Lock()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Attach to the remote's own device; covers are entities, not children.
+
+        Identifiers only: the remote device's name/model belong to
+        _ensure_remote_device, and repeating them here would let one cover
+        rename the shared device.
+        """
+        return DeviceInfo(identifiers={(DOMAIN, self._config.remote.key)})
+
+    # The three below are the contract a cover must satisfy to take part in RX.
+    # Abstract rather than merely conventional because CoverEntity's metaclass
+    # is an ABCMeta: a cover that forgets one now fails at instantiation
+    # instead of at the first heard press.
+
+    @abstractmethod
+    def _on_heard_press(self, event: HeardEvent) -> None:
+        """Apply one heard physical press of this remote to this cover."""
+
+    @abstractmethod
+    def _takeover_state(self) -> TakeoverCoverState:
+        """Return the command state the hub needs to classify a takeover."""
+
+    @abstractmethod
+    def _invalidate_for_takeover(self) -> None:
+        """Apply one hub-classified takeover invalidation to this cover."""
+
+    def _register_rx_listener(self) -> None:
+        """Subscribe this cover to heard presses on its own channels.
+
+        Written once for both covers because the ARGUMENT LIST is the contract.
+        Registering without `bases` is silent: RX classification falls back to
+        opcode inference, which is a ten-sample empirical fit rather than
+        protocol, so the loss shows up only on a remote outside that fit --
+        which is exactly how #30 survived. One call site cannot drift from the
+        other into that.
+        """
+        self._unsubscribe_rx_listener = self._hub.register_rx_listener(
+            self._config.remote.key,
+            frozenset(self._config.channels),
+            self._on_heard_press,
+            takeover_state=self._takeover_state,
+            invalidate_takeover=self._invalidate_for_takeover,
+            # The hub has no other route to a loaded remote's calibration.
+            bases=self._config.remote.bases,
+        )
+
+
+class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
+    """An assumed-state cover committed only after first RF dispatch."""
 
     def __init__(
         self,
@@ -216,18 +387,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if config.travel_up is None or config.travel_down is None:
             msg = "leaf cover entities require travel calibration"
             raise ValueError(msg)
+        super().__init__(cover_id, remote_entry_id, config, hub)
         self._travel_up: float = config.travel_up
         self._travel_down: float = config.travel_down
-        self._config: BlindConfig = config
-        self._hub = hub
         self._coordinator = coordinator
-        self._cover_id = cover_id
-        self._remote_entry_id = remote_entry_id
-        self._attr_unique_id = cover_id
-        # Full name, not a device-prefixed has_entity_name: deployed
-        # friendly names predate the shared-device layout and must not gain
-        # the remote's name as a prefix.
-        self._attr_name = config.name
         self._position: float | None = None
         self._direction = 0
         self._motion_started = 0.0
@@ -239,12 +402,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._motion_command_id: str | None = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
-        # position_confidence signals. `_position_verified` is set only when a
+        # position_confidence signals. `_position_anchored` is set only when a
         # travel actually COMPLETES against a hard limit; `_suspect` records an
         # untimed full travel cut short by an uncorroborated heard STOP and is
         # the one confidence signal that survives a restart. Both are cleared by
         # reaching a limit or going unknown -- they never overlap in practice.
-        self._position_verified = False
+        self._position_anchored = False
         self._suspect = False
         self._unverified_anchor_bridge: str | None = None
         self._unverified_anchor_command_id: str | None = None
@@ -255,28 +418,11 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._degraded = False
         self._intent_generation = 0
         self._restore_epoch = 0
-        self._unsubscribe_rx_listener: Callable[[], None] | None = None
-        self._unsubscribe_mqtt_status: Callable[[], None] | None = None
-        self._stopped_by_heard = False
-        # Serializes this entity's own commands: without it, a set_position
-        # racing an unstarted open/close computes travel from a stale
-        # estimate and physically overshoots.
-        self._command_lock = asyncio.Lock()
 
     async def async_set_member_position(self, target: int) -> None:
         """Run one aggregate-delegated position move under this entity's lock."""
         async with self._command_lock:
             await self._async_set_position_locked(target)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Attach to the remote's own device; covers are entities, not children.
-
-        Identifiers only: the remote device's name/model belong to
-        _ensure_remote_device, and repeating them here would let one cover
-        rename the shared device.
-        """
-        return DeviceInfo(identifiers={(DOMAIN, self._config.remote.key)})
 
     @property
     def available(self) -> bool:
@@ -308,10 +454,15 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     def position_confidence(self) -> str:
         """Report how far the current position estimate can be trusted.
 
+        The ranking is `unknown < suspect < assumed < anchored`. `anchored` is
+        the strongest thing this integration can honestly say and it is NOT
+        motor confirmation: it means a full travel was transmitted, a local
+        timer ran to completion, and no contradicting RF press was heard.
+
         `unknown` is deliberately derived from the entity state (no position)
         rather than tracked separately, so it is never a stored value. `suspect`
         -- an untimed full travel interrupted by an uncorroborated heard STOP --
-        outranks `verified`; the two never coexist, but suspect wins if they
+        outranks `anchored`; the two never coexist, but suspect wins if they
         somehow did. See ``_apply_stop`` for how it is raised and
         ``_anchor_if_at_limit`` / ``_mark_unknown`` for how it clears.
         """
@@ -319,8 +470,8 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             return CONFIDENCE_UNKNOWN
         if self._suspect:
             return CONFIDENCE_SUSPECT
-        if self._position_verified:
-            return CONFIDENCE_VERIFIED
+        if self._position_anchored:
+            return CONFIDENCE_ANCHORED
         return CONFIDENCE_ASSUMED
 
     @property
@@ -351,31 +502,39 @@ class ZemismartCover(CoverEntity, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Restore a stopped estimate or reconstruct complete started motion."""
         await super().async_added_to_hass()
+        # Handed to async_on_remove() BEFORE anything is acquired: HA runs these
+        # callbacks when the entity is removed AND when it fails to finish being
+        # added. The restore below raising used to leak every registration made
+        # above it onto the hub for the lifetime of the entry, because HA logs
+        # the entity-add failure without calling async_will_remove_from_hass().
+        # Both releases are idempotent, so the removal path — which calls them
+        # directly, and is the path the entity tests drive — cannot double-run
+        # them against this one.
+        self.async_on_remove(self._release_registrations)
+        self.async_on_remove(self._cancel_motion_task)
         if self._coordinator is not None:
             self._coordinator.register_leaf(self._cover_id, self)
-        self._unsubscribe_rx_listener = self._hub.register_rx_listener(
-            self._config.remote.key,
-            frozenset(self._config.channels),
-            self._on_heard_press,
-            takeover_state=self._takeover_state,
-            invalidate_takeover=self._invalidate_for_takeover,
-        )
+        self._register_rx_listener()
         self._hub.displaced_listeners.append(self._on_displaced)
         self._hub.emission_proof_listeners.append(self._on_emission_proof)
         self._hub.bridge_listeners.append(self._on_bridge_change)
         restore_guard = (self._intent_generation, self._restore_epoch)
         await self._async_restore_state(restore_guard)
-        # Subscribed LAST, after every await: if restoration raises, HA logs the
-        # entity-add failure without immediately calling
-        # async_will_remove_from_hass(), so a callback registered beforehand
-        # stays on the MQTT dispatcher until a later platform unload.
+        # Still subscribed LAST, but no longer for safety: restoration raising
+        # once left a callback registered beforehand on the MQTT dispatcher
+        # until a later platform unload, and ordering was the only defence
+        # available to it. _release_registrations, registered through
+        # async_on_remove() above, now covers this subscription wherever it is
+        # acquired — there is simply no reason to move it earlier.
         self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
 
-    async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
-        """Restore one stopped estimate or complete started motion."""
-        state = await self.async_get_last_state()
-        if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
-            return
+    def _restored_state_describes_this_cover(self, state: State) -> bool:
+        """Return whether a persisted state still describes THIS cover.
+
+        Both checks are about the config having moved out from under the
+        stored state, and either one makes every value in it meaningless --
+        so they answer one question and are asked in one place.
+        """
         if state.attributes.get("remote") != self._config.remote_key or state.attributes.get(
             "channels"
         ) != list(self._config.channels):
@@ -383,15 +542,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             # channel set changed in options): the persisted position and
             # motion describe the OLD physical target and must not be
             # assigned to the new one.
-            return
-        restored_role = state.attributes.get("role", Role.LEAF.value)
-        if restored_role != self._config.role.value:
-            # A topology change flipped this cover's role since the state
-            # was persisted; the old model does not describe the new shape.
-            return
-        restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
-        if restored is not None and 0 <= restored <= 100:
-            self._position = restored
+            return False
+        # A topology change flipping this cover's role since the state was
+        # persisted means the old model does not describe the new shape.
+        restored_role: object = state.attributes.get("role", Role.LEAF.value)
+        return restored_role == self._config.role.value
+
+    def _restore_confidence_signals(self, state: State) -> None:
+        """Reinstate the persisted doubts about the estimate, before any motion.
+
+        Every signal here describes a STOPPED cover, which is why it runs ahead
+        of the direction branches: a path that then marks the cover unknown
+        clears them, and that is a strictly stronger statement than any of them.
+        """
         self._last_bridge = self._optional_text(state.attributes.get(_ATTR_LAST_BRIDGE))
         self._degraded = bool(state.attributes.get(_ATTR_DEGRADED, False))
         # A questioned restore anchor survives repeated restarts: without
@@ -411,10 +574,20 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         )
         # The incident's wrong estimate survived a restart verbatim; the doubt
         # about it must too. A suspect estimate always persists with direction 0
-        # (a heard STOP froze it), so restoring it here in the common block --
-        # before the direction branches -- is correct; any path that then marks
-        # the cover unknown clears it, which is a strictly stronger statement.
+        # (a heard STOP froze it).
         self._suspect = state.attributes.get(_ATTR_POSITION_SUSPECT) is True
+
+    async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
+        """Restore one stopped estimate or complete started motion."""
+        state = await self.async_get_last_state()
+        if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
+            return
+        if not self._restored_state_describes_this_cover(state):
+            return
+        restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
+        if restored is not None and 0 <= restored <= 100:
+            self._position = restored
+        self._restore_confidence_signals(state)
         self._replay_emission_proof()
 
         raw_direction = state.attributes.get(_ATTR_MOTION_DIRECTION, 0)
@@ -479,7 +652,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             if absolute_anchor or target in {0.0, 100.0}:
                 # A travel that finished during downtime reached its hard
                 # limit for POSITION purposes, but nobody was listening while
-                # it ran -- no verified, and a restored suspect stays.
+                # it ran -- no anchored, and a restored suspect stays.
                 self._anchor_if_at_limit(observed=False)
             elif (
                 timed
@@ -520,8 +693,14 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._sync_position(now)
         self._create_motion_task("recovered travel")
 
-    async def async_will_remove_from_hass(self) -> None:
-        """Cancel the local timer and unregister direct group notifications."""
+    @callback
+    def _release_registrations(self) -> None:
+        """Drop every hub and coordinator registration this entity holds.
+
+        Idempotent by construction: it runs from the removal path below and
+        from the async_on_remove() callbacks, and a failed add followed by a
+        later unload runs it twice.
+        """
         if self._unsubscribe_rx_listener is not None:
             self._unsubscribe_rx_listener()
             self._unsubscribe_rx_listener = None
@@ -536,6 +715,10 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         if self._unsubscribe_mqtt_status is not None:
             self._unsubscribe_mqtt_status()
             self._unsubscribe_mqtt_status = None
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the local timer and unregister direct group notifications."""
+        self._release_registrations()
         self._cancel_motion_task()
         await super().async_will_remove_from_hass()
 
@@ -624,14 +807,19 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
         Equally deliberately NOT applied to a position that merely reads 0 or
         100 without a travel behind it -- a restored estimate from a
-        questioned origin would then launder itself into a verified one, which
+        questioned origin would then launder itself into an anchored one, which
         is exactly what _mark_unknown exists to prevent.
+
+        What this earns is `anchored`, never `verified` (#31): the motor
+        confirms nothing back over a one-way protocol, so the claim is about
+        the travel and the limit switch it ended against, not about evidence
+        from the hardware.
         """
         if self._position in (0.0, 100.0):
             self._clear_unverified_anchor()
             if observed:
                 # A completed travel to a hard limit is the ONLY thing that
-                # earns `verified`, and it also settles any suspect doubt:
+                # earns `anchored`, and it also settles any suspect doubt:
                 # whatever a heard STOP left ambiguous, the blind has now
                 # physically reached and rests against its limit switch.
                 #
@@ -640,12 +828,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
                 # an interruption. A completion that happened during HA's own
                 # downtime carries no such witness -- any press in that gap,
                 # real or phantom, was invisible -- so it keeps the position
-                # but earns no verified and settles no doubt. (Residual even
+                # but earns no anchored and settles no doubt. (Residual even
                 # when observed: a listener is deaf ~one slot after each
                 # capture, so a press CAN be missed. That risk is identical
                 # for commanded and heard travels, which is why both earn
-                # verified rather than only our own.)
-                self._position_verified = True
+                # anchored rather than only our own.)
+                self._position_anchored = True
                 self._suspect = False
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
@@ -758,12 +946,12 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._cancel_motion_task()
         self._clear_motion()
         # Any interruption ends the moving estimate BEFORE it reaches a limit, so
-        # the prior `verified` no longer holds. Runs only on interruption:
+        # the prior `anchored` no longer holds. Runs only on interruption:
         # clean completion goes through _async_track_motion, never here, so the
         # anchor it just set survives. `_suspect` is intentionally untouched --
         # it clears only at a completed limit or unknown, not when a fresh
         # travel starts over the doubtful estimate.
-        self._position_verified = False
+        self._position_anchored = False
 
     def _mark_unknown(self) -> None:
         """Discard ambiguous motion after a lifecycle timeout or recovery gap."""
@@ -771,9 +959,54 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self._position = None
         self._clear_motion()
         self._clear_unverified_anchor()
-        self._position_verified = False
+        self._position_anchored = False
         self._suspect = False
         self._degraded = True
+
+    @callback
+    def invalidate_for_cancelled_command(self) -> None:
+        """Invalidate this leaf after a command whose outcome we will never see.
+
+        Used by cancellation and by ack/started timeouts, and by an aggregate
+        for members that never issued the command themselves. All three share
+        one shape: a frame that MAY be on air, and no path left by which this
+        entity will learn what it did.
+
+        The aggregate's frame addresses the whole channel set, so if it had
+        already published, this member moved -- but the command was never this
+        entity's, so nothing here would otherwise record the loss (#28).
+
+        The epoch bump has to happen with the invalidation, not after it: leaves
+        register before awaiting restored state, so a member whose restore is
+        still in flight would pass its guard in _async_restore_state and put the
+        cached confident position straight back over this.
+
+        UNCONDITIONAL, deliberately, and two rejected attempts are why.
+
+        It is tempting to spare a cover whose model a physical press has just
+        replaced -- the press looks like better evidence than a cancelled
+        command's absence. It is not, because the cancellation says nothing
+        about RF ordering. The hub keeps an already-published command alive
+        after its caller is cancelled (a published frame is on air whether or
+        not anyone still awaits it), so the bridge may first-dispatch it AFTER
+        the press was heard, with no cover task left to observe the result. The
+        blind would then move under a command nobody is tracking while the cover
+        confidently reports the model the earlier press installed.
+
+        Keying the skip on `_intent_generation` failed for a second, simpler
+        reason: it advances for every intersecting press, including a STOP heard
+        with nothing to stop, which preserves the previous estimate without
+        earning it.
+
+        Neither a generation nor a model revision can express what would
+        actually be needed here: proof that the cancelled command's own
+        `started_at` preceded the heard event. Until the model carries that,
+        `unknown` is the only honest answer -- which is the same standard
+        `_async_transmit` already applies to an ack timeout.
+        """
+        self._restore_epoch += 1
+        self._mark_unknown()
+        self.async_write_ha_state()
 
     def _record_ack(self, ack: CommandAck) -> None:
         """Record the bridge selected at worker publish time."""
@@ -1014,6 +1247,9 @@ class ZemismartCover(CoverEntity, RestoreEntity):
 
     async def _async_track_motion(self, token: object) -> None:
         """Integrate this cover until its RF-start-based motion deadline."""
+        # The motion's own start write has just happened at the call site; the
+        # first throttled progress write is due one interval after it.
+        last_write = WALL_CLOCK()
         while self._motion_token is token:
             remaining = self._motion_deadline - WALL_CLOCK()
             if remaining <= 0:
@@ -1021,8 +1257,16 @@ class ZemismartCover(CoverEntity, RestoreEntity):
             await asyncio.sleep(min(POSITION_UPDATE_INTERVAL_SECONDS, remaining))
             if self._motion_token is not token:
                 return
+            # The estimate is re-integrated every tick — that is what keeps the
+            # position smooth — but only the throttled subset of those ticks is
+            # written. Start, stop, invalidation and completion all write
+            # immediately from their own call sites, so nothing a user or an
+            # automation waits on is delayed by this.
             self._sync_position()
-            self.async_write_ha_state()
+            now = WALL_CLOCK()
+            if now - last_write >= _PROGRESS_WRITE_INTERVAL_SECONDS:
+                last_write = now
+                self.async_write_ha_state()
         if self._motion_token is not token:
             return
         self._position = self._motion_target
@@ -1053,13 +1297,58 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
             # The frame MAY have reached RF; only unknown is honest. Aggregates
             # containing this leaf re-derive through the coordinator.
-            self._mark_unknown()
-            self.async_write_ha_state()
-            raise HomeAssistantError(str(exc)) from exc
-        except Exception as exc:
+            #
+            # Routed through the shared helper for its epoch bump: HA inserts an
+            # entity into the service mapping BEFORE awaiting
+            # async_added_to_hass, so a cover can be commanded while its own
+            # restore is still suspended. Marking unknown without advancing the
+            # epoch let that restore resume, pass its guard, and reinstall the
+            # cached position -- reporting a specific estimate after a command
+            # that may have reached the air. Identical hazard to the
+            # cancellation path, and it wants the identical answer.
+            self.invalidate_for_cancelled_command()
+            _LOGGER.warning("Command timed out for %s: %s", self._config.name, exc)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="command_timeout",
+            ) from exc
+        except asyncio.CancelledError:
+            # CancelledError derives from BaseException, so it used to pass
+            # straight through every handler and unwind without touching the
+            # model -- while the hub deliberately keeps an already-published
+            # command alive, because a published frame is on air whether or not
+            # anyone is still awaiting it. The blind moved and nobody recorded
+            # it, leaving a confident, specific, WRONG position (#28). Reachable
+            # from an entry reload mid-move, `script.turn_off`, an automation in
+            # mode: restart, and entity unload.
+            #
+            # Pessimistic on purpose: cancellation BEFORE publication could
+            # safely keep the estimate, but only the hub knows which side of
+            # publication the cancellation landed on. Narrowing it needs
+            # `_QueuedCommand.published` surfaced from models.py.
+            #
+            # The epoch bump is what makes the invalidation stick: leaves
+            # register before awaiting restored state, so a still-pending
+            # _async_restore_state would otherwise pass its guard and overwrite
+            # this with the cached confident position. Same reason _apply_stop
+            # bumps it -- a live invalidation supersedes a pending restore.
+            self.invalidate_for_cancelled_command()
+            raise
+        except HomeAssistantError:
+            # The transport refusing the publish outright (MQTT unavailable).
+            # It is already a translated, user-facing error, so it is re-raised
+            # untouched — but the bridge is still degraded.
             self._degraded = True
             self.async_write_ha_state()
-            raise HomeAssistantError(str(exc)) from exc
+            raise
+        except _TRANSPORT_FAILURES as exc:
+            self._degraded = True
+            self.async_write_ha_state()
+            _LOGGER.warning("Command failed for %s: %s", self._config.name, exc)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key=_failure_translation_key(exc),
+            ) from exc
         if result == "superseded":
             return None
         return result
@@ -1200,8 +1489,13 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         overlap_token = self._hub.overlap_token(self._config)
         current = self._estimated_position(WALL_CLOCK())
         if current is None:
-            msg = "position is unknown; run a full open or close calibration first"
-            raise HomeAssistantError(msg)
+            # A ServiceValidationError, not a HomeAssistantError: nothing
+            # failed, the caller asked for a partial move the model cannot
+            # compute yet.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="position_unknown",
+            )
         if abs(target - current) < 0.5:
             return
 
@@ -1229,7 +1523,7 @@ class ZemismartCover(CoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
 
-class ZemismartAggregateCover(CoverEntity):
+class ZemismartAggregateCover(_ZemismartCoverEntity):
     """A cover whose state derives from its leaf members.
 
     RF behavior matches the retired group entries: open/close/stop transmit
@@ -1237,16 +1531,6 @@ class ZemismartAggregateCover(CoverEntity):
     each member's own timed positioning. The aggregate owns no position model
     of its own — members are the single source of truth.
     """
-
-    _attr_assumed_state = True
-    _attr_device_class = CoverDeviceClass.SHADE
-    _attr_should_poll = False
-    _attr_supported_features = (
-        CoverEntityFeature.OPEN
-        | CoverEntityFeature.CLOSE
-        | CoverEntityFeature.STOP
-        | CoverEntityFeature.SET_POSITION
-    )
 
     def __init__(
         self,
@@ -1257,54 +1541,33 @@ class ZemismartAggregateCover(CoverEntity):
         coordinator: RemoteCoordinator,
     ) -> None:
         """Initialize one aggregate bound to its coordinator topology."""
-        self._config = config
-        self._hub = hub
+        super().__init__(cover_id, remote_entry_id, config, hub)
         self._coordinator = coordinator
-        self._cover_id = cover_id
-        self._remote_entry_id = remote_entry_id
-        self._attr_unique_id = cover_id
-        # Full name, not a device-prefixed has_entity_name: deployed
-        # friendly names predate the shared-device layout and must not gain
-        # the remote's name as a prefix.
-        self._attr_name = config.name
         self._last_command_bridge: str | None = None
         self._last_command_id: str | None = None
         self._last_command_button: Button | None = None
         self._last_command_at = 0.0
-        self._stopped_by_heard = False
         self._fanout_tasks: set[asyncio.Task[None]] = set()
-        self._unsubscribe_rx_listener: Callable[[], None] | None = None
-        self._unsubscribe_mqtt_status: Callable[[], None] | None = None
-        # Serializes the aggregate's own single-frame commands. Position
-        # fan-out deliberately runs OUTSIDE this lock so STOP never queues
-        # behind an in-flight fan-out (it cancels the fan-out instead).
-        self._command_lock = asyncio.Lock()
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Attach to the remote's own device; covers are entities, not children.
-
-        Identifiers only: the remote device's name/model belong to
-        _ensure_remote_device, and repeating them here would let one cover
-        rename the shared device.
-        """
-        return DeviceInfo(identifiers={(DOMAIN, self._config.remote.key)})
 
     async def async_added_to_hass(self) -> None:
         """Register with the coordinator and the hub's takeover machinery."""
         await super().async_added_to_hass()
+        # Registered before anything is acquired, for the reason spelled out on
+        # ZemismartCover.async_added_to_hass: HA runs these on a failed add too,
+        # which async_will_remove_from_hass() never sees.
+        self.async_on_remove(self._release_registrations)
+        self.async_on_remove(self._cancel_fanout)
         self._coordinator.register_aggregate(self._cover_id, self)
-        self._unsubscribe_rx_listener = self._hub.register_rx_listener(
-            self._config.remote.key,
-            frozenset(self._config.channels),
-            self._on_heard_press,
-            takeover_state=self._takeover_state,
-            invalidate_takeover=self._invalidate_for_takeover,
-        )
+        self._register_rx_listener()
         self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
 
-    async def async_will_remove_from_hass(self) -> None:
-        """Unregister and cancel any in-flight fan-out."""
+    @callback
+    def _release_registrations(self) -> None:
+        """Drop every hub and coordinator registration this aggregate holds.
+
+        Idempotent: it runs from the removal path below and from the
+        async_on_remove() callbacks.
+        """
         if self._unsubscribe_rx_listener is not None:
             self._unsubscribe_rx_listener()
             self._unsubscribe_rx_listener = None
@@ -1312,6 +1575,10 @@ class ZemismartAggregateCover(CoverEntity):
             self._unsubscribe_mqtt_status()
             self._unsubscribe_mqtt_status = None
         self._coordinator.unregister_aggregate(self._cover_id)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unregister and cancel any in-flight fan-out."""
+        self._release_registrations()
         self._cancel_fanout()
         await super().async_will_remove_from_hass()
 
@@ -1322,6 +1589,42 @@ class ZemismartAggregateCover(CoverEntity):
             self._coordinator.members_of(self._cover_id),
         )
 
+    def _failure_members(
+        self,
+        issued_members: tuple[ZemismartCover, ...],
+    ) -> tuple[ZemismartCover, ...]:
+        """Return every leaf a failed group frame could have moved.
+
+        The union of the members present when the frame was issued and those
+        present now. A leaf that deregistered mid-flight is gone from
+        `_members()` but its channels were still addressed; a leaf that joined
+        mid-flight was never in the snapshot but is addressed too. Order is kept
+        stable and duplicates dropped.
+        """
+        seen: dict[int, ZemismartCover] = {}
+        for member in (*issued_members, *self._members()):
+            seen.setdefault(id(member), member)
+        return tuple(seen.values())
+
+    def _members_cover_every_channel(self) -> bool:
+        """Return whether the live members account for ALL of our channels.
+
+        The laminar topology does not require them to. `members_of` returns the
+        live configured LEAVES strictly inside this aggregate, and nothing
+        guarantees their union equals ours: an aggregate over {1..6} whose
+        leaves are {1,2,3}, {4} and {5} has no model for channel 6 at all, and
+        `async_setup_entry` skips any cover whose config fails to derive, so a
+        member can also be missing at runtime.
+
+        Left unchecked, the aggregate reported a confident position -- possibly
+        `anchored` -- for hardware it had no model of, and `set_position` moved
+        the channels it could and returned success (#32).
+        """
+        covered = frozenset(
+            channel for member in self._members() for channel in member._config.channels
+        )
+        return covered == frozenset(self._config.channels)
+
     @property
     def available(self) -> bool:
         """Available while RF works and at least one member is registered."""
@@ -1329,15 +1632,33 @@ class ZemismartAggregateCover(CoverEntity):
 
     @property
     def current_cover_position(self) -> int | None:
-        """Return the unweighted mean of members with known positions."""
-        positions = [
-            position
-            for member in self._members()
-            if (position := member.current_cover_position) is not None
-        ]
-        if not positions:
+        """Return the channel-weighted member mean, or None if any is unknown.
+
+        Unknown members are NOT skipped (#32): averaging the rest produced a
+        confident, specific number describing only part of the hardware the
+        aggregate claims to represent, and that number is what dashboards and
+        automations read. `is_closed` already returns None on a mixed state;
+        this now matches its honesty.
+
+        Weighted by channel count because a member is a motor set, not a vote:
+        a leaf covering {1,2} moves twice as much hardware as one covering {3},
+        so an unweighted mean reported the midpoint of the two LEAVES rather
+        than of the three MOTORS.
+        """
+        if not self._members_cover_every_channel():
             return None
-        return round(sum(positions) / len(positions))
+        travelled = 0.0
+        channels = 0
+        for member in self._members():
+            position = member.current_cover_position
+            if position is None:
+                return None
+            weight = len(member._config.channels)
+            travelled += position * weight
+            channels += weight
+        if not channels:
+            return None
+        return round(travelled / channels)
 
     @property
     def is_opening(self) -> bool:
@@ -1355,9 +1676,16 @@ class ZemismartAggregateCover(CoverEntity):
         states = [member.is_closed for member in self._members()]
         if not states:
             return None
+        # `False` needs no completeness: one member demonstrably open makes the
+        # GROUP open whatever the unmodelled channels are doing.
         if any(state is False for state in states):
             return False
-        if all(state is True for state in states):
+        # `True` does. This is the entity's PRIMARY state, so an aggregate over
+        # {1,2,3,4} whose live members cover only {1,2,3} would otherwise be
+        # published to HA as `closed` while channel 4 is entirely unmodelled --
+        # the same hole current_cover_position and position_confidence already
+        # close (#32).
+        if all(state is True for state in states) and self._members_cover_every_channel():
             return True
         return None
 
@@ -1365,28 +1693,40 @@ class ZemismartAggregateCover(CoverEntity):
     def position_confidence(self) -> str:
         """Derive confidence from members -- the worst known value wins.
 
-        A suspect member marks the whole group suspect. A member with no
-        position cannot vote on which known value wins, but its absence is
-        itself information: the group caps at `assumed`, because `verified`
-        over a broken sibling would hide exactly the member that needs fixing.
-        Only an all-unknown group is itself unknown.
+        One rule throughout: no position means `unknown`. That holds for a leaf
+        with no estimate, for a group whose members do not cover its channels,
+        and for a group with an unknown member -- because `current_cover_position`
+        returns None in every one of those cases.
+
+        The older rule capped this at `assumed` instead, which was right while
+        the position was the mean of the members that HAD one. Once #32 made a
+        single unknown member withhold the whole position, `assumed` started
+        claiming an estimate that no longer existed, and an automation gating on
+        `position_confidence != 'unknown'` would act on nothing.
+
+        A suspect member still marks the whole group suspect.
         """
         members = list(self._members())
-        confidences = [
-            member.position_confidence
-            for member in members
-            if member.current_cover_position is not None
-        ]
+        if not self._members_cover_every_channel():
+            # `unknown`, not `assumed`: current_cover_position returns None in
+            # this state, and the leaf's rule is that no position means unknown.
+            # Reporting `assumed` implied there was an estimate that merely
+            # lacked corroboration, so an automation gating on
+            # `position_confidence != 'unknown'` would act on a position that
+            # does not exist.
+            return CONFIDENCE_UNKNOWN
+        confidences = [member.position_confidence for member in members]
         if not confidences:
             return CONFIDENCE_UNKNOWN
+        # Suspect first: a member frozen by an uncorroborated heard STOP is a
+        # stronger statement about the group than a sibling merely being blank.
         if CONFIDENCE_SUSPECT in confidences:
             return CONFIDENCE_SUSPECT
-        if CONFIDENCE_ASSUMED in confidences or len(confidences) != len(members):
-            # A member with no position at all caps the group at assumed:
-            # reporting verified while a sibling is broken would hide exactly
-            # the member an automation gating on this attribute needs to fix.
+        if CONFIDENCE_UNKNOWN in confidences:
+            return CONFIDENCE_UNKNOWN
+        if CONFIDENCE_ASSUMED in confidences:
             return CONFIDENCE_ASSUMED
-        return CONFIDENCE_VERIFIED
+        return CONFIDENCE_ANCHORED
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1450,14 +1790,54 @@ class ZemismartAggregateCover(CoverEntity):
 
     async def _async_transmit(self, button: Button) -> CommandAck | None:
         """Send one untimed full-channel-set frame and record its identity."""
+        # Membership is read TWICE and the two are unioned. Neither end alone is
+        # right: a leaf registers before awaiting its restore, so one can join
+        # while the frame is in flight; and a leaf can deregister on unload
+        # during the same window, vanishing from `_members()` while the frame
+        # that addressed its channels is already on air. Snapshot-only missed
+        # the first, current-only missed the second.
+        issued_members = self._members()
         try:
             result = await self._hub.async_transmit(
                 self._config,
                 button,
                 owner=self._remote_entry_id,
             )
-        except Exception as exc:
-            raise HomeAssistantError(str(exc)) from exc
+        except asyncio.CancelledError:
+            # Same hazard as the leaf's transmit (#28), but this frame addresses
+            # the WHOLE channel set: if it was already published, every member
+            # moved. The aggregate owns no position model, so the members are
+            # the only place that loss can be recorded -- and they cannot learn
+            # it themselves, because this command was never theirs.
+            #
+            # Each member's epoch is bumped for the same reason the leaf bumps
+            # its own: a member whose restore is still pending would otherwise
+            # overwrite this invalidation with its cached position.
+            for member in self._failure_members(issued_members):
+                member.invalidate_for_cancelled_command()
+            self.async_write_ha_state()
+            raise
+        except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
+            # The leaf invalidates itself on a timeout; the aggregate has to do
+            # it for its members. The frame MAY have reached RF, and this
+            # command was never any member's own, so nothing else records the
+            # loss: _async_move_full never starts member tracking and
+            # async_stop_cover never freezes it, leaving members integrating
+            # through a STOP that may have fired, still reporting `anchored`.
+            _LOGGER.warning("Command timed out for %s: %s", self._config.name, exc)
+            for member in self._failure_members(issued_members):
+                member.invalidate_for_cancelled_command()
+            self.async_write_ha_state()
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="command_timeout",
+            ) from exc
+        except _TRANSPORT_FAILURES as exc:
+            _LOGGER.warning("Command failed for %s: %s", self._config.name, exc)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key=_failure_translation_key(exc),
+            ) from exc
         if result == "superseded":
             return None
         self._last_command_bridge = result.bridge.bridge_id
@@ -1559,15 +1939,62 @@ class ZemismartAggregateCover(CoverEntity):
         skipped = [member for member in registered if not member.available]
         if not members:
             names = ", ".join(member._config.name for member in skipped) or "none"
-            msg = f"no member covers are available to position (unavailable: {names})"
-            raise HomeAssistantError(msg)
+            # Nothing failed: every member is simply unreachable right now.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="no_members_available",
+                translation_placeholders={"unavailable": names},
+            )
+        # Nor can a partial group be positioned at all: fanning out to the
+        # members we have would move some of this aggregate's channels and
+        # leave the rest, then report success (#32).
+        if not self._members_cover_every_channel():
+            covered = frozenset(
+                channel for member in registered for channel in member._config.channels
+            )
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="aggregate_incomplete",
+                translation_placeholders={
+                    "missing": ", ".join(
+                        str(channel)
+                        for channel in sorted(frozenset(self._config.channels) - covered)
+                    )
+                },
+            )
+        # PREFLIGHT before any frame reaches the air (#32). A member with no
+        # estimate cannot be positioned, and discovering that inside the
+        # fan-out meant reporting failure AFTER part of the group had
+        # physically moved -- a state neither the caller nor the model
+        # intended, and one that makes a retry hazardous: the already-moved
+        # members would move again from their new positions.
+        #
+        # It cannot close the window entirely -- a heard press can invalidate a
+        # member between this check and its frame -- but that member then fails
+        # in delegate() as before, which is the narrow residual, not the whole
+        # class.
+        unpositionable = [member for member in members if member.current_cover_position is None]
+        if unpositionable:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="member_position_unknown",
+                translation_placeholders={
+                    "members": ", ".join(member._config.name for member in unpositionable)
+                },
+            )
         failures: list[str] = []
 
         async def delegate(member: ZemismartCover) -> None:
             try:
                 await member.async_set_member_position(target)
             except HomeAssistantError as exc:
-                failures.append(f"{member._config.name}: {exc}")
+                # The member NAME only. Interpolating `exc` rendered a
+                # translated HomeAssistantError to its English fallback and
+                # then nested that inside another translated message, so a
+                # non-English user got English text either way (#37). The
+                # detail is logged instead.
+                _LOGGER.warning("Positioning failed for %s: %s", member._config.name, exc)
+                failures.append(member._config.name)
 
         tasks = [
             self.hass.async_create_task(
@@ -1578,9 +2005,30 @@ class ZemismartAggregateCover(CoverEntity):
         ]
         self._fanout_tasks.update(tasks)
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             self._fanout_tasks.difference_update(tasks)
+        # Every gather result is inspected (#33). `return_exceptions=True` is
+        # required here -- one member failing must not abandon the others
+        # mid-fan-out -- but the results used to be discarded, so a TypeError
+        # or AttributeError anywhere in a member's command path produced no
+        # traceback, no service failure, and a group where some blinds moved
+        # and some did not. delegate() collects only HomeAssistantError;
+        # anything else reaching this list is by definition unexpected.
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                # Preserve #28's semantics: the cancelled member already marked
+                # itself unknown, and cancellation must propagate as
+                # cancellation rather than be reported as a member failure.
+                raise result
+        for result in results:
+            if isinstance(result, BaseException):
+                # Re-raised, not wrapped: the original traceback is the whole
+                # point of surfacing it.
+                raise result
         if failures:
-            msg = f"position delegation failed for: {'; '.join(failures)}"
-            raise HomeAssistantError(msg)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="position_delegation_failed",
+                translation_placeholders={"members": ", ".join(failures)},
+            )

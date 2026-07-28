@@ -54,9 +54,18 @@ from .state_sync import (
 )
 
 if TYPE_CHECKING:
+    from .air import AirPlan
     from .coordinator import RemoteCoordinator
+    from .state_sync import BasesResolver
 
 _LOGGER = logging.getLogger(__name__)
+# Exception tuples are bound to names rather than written inline. `ruff format`
+# at this project's target-version rewrites the parenthesised `except (A, B):`
+# straight back into the bare PEP 758 `except A, B:`, which is a SyntaxError on
+# Python < 3.14 -- so a manual or zip install onto an older core fails at import
+# with no useful message. A named tuple is left alone by the formatter and
+# parses everywhere (#43).
+_PAYLOAD_ERRORS: Final = (UnicodeDecodeError, json.JSONDecodeError)
 
 Button = Literal["UP", "DOWN", "STOP", "TRAILER"]
 Publisher = Callable[[str, str], Awaitable[None]]
@@ -96,6 +105,17 @@ _LEDGER_REPEAT_AIRTIME_MS: Final = 1_000
 # 2 s this was fixed at before repeats was taken into account.
 _LEDGER_FRAME_AIRTIME_MS: Final = 2_000
 _PRESS_SEQ_CAP: Final = 512
+# Same bound as _PRESS_SEQ_CAP beside it: 16 channels per remote, so this is
+# 32 identities' worth of publish state. Raw frames can introduce arbitrary
+# remote keys, which is what made the unbounded version reachable (#34).
+_PUBLISH_SEQ_CAP: Final = 512
+# Movements and raw frames the hub will hold outstanding at once (queued +
+# fast lane + in flight). cover.py's per-entity _command_lock already
+# serialises real usage one-per-cover, so a household fleet never approaches
+# this; the admin send_raw service bypasses those locks entirely and is the
+# surface this bounds. STOP is deliberately NOT counted against the cap and
+# can never be rejected by it -- see _async_enqueue.
+_MAX_OUTSTANDING_COMMANDS: Final = 128
 _UINT32_MAX: Final = (1 << 32) - 1
 _MAX_STARTED_AGE_MS: Final = 7_200_000
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
@@ -139,6 +159,15 @@ class CommandStartedTimeoutError(RuntimeError):
 
 class CommandRejectedError(RuntimeError):
     """Raised when a bridge explicitly rejects a correlated command."""
+
+
+class CommandQueueFullError(RuntimeError):
+    """Raised when outstanding movement and raw work is already at its cap.
+
+    A ``RuntimeError`` so both command boundaries -- the cover entity and the
+    admin ``send_raw`` service -- already translate it into a user-facing
+    ``HomeAssistantError`` rather than a traceback. STOP never raises this.
+    """
 
 
 class CommandDisplacedError(RuntimeError):
@@ -241,6 +270,71 @@ def _as_float(value: object, field: str) -> float:
     except ValueError as exc:
         msg = f"{field} must be numeric"
         raise ValueError(msg) from exc
+
+
+def _cancel_waiters(commands: Iterable[_QueuedCommand]) -> None:
+    """Cancel every caller still awaiting these commands, on final teardown."""
+    for command in commands:
+        for future in command.futures:
+            future.cancel()
+
+
+def _bases_from_mapping(values: Mapping[str, object]) -> CommandBases | None:
+    """Read one remote's calibration out of stored config values.
+
+    All three bases are configured together or not at all: a partial set is
+    rejected rather than half-filled, because a missing base would silently
+    fall back to another remote's calibration and emit the wrong code.
+    Returns None when none are stored, which leaves RemoteIdentity free to
+    consult KNOWN_CALIBRATIONS.
+    """
+    configured = [key in values for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
+    if any(configured) and not all(configured):
+        msg = "base_up, base_down, and base_stop must be configured together"
+        raise ValueError(msg)
+    if not all(configured):
+        return None
+    return CommandBases(
+        up=parse_hex(_required(values, CONF_BASE_UP), CONF_BASE_UP, 16),
+        down=parse_hex(_required(values, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
+        stop=parse_hex(_required(values, CONF_BASE_STOP), CONF_BASE_STOP, 16),
+        trailer=(
+            parse_hex(values[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
+            if values.get(CONF_BASE_TRAILER) not in (None, "")
+            else None
+        ),
+    )
+
+
+def _bases_as_dict(bases: CommandBases) -> dict[str, object]:
+    """Return the JSON-safe storage form of one remote's calibration.
+
+    The trailer is always emitted, empty when absent: options merge OVER entry
+    data, so removing a trailer must store an explicit empty marker — an
+    omitted key would let the stale data-layer trailer keep winning.
+    """
+    return {
+        CONF_BASE_UP: f"{bases.up:04x}",
+        CONF_BASE_DOWN: f"{bases.down:04x}",
+        CONF_BASE_STOP: f"{bases.stop:04x}",
+        CONF_BASE_TRAILER: f"{bases.trailer:04x}" if bases.trailer is not None else "",
+    }
+
+
+def _validate_pacing(repeats: int, coalesce_window_ms: int) -> None:
+    """Validate the two transmit-pacing knobs shared by every stored config."""
+    if not MIN_REPEATS <= repeats <= MAX_REPEATS:
+        msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
+        raise ValueError(msg)
+    if (
+        isinstance(coalesce_window_ms, bool)
+        or not isinstance(coalesce_window_ms, int)
+        or not 0 <= coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
+    ):
+        # The upper bound matches the config-flow selector: a hand-edited
+        # giant window would silently delay every movement command.
+        msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,16 +495,7 @@ class RemoteConfig:
         if self.remote.bases is None:
             msg = "remote calibration is required"
             raise ValueError(msg)
-        if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
-            msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
-            raise ValueError(msg)
-        if (
-            isinstance(self.coalesce_window_ms, bool)
-            or not isinstance(self.coalesce_window_ms, int)
-            or not 0 <= self.coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
-        ):
-            msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
-            raise ValueError(msg)
+        _validate_pacing(self.repeats, self.coalesce_window_ms)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "area_id", area_id)
         object.__setattr__(self, "cover_rows", cover_rows)
@@ -426,25 +511,11 @@ class RemoteConfig:
         """Build one remote from HA config-entry data."""
         prefix = parse_hex(_required(data, CONF_PREFIX), CONF_PREFIX, 24)
         remote_id = parse_hex(_required(data, CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
-        configured = [key in data for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
-        if any(configured) and not all(configured):
-            msg = "base_up, base_down, and base_stop must be configured together"
-            raise ValueError(msg)
-        bases = (
-            CommandBases(
-                up=parse_hex(_required(data, CONF_BASE_UP), CONF_BASE_UP, 16),
-                down=parse_hex(_required(data, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
-                stop=parse_hex(_required(data, CONF_BASE_STOP), CONF_BASE_STOP, 16),
-                trailer=(
-                    parse_hex(data[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
-                    if data.get(CONF_BASE_TRAILER) not in (None, "")
-                    else None
-                ),
-            )
-            if all(configured)
-            else None
+        remote = RemoteIdentity(
+            prefix=prefix,
+            remote_id=remote_id,
+            bases=_bases_from_mapping(data),
         )
-        remote = RemoteIdentity(prefix=prefix, remote_id=remote_id, bases=bases)
         raw_cover_rows = data.get(CONF_COVERS, ())
         if not isinstance(raw_cover_rows, list | tuple):
             msg = "covers must be a list"
@@ -480,13 +551,8 @@ class RemoteConfig:
             CONF_AREA_ID: self.area_id,
             CONF_REPEATS: self.repeats,
             CONF_COALESCE_WINDOW_MS: self.coalesce_window_ms,
-            CONF_BASE_UP: f"{self.remote.bases.up:04x}",
-            CONF_BASE_DOWN: f"{self.remote.bases.down:04x}",
-            CONF_BASE_STOP: f"{self.remote.bases.stop:04x}",
+            **_bases_as_dict(self.remote.bases),
         }
-        values[CONF_BASE_TRAILER] = (
-            f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
-        )
         values[CONF_COVERS] = [dict(row) for row in self.cover_rows]
         return values
 
@@ -583,18 +649,7 @@ class BlindConfig:
             # the firmware's accepted 1-hour range.
             msg = f"travel times must be finite, greater than zero, at most {MAX_TRAVEL_SECONDS}"
             raise ValueError(msg)
-        if not MIN_REPEATS <= self.repeats <= MAX_REPEATS:
-            msg = f"repeats must be in the range {MIN_REPEATS}..{MAX_REPEATS}"
-            raise ValueError(msg)
-        if (
-            isinstance(self.coalesce_window_ms, bool)
-            or not isinstance(self.coalesce_window_ms, int)
-            or not 0 <= self.coalesce_window_ms <= MAX_COALESCE_WINDOW_MS
-        ):
-            # The upper bound matches the config-flow selector: a hand-edited
-            # giant window would silently delay every movement command.
-            msg = f"coalesce_window_ms must be an integer in 0..{MAX_COALESCE_WINDOW_MS}"
-            raise ValueError(msg)
+        _validate_pacing(self.repeats, self.coalesce_window_ms)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "area_id", area_id)
         object.__setattr__(self, "channels", channels)
@@ -605,24 +660,6 @@ class BlindConfig:
         channels = parse_channels(_required(values, CONF_CHANNELS))
         prefix = parse_hex(_required(values, CONF_PREFIX), CONF_PREFIX, 24)
         remote_id = parse_hex(_required(values, CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
-        configured_bases = [key in values for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP)]
-        if any(configured_bases) and not all(configured_bases):
-            msg = "base_up, base_down, and base_stop must be configured together"
-            raise ValueError(msg)
-        bases = (
-            CommandBases(
-                up=parse_hex(_required(values, CONF_BASE_UP), CONF_BASE_UP, 16),
-                down=parse_hex(_required(values, CONF_BASE_DOWN), CONF_BASE_DOWN, 16),
-                stop=parse_hex(_required(values, CONF_BASE_STOP), CONF_BASE_STOP, 16),
-                trailer=(
-                    parse_hex(values[CONF_BASE_TRAILER], CONF_BASE_TRAILER, 16)
-                    if values.get(CONF_BASE_TRAILER) not in (None, "")
-                    else None
-                ),
-            )
-            if all(configured_bases)
-            else None
-        )
 
         # RemoteIdentity.__post_init__ fills bases from KNOWN_CALIBRATIONS when
         # none are stored (the table ships empty; deployments may pre-seed it).
@@ -633,7 +670,7 @@ class BlindConfig:
         remote = RemoteIdentity(
             prefix=prefix,
             remote_id=remote_id,
-            bases=bases,
+            bases=_bases_from_mapping(values),
         )
 
         return cls(
@@ -663,16 +700,8 @@ class BlindConfig:
             CONF_AREA_ID: self.area_id,
             CONF_REPEATS: self.repeats,
             CONF_COALESCE_WINDOW_MS: self.coalesce_window_ms,
-            CONF_BASE_UP: f"{self.remote.bases.up:04x}",
-            CONF_BASE_DOWN: f"{self.remote.bases.down:04x}",
-            CONF_BASE_STOP: f"{self.remote.bases.stop:04x}",
+            **_bases_as_dict(self.remote.bases),
         }
-        # Always emitted, empty when absent: options merge OVER entry data,
-        # so removing a trailer must store an explicit empty marker — an
-        # omitted key would let the stale data-layer trailer keep winning.
-        values[CONF_BASE_TRAILER] = (
-            f"{self.remote.bases.trailer:04x}" if self.remote.bases.trailer is not None else ""
-        )
         return values
 
     @property
@@ -933,6 +962,10 @@ class _RxListener:
     callback: Callable[[HeardEvent], None]
     takeover_state: Callable[[], TakeoverCoverState] | None = None
     invalidate_takeover: Callable[[], None] | None = None
+    # The registering cover's measured calibration. This is how the hub learns
+    # a loaded remote's bases at all: a listener exists exactly for a
+    # configured cover, which is exactly when the bases are known (#30).
+    bases: CommandBases | None = None
 
 
 @dataclass(slots=True)
@@ -1072,11 +1105,20 @@ class ZemismartHub:
         self._air = AirArbiter(mode=air_mode, monotonic_now=monotonic_now)
         self._air.update_bridges(self._air_bridge_snapshot(), now=self._monotonic_now())
         self._rx_listeners: list[_RxListener] = []
+        # Entry-scoped calibrations, registered before the cover platform is
+        # forwarded. The RX listeners carry the same bases, but they only exist
+        # once entities have been added -- and `runtime.initialized` is true
+        # before that, so the raw service is callable in the gap. Resolving from
+        # listeners alone left a raw command in that window unledgered while its
+        # echo was later validated with the now-available bases and taken for a
+        # physical press.
+        self._remote_bases: dict[str, CommandBases] = {}
         self._rx_bridge_ids: dict[str, bool] = {}
         self._recent_emission_proofs: dict[str, float] = {}
         self._state_sync = StateSyncConsumer(
             ledger=self._ledger,
             clock_resolver=self._resolve_bridge_clock,
+            resolve_bases=self._resolve_remote_bases,
             dispatch=self._dispatch_heard,
             on_emission_proof=self._record_emission_proof,
             now=self._now,
@@ -1150,6 +1192,32 @@ class ZemismartHub:
         seen = self._recent_displaced.get(command_id)
         return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
 
+    def diagnostics_snapshot(self) -> dict[str, int]:
+        """Return the hub's outstanding-work counts for a diagnostics dump.
+
+        All of this lives behind private attributes, and without it a stuck hub
+        dumps identically to an idle one -- a queue that has stopped draining,
+        a pile of unresolved commands or a capture held forever are exactly the
+        states a bug report is trying to describe. Counts only: no identity, no
+        frame material, nothing replayable.
+
+        `publish_seq` and `bridge_affinity` are the maps #34 bounds, so their
+        sizes are what make that bound observable in the field.
+        """
+        return {
+            "queue_depth": len(self._queue),
+            "fast_lane_depth": len(self._fast_inflight),
+            "inflight": int(self._inflight is not None),
+            "pending_commands": len(self._pending),
+            "pending_disarms": len(self._disarm_requests),
+            "ledger_entries": self._ledger.entry_count,
+            "held_captures": self._state_sync.held_count,
+            "publish_seq": len(self._publish_seq),
+            "press_seq": len(self._press_seq),
+            "bridge_affinity": len(self._bridge_affinity),
+            "rx_listeners": len(self._rx_listeners),
+        }
+
     def air_shadow_stats(self) -> dict[str, object]:
         """Return current shadow and enforcement arbitration statistics."""
         return self._air.stats_snapshot(now=self._monotonic_now())
@@ -1173,7 +1241,7 @@ class ZemismartHub:
         would otherwise mask every matching press for the whole 30 s started
         timeout, burning the user's entire Learn attempt.
         """
-        signature = frame_signature(frame_hex)
+        signature = frame_signature(frame_hex, self._resolve_remote_bases)
         if signature is None:
             return False
         match = self._ledger.match(signature, self._now())
@@ -1211,6 +1279,7 @@ class ZemismartHub:
         *,
         takeover_state: Callable[[], TakeoverCoverState] | None = None,
         invalidate_takeover: Callable[[], None] | None = None,
+        bases: CommandBases | None = None,
     ) -> Callable[[], None]:
         """Register one metadata-bearing RX callback and return its remover."""
         listener = _RxListener(
@@ -1219,6 +1288,7 @@ class ZemismartHub:
             callback,
             takeover_state,
             invalidate_takeover,
+            bases,
         )
 
         def unsubscribe() -> None:
@@ -1228,6 +1298,75 @@ class ZemismartHub:
         if not self._closed:
             self._rx_listeners.append(listener)
         return unsubscribe
+
+    def maintain(self) -> None:
+        """Collect expired RX state on a schedule rather than on RF traffic.
+
+        The state-sync consumer's TTL sweep only runs when a capture arrives
+        or a command resumes its holds, so a hold whose command never resumes
+        waits for unrelated traffic before it is dispatched (#42). HA drives
+        this periodically; it is idempotent, cheap when idle, and safe to
+        call after ``close()``.
+        """
+        if self._closed:
+            return
+        self._state_sync.maintain()
+
+    @staticmethod
+    def _own_bases_resolver(command: _QueuedCommand) -> BasesResolver:
+        """Resolve bases for a frame WE built, from the command that built it.
+
+        An outbound frame's calibration is not a lookup -- it is right there on
+        the command. Falling back to opcode inference here silently dropped
+        every frame of a remote outside the 10-sample opcode table (#26): the
+        signature came back None, `_ledger_registration` bailed before
+        registering the action OR its armed `stop_raw`, and the command was
+        absent from the ledger entirely. Our own echo then classified as a
+        physical press, and `async_disarm_remote` found nothing to disarm --
+        leaving the previous identity's fail-safe STOP armed through a relearn.
+        """
+
+        def resolve(remote_key: str) -> CommandBases | None:
+            if command.remote is None or command.remote.key != remote_key:
+                return None
+            return command.remote.bases
+
+        return resolve
+
+    def register_remote_bases(
+        self, remote_key: str, bases: CommandBases | None
+    ) -> Callable[[], None]:
+        """Register one loaded entry's calibration; returns its remover."""
+        if bases is None:
+            return lambda: None
+        self._remote_bases[remote_key] = bases
+
+        def unregister() -> None:
+            if self._remote_bases.get(remote_key) is bases:
+                del self._remote_bases[remote_key]
+
+        return unregister
+
+    def _resolve_remote_bases(self, remote_key: str) -> CommandBases | None:
+        """Return a loaded remote's measured calibration, if any cover carries it.
+
+        This is what makes #30's exact-command validation real rather than
+        latent: without it `frame_signature` falls back to opcode-high-byte
+        inference, which accepts frames the motor rejects AND -- since the
+        opcode table is a 10-sample fit, not protocol (#26) -- rejects genuine
+        presses from remotes outside it.
+
+        Returns None for an unknown remote, which is the correct answer during
+        the Learn flow: there the bases are by definition not yet measured, and
+        inference is all there is.
+        """
+        registered = self._remote_bases.get(remote_key)
+        if registered is not None:
+            return registered
+        for listener in self._rx_listeners:
+            if listener.remote_key == remote_key and listener.bases is not None:
+                return listener.bases
+        return None
 
     def handle_rx(
         self,
@@ -1473,7 +1612,7 @@ class ZemismartHub:
             try:
                 text = payload.decode() if isinstance(payload, bytes | bytearray) else payload
                 decoded = json.loads(text)
-            except UnicodeDecodeError, json.JSONDecodeError:
+            except _PAYLOAD_ERRORS:
                 return False
         else:
             decoded = payload
@@ -1803,6 +1942,36 @@ class ZemismartHub:
             command.published.set()
         raise CommandDisplacedError(command.target)
 
+    def _revalidated_body(
+        self,
+        command: _QueuedCommand,
+        command_id: str,
+    ) -> dict[str, object]:
+        """Run every final validity check, then build the body to put on air.
+
+        Both no-await points before enqueue go through here — the one under
+        _publish_lock in _ordered_publish and the one inside the scheduled
+        task in _finalize_and_publish. Keeping the sequence in one place is
+        deliberate: these checks are what stop a command that a cancellation,
+        an overlapping publication, a heard physical press, or a safety STOP
+        has already retired from still reaching the air, and two copies drifting
+        apart would reopen exactly that gap on whichever path was missed.
+
+        Order matters. The air-preempt check settles the command's futures
+        before raising, so it runs before the checks that only raise; the
+        contributor rebuild narrows command.channels and must precede the two
+        generation checks that read them.
+        """
+        if all(future.done() for future in command.futures):
+            raise CommandDisplacedError(command.target)
+        self._raise_if_air_preempted(command)
+        self._rebuild_from_live_contributors(command)
+        self._raise_if_overlap_displaced(command)
+        self._raise_if_press_displaced(command)
+        body = dict(command.body)
+        body["command_id"] = command_id
+        return body
+
     def overlap_token(self, config: BlindConfig) -> int:
         """Snapshot the publish state of a config's channels.
 
@@ -1822,6 +1991,7 @@ class ZemismartHub:
             self._press_seq[key] = press_generation
         while len(self._press_seq) > _PRESS_SEQ_CAP:
             del self._press_seq[next(iter(self._press_seq))]
+        self._prune_publish_seq()
 
     def _record_publish(self, command: _QueuedCommand) -> None:
         """Advance every published channel's sequence number."""
@@ -1830,6 +2000,50 @@ class ZemismartHub:
         for channel in command.channels:
             key = (command.remote.key, channel)
             self._publish_seq[key] = self._publish_seq.get(key, 0) + 1
+        self._prune_publish_seq()
+
+    def _token_protected_channels(self) -> set[tuple[str, int]]:
+        """Return publish-sequence keys a live overlap token still depends on."""
+        # A configured cover takes its token BETWEEN the frames of a
+        # multi-frame move (cover.py's measure → STOP → move), so its key is
+        # spoken for even while nothing of its is queued. Every cover
+        # registers an RX listener for exactly its remote and channels.
+        protected = {
+            (listener.remote_key, channel)
+            for listener in self._rx_listeners
+            for channel in listener.channels
+        }
+        commands = [*self._queue, *self._fast_inflight]
+        if self._inflight is not None:
+            commands.append(self._inflight)
+        for queued in commands:
+            if queued.remote is None:
+                continue
+            protected.update((queued.remote.key, channel) for channel in queued.channels)
+        return protected
+
+    def _prune_publish_seq(self) -> None:
+        """Bound the publish-sequence map without invalidating a live token.
+
+        `_press_seq` beside it has always been capped; `_publish_seq` grew
+        without limit, and raw frames can introduce arbitrary remote keys
+        (#34). Eviction is not free here: `overlap_token` is a SUM over a
+        config's channels, so a dropped key silently reads back as 0 and
+        `_raise_if_overlap_displaced` would supersede a command that nothing
+        actually displaced. Keys some holder could still be comparing against
+        are therefore never evicted -- which is also why the map can sit above
+        the cap, bounded instead by covers plus outstanding work.
+        """
+        if len(self._publish_seq) <= _PUBLISH_SEQ_CAP:
+            return
+        protected = self._token_protected_channels()
+        for key in list(self._publish_seq):
+            if len(self._publish_seq) <= _PUBLISH_SEQ_CAP:
+                return
+            if key not in protected:
+                # dict preserves insertion order: oldest key first, exactly
+                # like the _press_seq eviction above.
+                del self._publish_seq[key]
 
     def _rebuild_from_live_contributors(self, command: _QueuedCommand) -> None:
         """Drop cancelled contributors' channels from a coalesced batch.
@@ -1886,6 +2100,35 @@ class ZemismartHub:
             barriers.append(inflight.published)
         return barriers
 
+    def _raise_if_outstanding_cap_reached(self, command: _QueuedCommand) -> None:
+        """Refuse one movement or raw frame once outstanding work is at the cap.
+
+        Counts every command still holding hub resources, resolved or not:
+        the queue retains superseded entries until the worker reaches them, so
+        counting only live ones would leave the flood this bounds unbounded.
+
+        STOPs are excluded from the COUNT as well as from the check. A live
+        fast-lane STOP sits in `_fast_inflight` for its whole life, so counting
+        them meant a backlog of unresolved STOPs -- a bridge that has stopped
+        reporting status, say -- could refuse every legitimate movement while
+        nothing was actually flooding anything. The flood this bounds comes
+        from `send_raw`, which always builds with `is_stop=False`, and entity
+        STOPs are serialised one-per-cover by cover.py's `_command_lock`, so
+        excluding them cedes no real headroom.
+        """
+        outstanding = sum(
+            1
+            for command in (*self._queue, *self._fast_inflight, self._inflight)
+            if command is not None and not command.is_stop
+        )
+        if outstanding < _MAX_OUTSTANDING_COMMANDS:
+            return
+        msg = (
+            f"refusing {command.target}: {outstanding} commands are already outstanding "
+            f"(cap {_MAX_OUTSTANDING_COMMANDS}); the bridge queue is not draining"
+        )
+        raise CommandQueueFullError(msg)
+
     async def _async_enqueue(self, command: _QueuedCommand) -> CommandResult:
         """Queue a command, giving STOP front priority and overlap supersession."""
         if self._closed:
@@ -1903,6 +2146,22 @@ class ZemismartHub:
                 # teardown-race command neither queues nor resurrects the
                 # worker via _ensure_worker() below.
                 return "superseded"
+            if not command.is_stop:
+                # Outstanding work was otherwise unbounded (#34): entity
+                # callers are serialised one-per-cover by cover.py's
+                # _command_lock, but the admin send_raw service bypasses
+                # entity locks entirely and can enqueue faster than the single
+                # worker drains -- each queued command pinning futures, an
+                # asyncio.Event and barrier references. Reject rather than
+                # grow.
+                #
+                # A STOP is never counted against the cap and can never be
+                # refused by it. STOP is the safety path: it takes the fast
+                # lane below precisely so it can never sit behind another
+                # command, and the whole air-arbitration design guarantees it
+                # never waits. A cap able to refuse a STOP would be a worse
+                # failure than the growth it prevents.
+                self._raise_if_outstanding_cap_reached(command)
             if command.is_stop:
                 # A STOP supersedes every queued movement whose channels
                 # intersect its own on the same remote (exact-target and
@@ -2222,15 +2481,17 @@ class ZemismartHub:
         self._pending[key] = pending
         return pending
 
-    @staticmethod
+    @classmethod
     def _ledger_registration(
+        cls,
         command: _QueuedCommand,
     ) -> tuple[str, list[LedgerFrameSpec]] | None:
         """Build one movement command's complete classifiable RF envelope."""
         action_raw = command.body.get("raw")
         if not isinstance(action_raw, str):
             return None
-        action_signature = frame_signature(action_raw)
+        resolve = cls._own_bases_resolver(command)
+        action_signature = frame_signature(action_raw, resolve)
         if action_signature is None:
             return None
         train_ms = _ledger_airtime_ms(command.body.get("repeats"))
@@ -2253,7 +2514,7 @@ class ZemismartHub:
         ]
         for body_field in ("trailer_raw", "stop_raw"):
             raw = command.body.get(body_field)
-            if not isinstance(raw, str) or (signature := frame_signature(raw)) is None:
+            if not isinstance(raw, str) or (signature := frame_signature(raw, resolve)) is None:
                 continue
             offset_ms = (
                 command.stop_after_ms
@@ -2361,6 +2622,78 @@ class ZemismartHub:
             (command.stop_after_ms or 0) / 1_000 + 60.0,
         )
         self._bridge_affinity[key] = (bridge_id, now + hold)
+        # Entries used to be overwritten but never swept, so every identity
+        # retired by a relearn stayed forever (#34). Collect expired holds on
+        # insert, the same place _recent_displaced and _recent_emission_proofs
+        # are collected: growth pays for its own collection, and every entry
+        # carries an expiry, so this alone bounds the map.
+        expired = [
+            stale
+            for stale, (_bridge_id, expires_at) in self._bridge_affinity.items()
+            if expires_at <= now
+        ]
+        for stale in expired:
+            del self._bridge_affinity[stale]
+
+    def _finish_air_hold(self, bridge_id: str, elapsed: float) -> None:
+        """Close one air hold, failing open.
+
+        Hold accounting is telemetry. Both the in-loop exit and the outer
+        `finally` have to close an open hold, and neither may let a metrics
+        fault stop a frame the user asked for.
+        """
+        try:
+            self._air.record_hold_finished(bridge_id, elapsed)
+        except Exception:
+            self._record_air_internal_failure("air: hold accounting failed open")
+
+    async def _commit_and_enqueue(
+        self,
+        command: _QueuedCommand,
+        topic: str,
+        bridge_id: str,
+        command_id: str,
+        *,
+        plan: AirPlan | None,
+        arbiter_failed: bool,
+        now: float,
+    ) -> BaseException | None:
+        """Provision the air calendar for a command we have decided to send.
+
+        Split from the wait loop because everything here happens once the
+        decision to transmit is made: the loop's job is deciding WHETHER the
+        air is free, this one's is committing to it. Returns the transport
+        error, if any, rather than raising, so the caller can tell an immediate
+        broker failure apart from a displacement.
+
+        Every arbiter fault fails OPEN. A calendar that cannot be provisioned
+        makes the transmission unaccounted-for, not forbidden.
+        """
+        commit_air_plan = not arbiter_failed
+        if commit_air_plan and plan is not None:
+            try:
+                commit_air_plan = self._air.provision(
+                    bridge_id=bridge_id,
+                    command_id=command_id,
+                    boot=self._air_bridge_boot(bridge_id),
+                    plan=plan,
+                    published_at=now,
+                    expires_at=now + self._ack_timeout + self._started_timeout,
+                    is_stop=command.is_stop,
+                )
+            except Exception:
+                commit_air_plan = False
+                self._record_air_internal_failure("air: calendar commit failed open")
+        publisher_wrapper = self._finalize_and_publish(
+            command,
+            topic,
+            bridge_id,
+            command_id,
+            count_air_plan=not arbiter_failed,
+            commit_air_plan=commit_air_plan,
+        )
+        _, transport_error = await self._enqueue_publish(publisher_wrapper)
+        return transport_error
 
     async def _ordered_publish(
         self,
@@ -2384,14 +2717,7 @@ class ZemismartHub:
                     # A ready cancellation or physical-press callback must run
                     # before the authoritative final-body and validity checks.
                     await asyncio.sleep(0)
-                    if all(future.done() for future in command.futures):
-                        raise CommandDisplacedError(command.target)
-                    self._raise_if_air_preempted(command)
-                    self._rebuild_from_live_contributors(command)
-                    self._raise_if_overlap_displaced(command)
-                    self._raise_if_press_displaced(command)
-                    body = dict(command.body)
-                    body["command_id"] = command_id
+                    body = self._revalidated_body(command, command_id)
                     now = self._monotonic_now()
                     plan = None
                     arbiter_failed = False
@@ -2431,41 +2757,16 @@ class ZemismartHub:
                     if wait_event is None:
                         if hold_started is not None and not hold_finished:
                             hold_finished = True
-                            try:
-                                self._air.record_hold_finished(
-                                    bridge_id,
-                                    now - hold_started,
-                                )
-                            except Exception:
-                                self._record_air_internal_failure(
-                                    "air: hold accounting failed open"
-                                )
-                        commit_air_plan = not arbiter_failed
-                        if commit_air_plan and plan is not None:
-                            try:
-                                commit_air_plan = self._air.provision(
-                                    bridge_id=bridge_id,
-                                    command_id=command_id,
-                                    boot=self._air_bridge_boot(bridge_id),
-                                    plan=plan,
-                                    published_at=now,
-                                    expires_at=now + self._ack_timeout + self._started_timeout,
-                                    is_stop=command.is_stop,
-                                )
-                            except Exception:
-                                commit_air_plan = False
-                                self._record_air_internal_failure(
-                                    "air: calendar commit failed open"
-                                )
-                        publisher_wrapper = self._finalize_and_publish(
+                            self._finish_air_hold(bridge_id, now - hold_started)
+                        transport_error = await self._commit_and_enqueue(
                             command,
                             topic,
                             bridge_id,
                             command_id,
-                            count_air_plan=not arbiter_failed,
-                            commit_air_plan=commit_air_plan,
+                            plan=plan,
+                            arbiter_failed=arbiter_failed,
+                            now=now,
                         )
-                        _, transport_error = await self._enqueue_publish(publisher_wrapper)
                 if wait_event is None:
                     break
                 try:
@@ -2489,13 +2790,7 @@ class ZemismartHub:
         finally:
             command.air_waiting = False
             if hold_started is not None and not hold_finished:
-                try:
-                    self._air.record_hold_finished(
-                        bridge_id,
-                        self._monotonic_now() - hold_started,
-                    )
-                except Exception:
-                    self._record_air_internal_failure("air: hold accounting failed open")
+                self._finish_air_hold(bridge_id, self._monotonic_now() - hold_started)
 
     async def _finalize_and_publish(
         self,
@@ -2508,14 +2803,7 @@ class ZemismartHub:
         commit_air_plan: bool,
     ) -> None:
         """Revalidate inside the scheduled task, then commit and enqueue to paho."""
-        if all(future.done() for future in command.futures):
-            raise CommandDisplacedError(command.target)
-        self._raise_if_air_preempted(command)
-        self._rebuild_from_live_contributors(command)
-        self._raise_if_overlap_displaced(command)
-        self._raise_if_press_displaced(command)
-        body = dict(command.body)
-        body["command_id"] = command_id
+        body = self._revalidated_body(command, command_id)
         if count_air_plan:
             try:
                 final_plan = plan_for_body(body)
@@ -2623,7 +2911,7 @@ class ZemismartHub:
             command.remote.key
             if command.remote is not None
             and isinstance(action_raw, str)
-            and frame_signature(action_raw) is not None
+            and frame_signature(action_raw, self._own_bases_resolver(command)) is not None
             else None
         )
         pending = self._register_pending(
@@ -2809,7 +3097,20 @@ class ZemismartHub:
             raise ValueError(msg)
         normalized = validate_b0_frame(raw)
         decoded = decode_b0(normalized)
-        remote = RemoteIdentity(decoded["prefix"], decoded["remote_id"])
+        # Bases from the LOADED remote, when we have one. Without them
+        # `_own_bases_resolver` yields None and the raw path silently drops back
+        # to opcode inference -- so a raw movement frame for a remote outside
+        # `_ACTION_COMMAND_HIGH` never enters the ledger, never stamps a
+        # commanded start, and has its own echo dispatched as a physical press
+        # (#26/#30). The raw service is the one surface that can address a
+        # remote it was not configured from, so an unknown identity still
+        # resolves to None and falls back, exactly as before.
+        raw_remote_key = f"{decoded['prefix']:06x}:{decoded['remote_id']:02x}"
+        remote = RemoteIdentity(
+            decoded["prefix"],
+            decoded["remote_id"],
+            self._resolve_remote_bases(raw_remote_key),
+        )
         decoded_channels = tuple(cast("Iterable[int]", decoded["chans"]))
         channels = frozenset(decoded_channels)
         target = remote.target_key(decoded_channels)
@@ -2963,18 +3264,13 @@ class ZemismartHub:
             publish_task.cancel()
         self._publish_tasks.clear()
         if self._inflight is not None:
-            for future in self._inflight.futures:
-                future.cancel()
-        for command in self._fast_inflight:
-            for future in command.futures:
-                future.cancel()
+            _cancel_waiters((self._inflight,))
+        _cancel_waiters(self._fast_inflight)
         self._fast_inflight.clear()
         self._recent_displaced.clear()
         self._bridge_affinity.clear()
         self._press_seq.clear()
-        for command in self._queue:
-            for future in command.futures:
-                future.cancel()
+        _cancel_waiters(self._queue)
         self._queue.clear()
         for pending in self._pending.values():
             pending.admission.cancel()

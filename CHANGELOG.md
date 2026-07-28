@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **`position_confidence` no longer reports `verified`; that value is now `anchored`.** (#31)
+  Any automation, template or dashboard matching `position_confidence: verified` **stops
+  matching** and must be updated to `anchored`. There is deliberately no compatibility shim
+  emitting both values: a state attribute is not persisted config, and a clean break with a
+  release note is more honest than a transition period in which the misleading word keeps
+  working.
+
+  The word was wrong. `verified` was set when a **local timer** reached an endpoint — nothing
+  confirmed that the motor received the frame, ran for the calibrated duration, or reached its
+  limit switch, and over a one-way protocol nothing can. `anchored` says exactly what the
+  integration knows: a full travel was transmitted, a timer ran to completion, and no
+  contradicting RF press was heard. The behaviour behind the value is unchanged, as is the
+  ranking, now `unknown < suspect < assumed < anchored`.
+
+### Fixed
+
+- **A command cancelled after its frame was published no longer leaves a stale position.** (#28)
+  `asyncio.CancelledError` bypassed both of the transmit's error handlers, so an entry reload or
+  options change during a group move, a `script.turn_off`, or an automation in `mode: restart`
+  moved the blind and left the cover reporting a confident, specific, wrong position. Affected
+  covers now go `unknown`. Deliberately pessimistic: a cancellation that landed *before*
+  publication invalidates the estimate too, because the entity cannot tell the two apart.
+
+- **A group's position no longer averages away an unknown member, and is weighted by channel
+  count.** (#32) A three-member group with one unknown reported the mean of the other two — a
+  confident number describing only part of the hardware; it now reports no position at all, as
+  `is_closed` already did on a mixed state. And a member covering two channels now counts twice
+  as much as one covering a single channel, so the group reports the mean of the *motors* rather
+  than of the *entities*.
+
+- **`cover.set_position` on a group no longer moves half of it before failing.** (#32) Members
+  that could be positioned were transmitted to and only then did an unpositionable member raise,
+  leaving the group in a state nobody intended and making a retry hazardous. Every member is now
+  checked before the first frame goes on air.
+
+- **An unexpected error inside a group's position fan-out is no longer silently swallowed.**
+  (#33) Results were gathered and discarded, so anything other than the expected member errors
+  produced no traceback and a *successful* service call while part of the group had not moved.
+  Such errors now fail the service call with their original traceback intact.
+
 ## [0.6.0] - 2026-07-26
 
 ### Added

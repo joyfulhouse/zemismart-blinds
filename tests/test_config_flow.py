@@ -18,6 +18,8 @@ from homeassistant.data_entry_flow import FlowResultType
 
 import custom_components.zemismart_blinds.config_flow as config_flow_module
 from custom_components.zemismart_blinds.codec import (
+    CommandBases,
+    derive_base,
     derive_bases_from_base,
     encode_b0,
     make_payload,
@@ -93,8 +95,57 @@ def b0_to_b1(frame: str) -> str:
 
 REFERENCE_UP_B1 = b0_to_b1(TEST_CH12_UP_B0)
 REFERENCE_DOWN_B1 = b0_to_b1(TEST_CH12_DOWN_B0)
+REFERENCE_STOP_B1 = b0_to_b1(
+    encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "STOP", bases=TEST_BASES))
+)
+
+# An R11-shaped remote: its calibration-normalised action commands carry the
+# opcode bytes F3/BC/DB, which _ACTION_COMMAND_HIGH does not contain, while the
+# low-byte offsets (-0x38 DOWN, -0x18 STOP from UP) hold exactly as they do on
+# all eleven remotes surveyed in #26. Only UP and STOP fall outside the table,
+# which is precisely why the pre-#26 wizard captured DOWN and then invented an
+# UP command the motor ignored. Identity and low bytes are fabricated -- the
+# real remote's are not committed to a public repository.
+UNTABLED_PREFIX = 0xC0FFEE
+UNTABLED_REMOTE_ID = 0x5A
+UNTABLED_CALIBRATION_COMMANDS = {"UP": 0xF37A, "DOWN": 0xBC42, "STOP": 0xDB62}
+UNTABLED_BASES = CommandBases(
+    **{
+        action.lower(): derive_base((1, 2, 3, 4, 5, 6), action, command, UNTABLED_REMOTE_ID)
+        for action, command in UNTABLED_CALIBRATION_COMMANDS.items()
+    }
+)
+UNTABLED_UP_B1, UNTABLED_DOWN_B1, UNTABLED_STOP_B1 = (
+    b0_to_b1(
+        encode_b0(
+            make_payload(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1,), action, bases=UNTABLED_BASES)
+        )
+    )
+    for action in ("UP", "DOWN", "STOP")
+)
+UNTABLED_FRAMES = (UNTABLED_UP_B1, UNTABLED_DOWN_B1, UNTABLED_STOP_B1)
+
+# A DIFFERENT remote that is also untabled. Needed to test the identity guard in
+# isolation: a tabled foreign frame is rejected earlier by the action-inference
+# mismatch, so it never reaches the guard at all.
+FOREIGN_UNTABLED_PREFIX = 0xC0FFEF
+_FOREIGN_UNTABLED_UP_PAYLOAD = make_payload(
+    FOREIGN_UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1,), "UP", bases=UNTABLED_BASES
+)
+FOREIGN_UNTABLED_UP_CMD = _FOREIGN_UNTABLED_UP_PAYLOAD & 0xFFFF
+FOREIGN_UNTABLED_UP_B1 = b0_to_b1(encode_b0(_FOREIGN_UNTABLED_UP_PAYLOAD))
 REFERENCE_TRAILER_B1 = b0_to_b1(
     encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "TRAILER", bases=TEST_BASES))
+)
+# Real field-captured bucket timings and the 65-pair single-0-read truncated
+# trailer, re-keyed to the synthetic identity (the same fixture family as
+# tests/test_codec.py REKEYED_FIELD_B1_CAPTURES). Decodes to the ALL-channel
+# UP command 0xF42B. The Learn wizard decoded captures strictly until #27 and
+# dropped this whole class of remote before any handler saw it.
+TRUNCATED_TRAILER_UP_B1 = (
+    "AAB10413EC026C012C143C381A192A192929292A1A192A1A19292A192A1A192929292A1A192A"
+    "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A192929292A192A192A"
+    "1A1955"
 )
 
 
@@ -327,6 +378,51 @@ async def advance_to_learn_setup(hass: HomeAssistant, flow_id: str) -> ConfigFlo
         flow_id,
         {"next_step_id": "learn"},
     )
+
+
+async def capture_learn_action(
+    hass: HomeAssistant,
+    fake: FakeMqtt,
+    flow_id: str,
+    frame: str,
+    *,
+    attempt: int,
+) -> ConfigFlowResult:
+    """Deliver one action frame to the current attempt and advance the wizard.
+
+    ``attempt`` is 1-based: every attempt publishes exactly one sniff start and
+    one sniff stop, and opens its own RX subscription.
+    """
+    rx = fake.rx_subscriptions()[attempt - 1]
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": frame, "t": attempt}),
+    )
+    await fake.wait_for_publications(attempt * 2)
+    await hass.async_block_till_done()
+    return await hass.config_entries.flow.async_configure(flow_id)
+
+
+async def learn_all_three_actions(
+    hass: HomeAssistant,
+    fake: FakeMqtt,
+    flow_id: str,
+    frames: tuple[str, str, str] = (REFERENCE_UP_B1, REFERENCE_DOWN_B1, REFERENCE_STOP_B1),
+) -> ConfigFlowResult:
+    """Walk one armed Learn flow through its UP, DOWN, and STOP captures."""
+    result: ConfigFlowResult | None = None
+    for index, frame in enumerate(frames, start=1):
+        if index > 1:
+            result = await hass.config_entries.flow.async_configure(
+                flow_id,
+                {"next_step_id": "learn_sniff"},
+            )
+            assert result["step_id"] == "learn_sniff"
+        await fake.wait_for_publications(index * 2 - 1)
+        result = await capture_learn_action(hass, fake, flow_id, frame, attempt=index)
+    assert result is not None
+    return result
 
 
 async def create_remote_entry(
@@ -697,14 +793,45 @@ async def test_wizard_creates_entry_with_data_covers_and_no_subentries(
     assert current_flow(hass, flow_id)["step_id"] == "learn_sniff"
     assert len(fake.published) == 1
 
-    await fake.emit(
-        rx,
-        "rf433/bridge-a/rx",
-        json.dumps({"frame": REFERENCE_UP_B1, "t": 3}),
+    result = await capture_learn_action(hass, fake, flow_id, REFERENCE_UP_B1, attempt=1)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_next"
+    # Deliberately no `learn_derive`: after a SUCCESSFUL capture, extrapolating
+    # the remaining bases from the one just measured is the #26 defect, not a
+    # convenience. It is offered only from `learn_timeout`, once a capture
+    # attempt has actually failed.
+    assert result["menu_options"] == ["learn_sniff", "learn_recapture"]
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
+    assert rx.unsubscribe_count == 1
+    assert fake.published[1] == (
+        "rf433/bridge-a/cmd",
+        {"action": "sniff", "seconds": 0},
     )
-    await fake.wait_for_publications(2)
-    await hass.async_block_till_done()
-    result = await hass.config_entries.flow.async_configure(flow_id)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "learn_sniff"},
+    )
+    assert result["step_id"] == "learn_sniff"
+    await fake.wait_for_publications(3)
+    result = await capture_learn_action(hass, fake, flow_id, REFERENCE_DOWN_B1, attempt=2)
+    assert result["step_id"] == "learn_next"
+    assert result["description_placeholders"] == {
+        "captured": "DOWN",
+        "measured": "UP, DOWN",
+        "action": "STOP",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "learn_sniff"},
+    )
+    await fake.wait_for_publications(5)
+    result = await capture_learn_action(hass, fake, flow_id, REFERENCE_STOP_B1, attempt=3)
     assert result["type"] is FlowResultType.MENU
     assert result["step_id"] == "learn_confirm"
     assert result["menu_options"] == [
@@ -717,16 +844,14 @@ async def test_wizard_creates_entry_with_data_covers_and_no_subentries(
         "prefix": "0xa1b2c3",
         "remote_id": "0x42",
         "channels": "1,2",
-        "button": "UP",
+        # All three bases came from a real press, so nothing was extrapolated
+        # from the codec's action opcode table (#26).
+        "measured": "UP, DOWN, STOP",
+        "derived": "none",
         "name": "Living room shade",
         "bridge": "bridge-a",
     }
     assert REFERENCE_UP_B1 not in placeholders.values()
-    assert rx.unsubscribe_count == 1
-    assert fake.published[1] == (
-        "rf433/bridge-a/cmd",
-        {"action": "sniff", "seconds": 0},
-    )
 
     result = await hass.config_entries.flow.async_configure(
         flow_id,
@@ -898,16 +1023,7 @@ async def test_advanced_setup_clears_learned_cover_channel_prefill(
         },
     )
     assert result["type"] is FlowResultType.SHOW_PROGRESS
-    await fake.wait_for_publications(1)
-    rx = fake.rx_subscriptions()[0]
-    await fake.emit(
-        rx,
-        "rf433/bridge-a/rx",
-        json.dumps({"frame": REFERENCE_UP_B1, "t": 3}),
-    )
-    await fake.wait_for_publications(2)
-    await hass.async_block_till_done()
-    result = await hass.config_entries.flow.async_configure(flow_id)
+    result = await learn_all_three_actions(hass, fake, flow_id)
     assert result["step_id"] == "learn_confirm"
 
     result = await hass.config_entries.flow.async_configure(
@@ -1002,15 +1118,15 @@ async def test_learn_timeout_retry_ignores_stale_session(
     await fake.emit(
         current,
         "rf433/bridge-a/rx",
-        json.dumps({"frame": REFERENCE_DOWN_B1, "t": 5}),
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 5}),
     )
     await fake.wait_for_publications(4)
     await hass.async_block_till_done()
     result = await hass.config_entries.flow.async_configure(flow_id)
-    assert result["step_id"] == "learn_confirm"
+    assert result["step_id"] == "learn_next"
     placeholders = result["description_placeholders"]
     assert placeholders is not None
-    assert placeholders["button"] == "DOWN"
+    assert placeholders["captured"] == "UP"
     assert current.unsubscribe_count == 1
     assert fake.published[2][1] == {
         "action": "sniff",
@@ -1172,7 +1288,7 @@ async def test_learn_serializes_concurrent_sniffs_on_one_bridge(
     )
     await fake.wait_for_publications(4)
     second = await hass.config_entries.flow.async_configure(second_id)
-    assert second["step_id"] == "learn_confirm"
+    assert second["step_id"] == "learn_next"
     hass.config_entries.flow.async_abort(second_id)
 
 
@@ -1971,14 +2087,25 @@ async def test_reconfigure_relearn_applies_new_identity_and_collides(
     await fake.wait_for_publications(2)
     await hass.async_block_till_done()
     result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_next"
+    # Only UP was captured; the remaining bases come from the extrapolation
+    # fallback, which the confirmation step must name as calculated (#26).
+    result = await derive_from_timeout(hass, monkeypatch, flow_id)
     assert result["step_id"] == "learn_confirm"
     assert result["menu_options"] == ["reconfigure_apply", "learn_retry"]
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["measured"] == "UP"
+    assert placeholders["derived"] == "DOWN, STOP"
     result = await hass.config_entries.flow.async_configure(
         flow_id,
         {"next_step_id": "reconfigure_apply"},
     )
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
+    # The extrapolated bases must still match what one labeled UP reference
+    # has always produced, so the 10 remotes in #26's table keep enrolling.
+    assert RemoteConfig.from_entry(entry.data).remote.bases == REF_BASES
     updated = RemoteConfig.from_entry(entry.data)
     assert updated.key == f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x}"
     assert entry.unique_id == updated.key
@@ -2059,6 +2186,8 @@ async def test_reconfigure_relearn_collision_aborts(
     await fake.wait_for_publications(2)
     await hass.async_block_till_done()
     result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_next"
+    result = await derive_from_timeout(hass, monkeypatch, flow_id)
     assert result["step_id"] == "learn_confirm"
     result = await hass.config_entries.flow.async_configure(
         flow_id,
@@ -2068,6 +2197,214 @@ async def test_reconfigure_relearn_collision_aborts(
     assert result["reason"] == "already_configured"
     assert dict(entry.data) == original_data
     assert entry.unique_id == "a1b2c3:42"
+
+
+def test_untabled_remote_fixture_is_outside_the_action_opcode_table() -> None:
+    """Pin the premise of #26: only DOWN of this remote is recognisable by opcode."""
+    from custom_components.zemismart_blinds.codec import infer_action_button
+
+    inferred = {
+        action: infer_action_button(
+            (1,),
+            make_payload(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1,), action, bases=UNTABLED_BASES)
+            & 0xFFFF,
+        )
+        for action in ("UP", "DOWN", "STOP")
+    }
+    assert inferred == {"UP": None, "DOWN": "DOWN", "STOP": None}
+    # And the derivation the wizard used to perform from that single DOWN
+    # capture reconstructs the WRONG UP and STOP -- the live-proven defect.
+    from custom_components.zemismart_blinds.codec import derive_bases_from_base
+
+    invented = derive_bases_from_base("DOWN", UNTABLED_BASES.down, UNTABLED_REMOTE_ID)
+    assert invented.down == UNTABLED_BASES.down
+    assert invented.up != UNTABLED_BASES.up
+    assert invented.stop != UNTABLED_BASES.stop
+
+
+@pytest.mark.asyncio
+async def test_learn_enrols_a_remote_outside_the_action_opcode_table(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every action is measured, so an unrecognised opcode still enrols (#26).
+
+    Before this, the wizard's capture handler dropped any frame whose opcode
+    byte was missing from _ACTION_COMMAND_HIGH -- silently, with no log and no
+    error -- so UP and STOP presses on this remote produced a capture timeout.
+    Having accepted only DOWN it then invented UP and STOP from the same table,
+    which for this shape of remote yields commands the motor refuses.
+    """
+    prepare_config_flow(hass, monkeypatch)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    # An unrecognised opcode is only resolved when the window closes without a
+    # recognised frame for the prompted action, so shorten the window rather
+    # than waiting the real 30 s twice.
+    monkeypatch.setattr(config_flow_module, "_CAPTURE_TIMEOUT_SECONDS", 0.2, raising=False)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Study shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: "bridge-a",
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+
+    result = await learn_all_three_actions(hass, fake, flow_id, UNTABLED_FRAMES)
+    assert result["step_id"] == "learn_confirm"
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["prefix"] == f"0x{UNTABLED_PREFIX:06x}"
+    assert placeholders["measured"] == "UP, DOWN, STOP"
+    assert placeholders["derived"] == "none"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "remote_settings"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Study remote",
+            CONF_AREA_ID: "living_room",
+            ADVANCED_SECTION: {CONF_REPEATS: 3, CONF_COALESCE_WINDOW_MS: 0},
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Study blind",
+            CONF_CHANNELS: "1",
+            CONF_TRAVEL_UP: 10,
+            CONF_TRAVEL_DOWN: 10,
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "finish"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    # Every base is the one the remote actually transmits, not a table lookup.
+    assert RemoteConfig.from_entry(result["data"]).remote.bases == UNTABLED_BASES
+
+
+@pytest.mark.asyncio
+async def test_learn_recapture_rearms_the_action_just_measured(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recapture re-arms UP, not the DOWN the wizard has already moved on to.
+
+    learn_next advances the prompt before it is shown, so reusing learn_retry
+    here would discard nothing and silently arm the next button instead.
+    """
+    prepare_config_flow(hass, monkeypatch)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Hall shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: "bridge-a",
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    result = await capture_learn_action(hass, fake, flow_id, REFERENCE_UP_B1, attempt=1)
+    assert result["step_id"] == "learn_next"
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "learn_recapture"},
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    rearmed = result["description_placeholders"]
+    assert rearmed is not None
+    assert rearmed["action"] == "UP"
+    await fake.wait_for_publications(3)
+    # A DOWN press is refused while UP is armed, so the discarded UP really is
+    # being asked for again rather than the prompt having moved on.
+    rx = fake.rx_subscriptions()[1]
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_DOWN_B1, "t": 9}),
+    )
+    await asyncio.sleep(0)
+    assert current_flow(hass, flow_id)["step_id"] == "learn_sniff"
+
+    result = await capture_learn_action(hass, fake, flow_id, REFERENCE_UP_B1, attempt=2)
+    assert result["step_id"] == "learn_next"
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
+    hass.config_entries.flow.async_abort(flow_id)
+
+
+@pytest.mark.asyncio
+async def test_learn_accepts_a_truncated_trailer_capture(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote that truncates its OEM trailer on air still enrols through Learn.
+
+    The codec and state-sync layers already tolerated this structure; the Learn
+    wizard used the strict decoder and rejected it before any handler ran, so
+    the user saw a capture timeout on a remote transmitting perfectly (#27).
+    """
+    prepare_config_flow(hass, monkeypatch)
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Living room shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: config_flow_module._AUTOMATIC_BRIDGE,
+        },
+    )
+    assert result["step_id"] == "learn_sniff"
+    await fake.wait_for_publications(1)
+    rx = fake.rx_subscriptions()[0]
+
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": TRUNCATED_TRAILER_UP_B1, "t": 1}),
+    )
+    await fake.wait_for_publications(2)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_next"
+    result = await derive_from_timeout(hass, monkeypatch, flow_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_confirm"
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["prefix"] == "0xa1b2c3"
+    assert placeholders["remote_id"] == "0x42"
+    assert placeholders["channels"] == "1,2,3,4,5,6"
 
 
 @pytest.mark.asyncio
@@ -2133,6 +2470,135 @@ async def test_learn_ignores_our_own_transmission_echo(
     assert config_flow_module._is_own_emission(hass, TEST_CH12_UP_B0) is True
 
 
+def _deliver_sniff_frame(
+    hass: HomeAssistant,
+    flow: Any,
+    session_id: str,
+    attempt: Any,
+    frame: str,
+) -> None:
+    """Push one RX payload straight into the wizard's capture handler."""
+    from types import SimpleNamespace
+
+    config_flow_module._handle_sniff_message(
+        flow,
+        session_id,
+        "rf433/bridge-a/rx",
+        attempt,
+        cast(
+            "ReceiveMessage",
+            SimpleNamespace(
+                topic="rf433/bridge-a/rx",
+                payload=json.dumps({"frame": frame}),
+                retain=False,
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sniff_handler_holds_an_unrecognised_opcode_but_prefers_the_action(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrecognised opcode reaches the handler and is held, not dropped (#26).
+
+    It must not resolve the attempt outright, though: the OEM TRAILER burst
+    that follows UP and DOWN also decodes structurally, so a frame that really
+    does carry the prompted action's opcode still wins.
+    """
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    session_id = "session-untabled"
+    flow._sniff_session_id = session_id
+
+    attempt = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, attempt, UNTABLED_UP_B1)
+    assert not attempt.future.done()
+    assert attempt.unrecognized is not None
+    assert attempt.unrecognized.button == "UP"
+    assert attempt.unrecognized.inferred_button is None
+    assert attempt.unrecognized.base == UNTABLED_BASES.up
+
+    # A recognised UP for the SAME prompt still ends the window immediately.
+    recognised = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, recognised, REFERENCE_TRAILER_B1)
+    assert recognised.unrecognized is not None
+    _deliver_sniff_frame(hass, flow, session_id, recognised, REFERENCE_UP_B1)
+    assert recognised.future.done()
+    assert recognised.future.result().inferred_button == "UP"
+    attempt.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_sniff_handler_rejects_a_foreign_remote_and_a_repeated_base(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later actions are pinned to the identity and bases already measured.
+
+    With inference demoted to a hint, these are what keep a stray neighbouring
+    frame — or the previous button's lingering repeats — out of the next
+    action's slot.
+    """
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    session_id = "session-guards"
+    flow._sniff_session_id = session_id
+
+    measured_up = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, measured_up, REFERENCE_UP_B1)
+    assert measured_up.future.done()
+    already = {"UP": measured_up.future.result()}
+
+    # A different remote's frame cannot fill this remote's slot. It has to be an
+    # UNTABLED foreign frame to test the identity guard at all: a tabled one is
+    # dropped earlier by the action-inference mismatch, so the guard could be
+    # deleted outright with this test still passing.
+    foreign = config_flow_module._SniffAttempt(
+        action="DOWN",
+        measured=already,
+        future=hass.loop.create_future(),
+    )
+    from custom_components.zemismart_blinds.codec import infer_action_button as _infer
+
+    assert _infer((1,), FOREIGN_UNTABLED_UP_CMD) is None, (
+        "the foreign fixture must be untabled or this test proves nothing"
+    )
+    _deliver_sniff_frame(hass, flow, session_id, foreign, FOREIGN_UNTABLED_UP_B1)
+    assert not foreign.future.done()
+    assert foreign.unrecognized is None
+
+    # Nor can a lingering repeat of the UP burst we already measured.
+    repeat = config_flow_module._SniffAttempt(
+        action="DOWN",
+        measured=already,
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, repeat, REFERENCE_UP_B1)
+    assert not repeat.future.done()
+    assert repeat.unrecognized is None
+
+    # The genuine DOWN press is still accepted.
+    _deliver_sniff_frame(hass, flow, session_id, repeat, REFERENCE_DOWN_B1)
+    assert repeat.future.done()
+    foreign.future.cancel()
+
+
 @pytest.mark.asyncio
 async def test_sniff_handler_skips_our_echo_but_accepts_a_real_press(
     hass: HomeAssistant,
@@ -2147,32 +2613,172 @@ async def test_sniff_handler_skips_our_echo_but_accepts_a_real_press(
     flow._sniff_session_id = session_id
     topic = "rf433/rf433-bridge-office/rx"
 
-    def deliver(future: asyncio.Future[Any]) -> None:
+    def deliver(frame: str = TEST_CH12_UP_B0) -> config_flow_module._SniffAttempt:
+        attempt = config_flow_module._SniffAttempt(
+            action="UP",
+            measured={},
+            future=hass.loop.create_future(),
+        )
         config_flow_module._handle_sniff_message(
             flow,
             session_id,
             topic,
-            future,
+            attempt,
             cast(
                 "ReceiveMessage",
                 SimpleNamespace(
                     topic=topic,
-                    payload=json.dumps({"frame": TEST_CH12_UP_B0}),
+                    payload=json.dumps({"frame": frame}),
                     retain=False,
                 ),
             ),
         )
+        return attempt
 
     # Classified as our own echo -> the capture is dropped.
     monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: True)
-    echo_future: asyncio.Future[Any] = hass.loop.create_future()
-    deliver(echo_future)
-    assert not echo_future.done(), "our own transmission must not be learned"
+    echo = deliver()
+    assert not echo.future.done(), "our own transmission must not be learned"
+    assert echo.unrecognized is None
 
     # Classified as foreign -> it is a real remote press and gets captured.
     monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
-    press_future: asyncio.Future[Any] = hass.loop.create_future()
-    deliver(press_future)
-    assert press_future.done()
-    assert press_future.result().button == "UP"
-    echo_future.cancel()
+    press = deliver()
+    assert press.future.done()
+    assert press.future.result().button == "UP"
+    echo.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_untabled_lingering_repeat_never_becomes_the_next_action(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An UP repeat heard during the DOWN window is not stored as DOWN.
+
+    Only reachable on an UNTABLED remote, which is why the tabled version of
+    this test passed while the guard was broken. For a tabled remote the frame
+    is dropped further down by `inferred is not None`; for an untabled one
+    `inferred` is None, so `_capture_belongs_to_this_action` is the only thing
+    standing between a lingering repeat and the measured DOWN base.
+
+    A review round claimed the guard was broken here, on the theory that
+    `derive_base` folds the solicited action into the base and so never matches
+    across the UP -> DOWN boundary. It does not: the function validates its
+    button argument but recovers the base as
+    `(cmd - remote_id + group_offset(chans))`, which is action-independent.
+    Confirmed by this test passing with the guard's comparison switched between
+    base and raw command. It is kept as characterization, not regression: the
+    guard genuinely had no untabled coverage before, which is how a false
+    finding survived long enough to be acted on.
+    """
+    monkeypatch.setattr(config_flow_module, "_is_own_emission", lambda _hass, _frame: False)
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    session_id = "session-untabled-repeat"
+    flow._sniff_session_id = session_id
+
+    up_attempt = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, up_attempt, UNTABLED_UP_B1)
+    # Untabled: inference cannot resolve it, so it is held rather than accepted.
+    measured_up = (
+        up_attempt.future.result() if up_attempt.future.done() else up_attempt.unrecognized
+    )
+    assert measured_up is not None
+    assert measured_up.inferred_button is None, (
+        "fixture must be untabled for this test to mean anything"
+    )
+
+    repeat = config_flow_module._SniffAttempt(
+        action="DOWN",
+        measured={"UP": measured_up},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, repeat, UNTABLED_UP_B1)
+    assert not repeat.future.done()
+    assert repeat.unrecognized is None, "the UP repeat must not become the DOWN fallback"
+
+    # The genuine DOWN press still lands.
+    genuine = config_flow_module._SniffAttempt(
+        action="DOWN",
+        measured={"UP": measured_up},
+        future=hass.loop.create_future(),
+    )
+    _deliver_sniff_frame(hass, flow, session_id, genuine, UNTABLED_DOWN_B1)
+    landed = genuine.future.result() if genuine.future.done() else genuine.unrecognized
+    assert landed is not None
+    assert landed.command != measured_up.command
+
+
+async def derive_from_timeout(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    flow_id: str,
+) -> ConfigFlowResult:
+    """Reach `learn_derive` the only way production offers it: a failed capture.
+
+    Derivation is deliberately NOT on the `learn_next` success menu (#26) --
+    extrapolating from a button we just measured is what stored an invented base
+    that the motor ignored. It is reachable only after a capture attempt has
+    demonstrably failed, so a test that wants it has to fail one.
+    """
+    monkeypatch.setattr(config_flow_module, "_CAPTURE_TIMEOUT_SECONDS", 0.001, raising=False)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "learn_sniff"}
+    )
+    while result["type"] is FlowResultType.SHOW_PROGRESS:
+        await hass.async_block_till_done()
+        result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "learn_timeout", result["step_id"]
+    return await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "learn_derive"})
+
+
+def _capture_for(
+    action: str, prefix: int, remote_id: int, bases: CommandBases
+) -> config_flow_module._LearnCapture:
+    """Build one measured capture the way _handle_sniff_message would."""
+    from custom_components.zemismart_blinds.codec import infer_action_button
+
+    payload = make_payload(prefix, remote_id, (1,), action, bases=bases)
+    command = payload & 0xFFFF
+    return config_flow_module._LearnCapture(
+        frame=b0_to_b1(encode_b0(payload)),
+        prefix=prefix,
+        remote_id=remote_id,
+        channels=(1,),
+        command=command,
+        button=action,
+        inferred_button=infer_action_button((1,), command),
+        base=derive_base((1,), action, command, remote_id),
+    )
+
+
+def test_derivation_falls_back_to_a_later_usable_capture() -> None:
+    """Derivation tries every measured capture, not just the first.
+
+    `derive_bases` only works from a reference whose own opcode is inside
+    `_ACTION_COMMAND_HIGH`, and captures are kept in the order the wizard asked
+    for buttons. A user whose UP is untabled but whose DOWN is not was therefore
+    refused the fallback they had explicitly selected -- the flow bounced back to
+    the timeout menu -- even though the measured DOWN could derive the missing
+    STOP perfectly well.
+    """
+    untabled_up = _capture_for("UP", UNTABLED_PREFIX, UNTABLED_REMOTE_ID, UNTABLED_BASES)
+    tabled_down = _capture_for("DOWN", TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+    assert untabled_up.inferred_button is None, "the UP fixture must be untabled"
+    assert tabled_down.inferred_button == "DOWN", "the DOWN fixture must be tabled"
+
+    # UP first, exactly as the wizard collects them; STOP never captured.
+    identity, derived = config_flow_module._remote_identity_from_captures(
+        {"UP": untabled_up, "DOWN": tabled_down}
+    )
+
+    assert derived == ("STOP",), "only the uncaptured button may be derived"
+    assert identity.bases is not None
+    # Measured values are kept verbatim; only STOP comes from the fallback.
+    assert identity.bases.up == untabled_up.base
+    assert identity.bases.down == tabled_down.base

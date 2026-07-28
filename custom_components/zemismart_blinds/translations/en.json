@@ -2,7 +2,7 @@
   "title": "Zemismart Blinds",
   "config": {
     "progress": {
-      "sniffing": "Capturing on {bridge} for a remote button press for up to {seconds} seconds"
+      "sniffing": "Capturing on {bridge} for a {action} press on the remote for up to {seconds} seconds"
     },
     "step": {
       "user": {
@@ -34,19 +34,29 @@
         }
       },
       "learn_sniff": {
-        "title": "Capture a remote button"
+        "title": "Capture the {action} button"
+      },
+      "learn_next": {
+        "title": "Captured {captured}",
+        "description": "Measured so far: {measured}. Choose Capture {action}, then press {action} on the remote while the bridge listens. Every action is measured from its own press: the command bytes for Up, Down, and Stop are not related the same way on every remote, so calculating one from another can produce a command your motor ignores.",
+        "menu_options": {
+          "learn_sniff": "Capture {action}",
+          "learn_recapture": "Capture {captured} again",
+          "learn_derive": "Skip the rest and calculate them"
+        }
       },
       "learn_timeout": {
-        "title": "No supported button press was detected",
-        "description": "Press Up, Down, or Stop on the remote during the capture window.",
+        "title": "No {action} press was detected",
+        "description": "Press {action} on the remote during the capture window. If this remote has no {action} button the wizard can hear, the remaining bases can be calculated from what was already measured — they may be wrong for your remote, so test them afterwards.",
         "menu_options": {
           "learn_retry": "Try again",
+          "learn_derive": "Calculate the remaining bases",
           "advanced": "Advanced"
         }
       },
       "learn_confirm": {
         "title": "Confirm the detected remote",
-        "description": "Detected prefix {prefix}, remote ID {remote_id}, channels {channels}, and {button} for {name} through {bridge}.",
+        "description": "Detected prefix {prefix}, remote ID {remote_id}, and channels {channels} for {name} through {bridge}. Measured from a real press: {measured}. Calculated rather than measured: {derived}. A calculated base can be wrong for remotes outside the common command layout — test those actions, and correct them under Edit remote settings if a blind does not respond.",
         "menu_options": {
           "remote_settings": "Continue",
           "learn_retry": "Try again",
@@ -268,6 +278,56 @@
           "description": "Which hard limit to drive to. Both the fully open and fully closed endpoints are physical stops the estimate re-anchors against; pick whichever is safer to reach right now."
         }
       }
+    }
+  },
+  "exceptions": {
+    "no_runtime_loaded": {
+      "message": "No Zemismart Blinds entry is loaded, so no bridge registry exists."
+    },
+    "send_raw_invalid_frame": {
+      "message": "The raw frame was rejected before transmission. See the log for the reason."
+    },
+    "send_raw_transport_failed": {
+      "message": "The raw frame could not be transmitted. See the log for the reason."
+    },
+    "legacy_entry_format": {
+      "message": "This entry uses the retired per-blind format. Add its remote through the integration's new wizard, then delete this entry."
+    },
+    "command_timeout": {
+      "message": "The bridge did not confirm the command in time, so the position is now unknown."
+    },
+    "command_failed": {
+      "message": "The command could not be sent."
+    },
+    "position_unknown": {
+      "message": "The position is unknown; run a full open or close calibration first."
+    },
+    "no_members_available": {
+      "message": "No member covers are available to position (unavailable: {unavailable})."
+    },
+    "position_delegation_failed": {
+      "message": "Positioning failed for: {members}"
+    },
+    "member_position_unknown": {
+      "message": "No frame was sent: the position is unknown for {members}. Run a full open or close calibration first."
+    },
+    "aggregate_incomplete": {
+      "message": "This group has no cover configured for channel(s) {missing}, so it cannot be positioned as a whole. Add a cover for them, or position the members individually."
+    },
+    "no_bridge_online": {
+      "message": "No RF433 bridge is online, so the command could not be sent."
+    },
+    "command_rejected": {
+      "message": "The bridge rejected the command."
+    },
+    "transport_failed": {
+      "message": "The command could not be handed to MQTT."
+    },
+    "invalid_frame": {
+      "message": "The frame was rejected before transmission."
+    },
+    "queue_full": {
+      "message": "Too many commands are already waiting for the bridge. Try again shortly."
     }
   }
 }

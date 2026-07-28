@@ -8,7 +8,7 @@ from typing import Final
 import pytest
 
 from custom_components.zemismart_blinds import state_sync as state_sync_module
-from custom_components.zemismart_blinds.codec import encode_b0, make_payload
+from custom_components.zemismart_blinds.codec import CommandBases, encode_b0, make_payload
 from custom_components.zemismart_blinds.state_sync import (
     BridgeClock,
     CommandLedger,
@@ -112,6 +112,89 @@ def test_frame_signature_decodes_rekeyed_field_truncated_trailer_capture() -> No
         frozenset({1, 2, 3, 4, 5, 6}),
         "UP",
     )
+
+
+# The same identity, the same channel set, and the same UP opcode high byte --
+# only the calibrated low byte is wrong, so this is a command the motor would
+# refuse while opcode-only inference still reads it as a genuine UP press.
+_MISCALIBRATED_BASES: Final = CommandBases(
+    up=TEST_BASES.up ^ 0x01,
+    down=TEST_BASES.down,
+    stop=TEST_BASES.stop,
+)
+
+
+def _miscalibrated_frame(channels: tuple[int, ...]) -> str:
+    """Build one frame whose UP command is off by a single low-byte step."""
+    return encode_b0(
+        make_payload(
+            TEST_PREFIX,
+            TEST_REMOTE_ID,
+            channels,
+            "UP",
+            bases=_MISCALIBRATED_BASES,
+        )
+    )
+
+
+def _configured_bases(remote_key: str) -> CommandBases | None:
+    """Resolve the synthetic remote's real calibration, as a hub would."""
+    return TEST_BASES if remote_key == _REMOTE_KEY else None
+
+
+def test_frame_signature_refuses_a_command_outside_the_configured_bases() -> None:
+    """Known bases reject a frame whose 16-bit command is not one of ours (#30)."""
+    frame = _miscalibrated_frame((1,))
+
+    # Inference sees the UP opcode high byte and accepts it; that is the
+    # exposure -- such a frame starts a heard-motion model and disarms
+    # takeovers for a command the motor ignored.
+    assert frame_signature(frame) == (_REMOTE_KEY, frozenset({1}), "UP")
+    assert frame_signature(frame, _configured_bases) is None
+    # A genuine press still classifies, by exact command rather than opcode.
+    assert frame_signature(_frame((1,), "UP"), _configured_bases) == (
+        _REMOTE_KEY,
+        frozenset({1}),
+        "UP",
+    )
+
+
+def test_frame_signature_resolves_actions_outside_the_opcode_table() -> None:
+    """Exact base matching also recognises remotes #26 showed the table misses."""
+    untabled = CommandBases(up=0xF361, down=0xBC29, stop=0xDB49)
+    frame = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", bases=untabled))
+
+    assert frame_signature(frame) is None
+    assert frame_signature(frame, lambda _key: untabled) == (
+        _REMOTE_KEY,
+        frozenset({3}),
+        "UP",
+    )
+
+
+def test_consumer_drops_a_miscalibrated_frame_without_dispatching() -> None:
+    """No HeardEvent leaves the consumer, so nothing downstream can take over.
+
+    Every takeover consequence in #30 -- the heard-motion model, the
+    physical-press generation bump that supersedes queued commands, and the
+    disarm requests against live commands -- hangs off this dispatch. Refusing
+    it here is what keeps them from firing for a frame the motor rejected.
+    """
+    dispatched: list[HeardEvent] = []
+    consumer = StateSyncConsumer(
+        ledger=CommandLedger(),
+        clock_resolver=lambda _bridge_id: BridgeClock(),
+        dispatch=dispatched.append,
+        on_emission_proof=lambda _command_id: None,
+        now=lambda: 10.0,
+        resolve_bases=_configured_bases,
+    )
+
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _miscalibrated_frame((1,)), 10.0)
+    assert dispatched == []
+
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 2_000, _frame((1,), "UP"), 11.0)
+    assert [event.button for event in dispatched] == ["UP"]
 
 
 def test_bridge_clock_tracks_steady_samples() -> None:
@@ -699,6 +782,98 @@ def test_consumer_resumes_retired_hold_as_press() -> None:
     consumer.resume_holds("command-1")
 
     assert [event.button for event in dispatched] == ["STOP"]
+
+
+_HOLD_CAP_TIME: Final = 10.0
+_HOLD_FILL_BASE_T: Final = 2_000
+
+
+def test_consumer_classifies_the_hold_it_evicts_at_the_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A capture pushed out of the hold queue is resolved, never dropped.
+
+    The oldest hold used to be `popleft()`-ed unclassified and unlogged, so a
+    real physical press parked behind a pending command vanished and its
+    cover never re-synced (#42).
+    """
+    ledger = CommandLedger()
+    press = _required_signature((1,), "STOP")
+    filler = _required_signature((2,), "UP")
+    ledger.register_pending(
+        "command-press",
+        _BRIDGE_A,
+        (1,),
+        "STOP",
+        [LedgerFrameSpec(press, offset_ms=0, airtime_ms=500)],
+    )
+    ledger.register_pending(
+        "command-filler",
+        _BRIDGE_A,
+        (2,),
+        "UP",
+        [LedgerFrameSpec(filler, offset_ms=0, airtime_ms=500)],
+    )
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(ledger, dispatched, [], [_HOLD_CAP_TIME])
+
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "STOP"), _HOLD_CAP_TIME)
+    assert dispatched == []
+
+    with caplog.at_level(logging.WARNING, logger=state_sync_module._LOGGER.name):
+        for index in range(state_sync_module._HOLD_CAP):
+            consumer.handle_rx(
+                _BRIDGE_A,
+                _BOOT,
+                _HOLD_FILL_BASE_T + index,
+                _frame((2,), "UP"),
+                _HOLD_CAP_TIME,
+            )
+
+    assert [(event.button, sorted(event.chans)) for event in dispatched] == [("STOP", [1])]
+    assert "held-capture queue hit its cap" in caplog.text
+
+
+def test_maintain_flushes_an_expired_hold_without_other_traffic() -> None:
+    """A hold whose command never resumes is released by maintenance alone.
+
+    `_maintain` otherwise runs only on incoming RF or a command resume, so an
+    orphaned hold waits for unrelated traffic to exist (#42).
+    """
+    ledger = CommandLedger()
+    signature = _required_signature((1,), "UP")
+    ledger.register_pending(
+        "command-orphan",
+        _BRIDGE_A,
+        (1,),
+        "UP",
+        [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
+    )
+    dispatched: list[HeardEvent] = []
+    now_value = [_HOLD_CAP_TIME]
+    consumer = _consumer(ledger, dispatched, [], now_value)
+    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), _HOLD_CAP_TIME)
+    assert dispatched == []
+
+    now_value[0] = _HOLD_CAP_TIME + state_sync_module._HOLD_TTL_SECONDS + 1.0
+    consumer.maintain()
+    # Idempotent: a repeat pass must not dispatch the same press twice.
+    consumer.maintain()
+
+    assert [event.button for event in dispatched] == ["UP"]
+
+
+def test_maintain_is_safe_when_idle_and_after_close() -> None:
+    """Periodic maintenance costs nothing with no captures and no command."""
+    dispatched: list[HeardEvent] = []
+    consumer = _consumer(CommandLedger(), dispatched, [], [_HOLD_CAP_TIME])
+
+    consumer.maintain()
+    consumer.maintain()
+    consumer.close()
+    consumer.maintain()
+
+    assert dispatched == []
 
 
 def test_consumer_drops_resumed_hold_older_than_overlapping_press() -> None:

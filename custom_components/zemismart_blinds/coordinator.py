@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.core import callback
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .models import CoverConfig, Role, derive_role, member_covers
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from homeassistant.core import Event, EventStateChangedData, HomeAssistant
+    from homeassistant.core import (
+        CALLBACK_TYPE,
+        Event,
+        EventStateChangedData,
+        HomeAssistant,
+    )
 
 
 class MemberCover(Protocol):
@@ -73,15 +78,21 @@ class RemoteCoordinator:
         # Entity.async_write_ha_state is final, so member mutations are
         # observed through the state machine instead of an entity override:
         # every leaf write lands here exactly once, whatever triggered it.
-        self._unsub_state_changed = hass.bus.async_listen(
-            EVENT_STATE_CHANGED,
-            self._on_state_changed,
-        )
+        # The subscription is SCOPED to the registered leaf entity ids, through
+        # HA's indexed per-entity dispatcher: an unfiltered EVENT_STATE_CHANGED
+        # listener made every coordinator in the instance — one per config
+        # entry, ~16 on this fleet — do a dict lookup for every state change
+        # anywhere, with moving covers themselves among the loudest producers.
+        # The entity ids are not known here, so it is (re)installed from
+        # register_leaf/unregister_leaf instead of from the constructor.
+        self._unsub_state_changed: CALLBACK_TYPE | None = None
 
     @callback
     def detach(self) -> None:
         """Stop listening when the owning entry unloads."""
-        self._unsub_state_changed()
+        if self._unsub_state_changed is not None:
+            self._unsub_state_changed()
+            self._unsub_state_changed = None
         self._leaf_entities.clear()
         self._aggregate_entities.clear()
         self._entity_cover_ids.clear()
@@ -95,10 +106,31 @@ class RemoteCoordinator:
             self.member_changed(cover_id)
 
     @callback
+    def _resubscribe(self) -> None:
+        """Point the state-change subscription at exactly the live leaves.
+
+        The new subscription is installed before the old one is released, so
+        no leaf write can fall between them.
+        """
+        previous = self._unsub_state_changed
+        self._unsub_state_changed = (
+            async_track_state_change_event(
+                self._hass,
+                list(self._entity_cover_ids),
+                self._on_state_changed,
+            )
+            if self._entity_cover_ids
+            else None
+        )
+        if previous is not None:
+            previous()
+
+    @callback
     def register_leaf(self, cover_id: str, entity: MemberCover) -> None:
         """Register one live leaf entity for fan-out and derivation."""
         self._leaf_entities[cover_id] = entity
         self._entity_cover_ids[entity.entity_id] = cover_id
+        self._resubscribe()
         self._mark_containers_dirty(cover_id)
 
     @callback
@@ -107,6 +139,7 @@ class RemoteCoordinator:
         entity = self._leaf_entities.pop(cover_id, None)
         if entity is not None:
             self._entity_cover_ids.pop(entity.entity_id, None)
+            self._resubscribe()
         self._mark_containers_dirty(cover_id)
 
     @callback

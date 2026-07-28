@@ -161,11 +161,13 @@ def migration_config_entry(
     )
 
 
-def stub_entry_setup(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Stub MQTT transport and platform forwarding for entry setup tests."""
+def stub_mqtt_subscribe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept every subscription without wiring a broker.
+
+    The qos assertion is the point, not the plumbing: RX and status topics
+    carry state the integration cannot afford to lose, so a subscription that
+    quietly downgraded to qos 0 must fail the test that stubbed it.
+    """
 
     async def subscribe(
         _hass: HomeAssistant,
@@ -176,10 +178,75 @@ def stub_entry_setup(
         assert qos == 1
         return lambda: None
 
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+
+
+def capture_mqtt_subscribe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Callable[[ReceiveMessage], None]]:
+    """Accept subscriptions and hand back each topic's callback to drive by hand."""
+    callbacks: dict[str, Callable[[ReceiveMessage], None]] = {}
+
+    async def subscribe(
+        _hass: HomeAssistant,
+        topic: str,
+        callback: Callable[[ReceiveMessage], None],
+        qos: int,
+    ) -> Callable[[], None]:
+        assert qos == 1
+        callbacks[topic] = callback
+        return lambda: None
+
+    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    return callbacks
+
+
+def stub_entry_setup_recording_covers(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: ConfigEntry[RemoteRuntime],
+) -> list[tuple[list[Any], dict[str, Any]]]:
+    """Forward to the REAL cover platform, recording each batched add call.
+
+    Returns the calls rather than the entities so a test can still assert how
+    many there were: the platform must hand every cover over in one add, and a
+    helper that flattened them would hide a regression back to one call per
+    cover.
+    """
+    from custom_components.zemismart_blinds import cover as cover_module
+
+    added: list[tuple[list[Any], dict[str, Any]]] = []
+
+    def record_add(
+        entities: list[Any],
+        update_before_add: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del update_before_add
+        added.append((list(entities), kwargs))
+
+    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        await cover_module.async_setup_entry(
+            hass,
+            entry,
+            cast("AddConfigEntryEntitiesCallback", record_add),
+        )
+
+    stub_mqtt_subscribe(monkeypatch)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    return added
+
+
+def stub_entry_setup(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stub MQTT transport and platform forwarding for entry setup tests."""
+
     async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    stub_mqtt_subscribe(monkeypatch)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
 
 
@@ -320,20 +387,7 @@ async def test_remote_format_entry_sets_up_with_no_entities(
         version=1,
     )
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        return
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    stub_entry_setup(hass, monkeypatch)
     add_to_manager(hass, entry)
     assert await async_setup_entry(hass, entry)
 
@@ -646,19 +700,8 @@ async def test_retained_discovery_order_and_status_ack_filtering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Info/availability commute, while retained or malformed statuses never ack TX."""
-    callbacks: dict[str, Callable[[ReceiveMessage], None]] = {}
     published: list[tuple[str, dict[str, Any]]] = []
     published_event = asyncio.Event()
-
-    async def subscribe(
-        _hass: HomeAssistant,
-        topic: str,
-        callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        callbacks[topic] = callback
-        return lambda: None
 
     async def publish(
         _hass: HomeAssistant,
@@ -676,7 +719,7 @@ async def test_retained_discovery_order_and_status_ack_filtering(
     async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    callbacks = capture_mqtt_subscribe(monkeypatch)
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     entry = config_entry("one")
@@ -746,20 +789,7 @@ async def test_virtual_remote_keeps_known_family_prefix(
 ) -> None:
     """Virtual identities randomize the low prefix bits, remote byte, and calibration seed."""
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        return
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    stub_entry_setup(hass, monkeypatch)
     values = iter((0x1234, 0x56, 0x2B))
     monkeypatch.setattr(secrets, "randbelow", lambda _limit: next(values))
     assert await async_setup(hass, {})
@@ -797,18 +827,7 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed service input is rejected on the real HA service path before publication."""
-    callbacks: dict[str, Callable[[ReceiveMessage], None]] = {}
     published: list[str] = []
-
-    async def subscribe(
-        _hass: HomeAssistant,
-        topic: str,
-        callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        callbacks[topic] = callback
-        return lambda: None
 
     async def publish(
         _hass: HomeAssistant,
@@ -823,7 +842,7 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
     async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
         return
 
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    callbacks = capture_mqtt_subscribe(monkeypatch)
     monkeypatch.setattr(mqtt, "async_publish", publish)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     assert await async_setup(hass, {})
@@ -834,7 +853,7 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
         message("rf433/bridge-a/availability", "online", retain=True)
     )
 
-    with pytest.raises(HomeAssistantError, match="hex"):
+    with pytest.raises(HomeAssistantError) as rejected:
         await hass.services.async_call(
             DOMAIN,
             SERVICE_SEND_RAW,
@@ -842,6 +861,11 @@ async def test_send_raw_service_rejects_malformed_input_before_mqtt(
             blocking=True,
         )
 
+    assert rejected.value.translation_key == "send_raw_invalid_frame"
+    # No placeholder: the reason goes to the log, not into a translated string.
+    # Requiring the English word "hex" in a user-facing message was the test
+    # actively holding the #37 violation in place.
+    assert not rejected.value.translation_placeholders
     assert published == []
 
 
@@ -1041,8 +1065,29 @@ async def test_migration_passes_legacy_entries_through_untouched(
     assert entry.version == 2
     assert entry.data is original_data
     assert CONF_COVERS not in entry.data
-    with pytest.raises(ConfigEntryError, match="retired per-blind format"):
+    with pytest.raises(ConfigEntryError, match="legacy_entry_format"):
         await async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [0, 3])
+async def test_migration_refuses_unknown_and_future_versions(
+    hass: HomeAssistant,
+    version: int,
+) -> None:
+    """An unrecognised or downgraded-from-newer entry is refused, not accepted."""
+    entry = migration_config_entry(
+        f"migration-version-{version}",
+        subentries=[],
+        version=version,
+    )
+    add_to_manager(hass, entry)
+    original_data = entry.data
+
+    assert not await async_migrate_entry(hass, entry)
+
+    assert entry.version == version
+    assert entry.data is original_data
 
 
 @pytest.mark.asyncio
@@ -1105,20 +1150,11 @@ async def test_legacy_entry_fails_setup_and_keeps_data(
     """A retired per-blind entry never loads; its data stays for migration."""
     from homeassistant.exceptions import ConfigEntryError
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    stub_mqtt_subscribe(monkeypatch)
     entry = legacy_config_entry("legacy-one")
     add_to_manager(hass, entry)
     original = dict(entry.data)
-    with pytest.raises(ConfigEntryError, match="retired per-blind format"):
+    with pytest.raises(ConfigEntryError, match="legacy_entry_format"):
         await async_setup_entry(hass, entry)
     assert dict(entry.data) == original
     assert DOMAIN not in hass.data  # no shared runtime was leaked
@@ -1131,8 +1167,6 @@ async def test_remote_entry_data_builds_leaf_entities_and_devices(
 ) -> None:
     """Entry-data rows become cover-id entities sharing the remote's device."""
     from homeassistant.helpers import device_registry as dr
-
-    from custom_components.zemismart_blinds import cover as cover_module
 
     entry = ConfigEntry(
         data={
@@ -1174,34 +1208,7 @@ async def test_remote_entry_data_builds_leaf_entities_and_devices(
     )
     add_to_manager(hass, entry)
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    added: list[tuple[list[Any], dict[str, Any]]] = []
-
-    def record_add(
-        entities: list[Any],
-        update_before_add: bool = False,
-        **kwargs: Any,
-    ) -> None:
-        del update_before_add
-        added.append((list(entities), kwargs))
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        await cover_module.async_setup_entry(
-            hass,
-            entry,
-            cast("AddConfigEntryEntitiesCallback", record_add),
-        )
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    added = stub_entry_setup_recording_covers(hass, monkeypatch, entry)
 
     # A per-cover child device left behind by the pre-0.3.1 layout.
     registry = dr.async_get(hass)
@@ -1213,16 +1220,17 @@ async def test_remote_entry_data_builds_leaf_entities_and_devices(
 
     assert await async_setup_entry(hass, entry)
 
-    # One entity per data row, all attached directly to the remote entry.
-    assert len(added) == 3
+    # One entity per data row, all attached directly to the remote entry and
+    # handed over in a single batched add call.
+    assert len(added) == 1
     assert all(kwargs == {} for _entities, kwargs in added)
     from custom_components.zemismart_blinds.cover import ZemismartAggregateCover
 
     aggregate_cover_id = "cover-all"
     entities_by_id: dict[str, Any] = {}
-    for entities, _kwargs in added:
-        assert len(entities) == 1
-        entity = entities[0]
+    batch, _kwargs = added[0]
+    assert len(batch) == 3
+    for entity in batch:
         entities_by_id[entity.unique_id] = entity
         assert entity._config.area_id == "living_room"  # inherited from remote
         assert entity._config.repeats == 5
@@ -1268,25 +1276,12 @@ async def test_update_listener_schedules_one_reload_per_mutation(
 
     from homeassistant.config_entries import ConfigSubentry
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        return
-
     reloads: list[str] = []
 
     def schedule_reload(entry_id: str) -> None:
         reloads.append(entry_id)
 
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    stub_entry_setup(hass, monkeypatch)
     monkeypatch.setattr(hass.config_entries, "async_schedule_reload", schedule_reload)
     entry = config_entry("one")
     add_to_manager(hass, entry)
@@ -1385,15 +1380,6 @@ async def test_underivable_cover_skips_without_failing_entry(
         original_name="Orphan",
     )
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
     added: list[Any] = []
 
     def record_add(
@@ -1412,7 +1398,7 @@ async def test_underivable_cover_skips_without_failing_entry(
             cast("AddConfigEntryEntitiesCallback", record_add),
         )
 
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    stub_mqtt_subscribe(monkeypatch)
     monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
     assert await async_setup_entry(hass, entry)
     assert [entity._config.name for entity in added] == ["Solo"]
@@ -1433,20 +1419,7 @@ async def test_cleared_device_area_survives_reload(
     """A user's explicit no-area choice is never re-assigned on reload."""
     from homeassistant.helpers import device_registry as dr
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        return
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    stub_entry_setup(hass, monkeypatch)
     entry = config_entry("one")
     add_to_manager(hass, entry)
     await async_setup_entry(hass, entry)
@@ -1506,41 +1479,12 @@ async def test_remote_device_rekeys_in_place_preserving_device_id(
     """
     from homeassistant.helpers import device_registry as dr
 
-    from custom_components.zemismart_blinds import cover as cover_module
-
     entry = _rekey_entry("rekey-entry")
     add_to_manager(hass, entry)
     remote_key = entry.unique_id
     assert remote_key is not None
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    added: list[tuple[list[Any], dict[str, Any]]] = []
-
-    def record_add(
-        entities: list[Any],
-        update_before_add: bool = False,
-        **kwargs: Any,
-    ) -> None:
-        del update_before_add
-        added.append((list(entities), kwargs))
-
-    async def forward(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
-        await cover_module.async_setup_entry(
-            hass,
-            entry,
-            cast("AddConfigEntryEntitiesCallback", record_add),
-        )
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
-    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    added = stub_entry_setup_recording_covers(hass, monkeypatch, entry)
 
     # The deployed pre-re-key device, carrying a user's area override.
     registry = dr.async_get(hass)
@@ -1593,16 +1537,7 @@ async def test_remote_device_survives_entry_delete_and_readd(
 
     from custom_components.zemismart_blinds import cover as cover_module
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    stub_mqtt_subscribe(monkeypatch)
 
     def make_forward(target: ConfigEntry[RemoteRuntime]) -> Any:
         async def forward(
@@ -1675,16 +1610,7 @@ async def test_cleared_area_survives_entry_delete_and_readd(
 
     from custom_components.zemismart_blinds import cover as cover_module
 
-    async def subscribe(
-        _hass: HomeAssistant,
-        _topic: str,
-        _callback: Callable[[ReceiveMessage], None],
-        qos: int,
-    ) -> Callable[[], None]:
-        assert qos == 1
-        return lambda: None
-
-    monkeypatch.setattr(mqtt, "async_subscribe", subscribe)
+    stub_mqtt_subscribe(monkeypatch)
 
     def make_forward(target: ConfigEntry[RemoteRuntime]) -> Any:
         async def forward(
@@ -1724,3 +1650,205 @@ async def test_cleared_area_survives_entry_delete_and_readd(
     assert readded.area_id is None
 
     await async_unload_entry(hass, second)
+
+
+def test_send_raw_repeats_default_matches_the_schema() -> None:
+    """The UI default and the schema default put the same frame count on air.
+
+    services.yaml advertised 5 while the schema applied DEFAULT_REPEATS = 3, so
+    a UI call and the identical YAML call with the field omitted transmitted
+    different numbers of repeats. The number is hand-maintained in two places;
+    this pins them together.
+    """
+    import pathlib
+
+    from homeassistant.util.yaml import parse_yaml
+
+    from custom_components.zemismart_blinds.const import ATTR_REPEATS, DEFAULT_REPEATS
+
+    services_yaml = (pathlib.Path(integration_module.__file__).parent / "services.yaml").read_text()
+    services = cast("dict[str, Any]", parse_yaml(services_yaml))
+
+    assert services[SERVICE_SEND_RAW]["fields"][ATTR_REPEATS]["default"] == DEFAULT_REPEATS
+
+
+def test_every_module_parses_on_pythons_older_than_the_syntax_floor() -> None:
+    """No module carries syntax that only Python 3.14 can parse.
+
+    PEP 758's unparenthesised ``except A, B:`` needs 3.14+, and manifest.json
+    cannot declare a Home Assistant floor -- HA's Manifest TypedDict has no
+    minimum-version key; that is a HACS concept. So a manual or zip install onto
+    an older core failed at import with a bare SyntaxError and no version
+    message.
+
+    Every module, not just __init__.py: it imports models.py, so one bad site
+    anywhere in the package breaks the whole integration. Scoping this to a
+    single file is what let nine sites survive in config_flow.py and one in
+    models.py while the test stayed green (#43).
+
+    Note the fix is NOT to parenthesise: `ruff format` at this project's
+    target-version rewrites `except (A, B):` straight back to the bare form.
+    The sites bind their tuples to `_COERCION_ERRORS` / `_PAYLOAD_ERRORS`
+    instead, which the formatter leaves alone.
+    """
+    import ast
+    import pathlib
+
+    package = pathlib.Path(integration_module.__file__).parent
+    modules = sorted(package.glob("*.py"))
+    assert len(modules) >= 10, "the package should have more modules than this"
+
+    for module in modules:
+        try:
+            ast.parse(module.read_text(), feature_version=(3, 13))
+        except SyntaxError as err:  # pragma: no cover - the assertion is the report
+            pytest.fail(f"{module.name}:{err.lineno} needs Python 3.14 to parse: {err.msg}")
+
+
+def test_every_raised_translation_key_exists_and_both_catalogues_agree() -> None:
+    """Exception messages are translated, and the two catalogues stay identical.
+
+    Nine raise sites used to pass raw English literals and strings.json had no
+    exceptions block at all, so a non-English user saw all of them in English.
+    """
+    import json
+    import pathlib
+    import re
+
+    package = pathlib.Path(integration_module.__file__).parent
+    strings = json.loads((package / "strings.json").read_text())
+    english = json.loads((package / "translations" / "en.json").read_text())
+
+    assert strings == english
+
+    # Only the exception raise sites: selectors carry translation keys too.
+    raised = {
+        match.group(1)
+        for source in package.glob("*.py")
+        for match in re.finditer(
+            r'translation_domain=DOMAIN,\s*translation_key="([a-z_]+)"',
+            source.read_text(),
+        )
+    }
+    # Plus the keys chosen at runtime by _failure_translation_key: each defined
+    # transport failure gets its own message rather than having str(exc)
+    # interpolated into a shared one, so these never appear as literals at a
+    # raise site and a purely textual scan would call them orphans (#37).
+    from custom_components.zemismart_blinds.cover import (
+        _DEFAULT_FAILURE_KEY,
+        _TRANSPORT_FAILURE_KEYS,
+    )
+
+    raised |= set(_TRANSPORT_FAILURE_KEYS.values()) | {_DEFAULT_FAILURE_KEY}
+
+    # Every raised key has a message, and no message goes unraised.
+    assert raised == set(strings["exceptions"])
+    for key in raised:
+        assert strings["exceptions"][key]["message"]
+
+
+@pytest.mark.asyncio
+async def test_setup_registers_and_releases_the_maintenance_timer(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The RX maintenance sweep has a production caller, and it is released.
+
+    `ZemismartHub.maintain()` shipped with a docstring saying HA drives it
+    periodically, but nothing did -- the only callers were tests, so a held
+    capture whose command never resumed stayed parked until unrelated RF traffic
+    happened to arrive (#42). A test that calls maintain() by hand cannot see
+    that the lifecycle wiring is missing, which is exactly how this survived.
+
+    Asserts the registration rather than firing HA's clock: what was missing was
+    the wiring, and the callback is invoked here directly to prove it does the
+    work it claims to.
+    """
+    registered: list[tuple[Any, Any]] = []
+    released: list[None] = []
+    maintained: list[None] = []
+
+    def track_time_interval(
+        _hass: HomeAssistant,
+        action: Any,
+        interval: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Callable[[], None]:
+        registered.append((action, interval))
+        return lambda: released.append(None)
+
+    async def unload(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
+        return True
+
+    stub_entry_setup(hass, monkeypatch)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
+    monkeypatch.setattr(integration_module, "async_track_time_interval", track_time_interval)
+    monkeypatch.setattr(ZemismartHub, "maintain", lambda _self: maintained.append(None))
+
+    entry = config_entry("maintenance-timer")
+    add_to_manager(hass, entry)
+    assert await async_setup_entry(hass, entry)
+
+    assert len(registered) == 1, "setup must register exactly one maintenance timer"
+    action, interval = registered[0]
+    assert interval == integration_module.MAINTENANCE_INTERVAL
+
+    # The callback does the work it exists for.
+    action(None)
+    assert maintained, "the timer callback must reach hub.maintain()"
+
+    assert await async_unload_entry(hass, entry)
+    assert released, "the timer must be cancelled when the last entry unloads"
+
+
+@pytest.mark.asyncio
+async def test_setup_registers_entry_bases_before_forwarding_platforms(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entry's calibration is known to the hub before any cover exists.
+
+    `runtime.initialized` becomes true once the MQTT subscriptions are up, which
+    is BEFORE the cover platform is forwarded -- so `send_raw` is callable while
+    no RX listener carries the bases yet (#30).
+
+    Asserted at the seam that actually matters: the registration is observed
+    from INSIDE the platform forward, and released through the entry's own
+    unload. A hub-level test that calls `register_remote_bases` by hand passes
+    with the production registration deleted.
+    """
+    seen_during_forward: list[object] = []
+
+    async def forward(entry_arg: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> None:
+        runtime = cast("DomainRuntime", hass.data[DOMAIN])
+        key = entry_arg.runtime_data.remote.key
+        seen_during_forward.append(runtime.hub._resolve_remote_bases(key))
+
+    async def unload(_entry: ConfigEntry[RemoteRuntime], _platforms: list[Any]) -> bool:
+        return True
+
+    stub_mqtt_subscribe(monkeypatch)
+    monkeypatch.setattr(hass.config_entries, "async_forward_entry_setups", forward)
+    monkeypatch.setattr(hass.config_entries, "async_unload_platforms", unload)
+
+    entry = config_entry("bases-window")
+    add_to_manager(hass, entry)
+    assert await async_setup_entry(hass, entry)
+
+    assert seen_during_forward and seen_during_forward[0] is not None, (
+        "the bases must be registered BEFORE the cover platform is forwarded"
+    )
+
+    runtime = cast("DomainRuntime", hass.data[DOMAIN])
+    key = entry.runtime_data.remote.key
+    assert runtime.hub._resolve_remote_bases(key) is not None
+
+    assert await async_unload_entry(hass, entry)
+    # HA runs the entry's on-unload callbacks after async_unload_entry returns;
+    # calling our function alone does not, so drive them the way the config
+    # entry machinery does.
+    await entry._async_process_on_unload(hass)
+    assert runtime.hub._resolve_remote_bases(key) is None, (
+        "unload must release the registration through entry.async_on_unload"
+    )

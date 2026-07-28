@@ -167,6 +167,33 @@ def infer_action_button(chans: Iterable[int], cmd: int) -> str | None:
     return None
 
 
+def button_for_command(
+    chans: Iterable[int],
+    cmd: int,
+    remote_id: int,
+    bases: CommandBases,
+) -> str | None:
+    """Return the action whose calibrated command this capture exactly is.
+
+    The frame format carries no checksum, and :func:`infer_action_button`
+    compares only the opcode high byte -- so a frame with our prefix, our
+    remote id, our channel set and a plausible high byte is indistinguishable
+    from a real press even when its low byte makes it a command the motor
+    itself would reject (#30).  Wherever a remote's measured bases are known
+    they are the ground truth, so the whole 16-bit command must match one of
+    them; the same exactness also recognises actions whose opcode byte is
+    outside :data:`_ACTION_COMMAND_HIGH`, which is only a 10-sample fit (#26).
+    """
+    normalized = validate_channels(chans, allow_empty=False)
+    _require_uint(cmd, 16, "command")
+    _require_uint(remote_id, 8, "remote_id")
+    recovered = _recover_base(remote_id, normalized, cmd)
+    return next(
+        (button for button in _ACTION_COMMAND_HIGH if bases.base(button) == recovered),
+        None,
+    )
+
+
 def channel_field(channels: Iterable[int]) -> int:
     """Encode channels as the protocol's 16-bit active-low bit field."""
     normalized = validate_channels(channels, allow_empty=True)

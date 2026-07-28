@@ -19,7 +19,10 @@ send_raw:
     repeats:
       name: Repeats
       description: How many times the frame is transmitted (distant or obstructed blinds may need more).
-      default: 5
+      # Must equal DEFAULT_REPEATS (const.py), which the service schema applies
+      # when the field is omitted: a UI call and the identical YAML call have to
+      # put the same number of frames on air. Pinned by a test.
+      default: 3
       selector:
         number:
           min: 1

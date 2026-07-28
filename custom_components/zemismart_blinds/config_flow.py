@@ -10,7 +10,7 @@ import secrets
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -21,8 +21,9 @@ from homeassistant.util.ulid import ulid_now
 
 from .codec import (
     CommandBases,
-    decode_b0,
     decode_reference_b0,
+    decode_rx_capture,
+    derive_base,
     derive_bases,
     derive_bases_from_base,
     infer_action_button,
@@ -88,11 +89,25 @@ if TYPE_CHECKING:
 
 
 _LOGGER = logging.getLogger(__name__)
+# Exception tuples are bound to names rather than written inline. `ruff format`
+# at this project's target-version rewrites the parenthesised `except (A, B):`
+# straight back into the bare PEP 758 `except A, B:`, which is a SyntaxError on
+# Python < 3.14 -- so a manual or zip install onto an older core fails at import
+# with no useful message. A named tuple is left alone by the formatter and
+# parses everywhere (#43).
+_COERCION_ERRORS: Final = (TypeError, ValueError)
+_PAYLOAD_ERRORS: Final = (UnicodeDecodeError, json.JSONDecodeError)
 _ADVANCED_SECTION = "advanced"
 _AUTOMATIC_BRIDGE = "automatic"
 _BRIDGE_DISCOVERY_SECONDS = 0.25
 _MQTT_BOOTSTRAP_TIMEOUT_SECONDS = 5.0
 _CAPTURE_TIMEOUT_SECONDS = float(DEFAULT_SNIFF_WINDOW_SECONDS)
+# The order the wizard walks the user through. Every one of these is MEASURED
+# from its own press: the codec can extrapolate two of the three from the
+# remaining one, but its action opcode table holds for only 10 of the 11
+# remotes surveyed in #26, and the eleventh's extrapolated UP frame was
+# transmitted, heard by five bridges, and ignored by the motor.
+_LEARN_ACTIONS: Final = ("UP", "DOWN", "STOP")
 _CAPTURE_OWNERS: dict[tuple[int, str], str] = {}
 # CoverConfig enforces storage identity while this validation draft is not yet
 # stored. Every terminal add replaces the sentinel with a fresh ULID; edits
@@ -216,7 +231,33 @@ class _LearnCapture:
     remote_id: int
     channels: tuple[int, ...]
     command: int
+    # The action the WIZARD asked the user to press. Authoritative: the button
+    # is known from the prompt, so it is never inferred from the opcode.
     button: str
+    # What infer_action_button() made of the opcode byte, or None when the byte
+    # is outside the codec's table. Retained as a hint only -- it decides
+    # whether this frame resolves the attempt immediately or is held as the
+    # fallback, never whether the capture is valid (#26).
+    inferred_button: str | None
+    # The per-remote calibrated base recovered from this exact capture.
+    base: int
+
+
+@dataclass(slots=True)
+class _SniffAttempt:
+    """Mutable state for one prompted action's capture window."""
+
+    action: str
+    measured: dict[str, _LearnCapture]
+    future: asyncio.Future[_LearnCapture]
+    # A structurally valid capture whose opcode byte is not in the codec's
+    # action table. That table is a 10-sample empirical fit, not protocol, so
+    # an unrecognised opcode is not evidence of a bad capture -- it is held
+    # here and used if the window closes without a recognised match, instead
+    # of being dropped as it was until #26. A recognised frame for the
+    # prompted action still wins outright, which keeps the OEM TRAILER burst
+    # that follows UP/DOWN from being mistaken for the action itself.
+    unrecognized: _LearnCapture | None = None
 
 
 def _remote_identity_from_manual(user_input: Mapping[str, Any]) -> RemoteIdentity:
@@ -267,18 +308,63 @@ def _remote_identity_from_manual(user_input: Mapping[str, Any]) -> RemoteIdentit
     return identity
 
 
-def _remote_identity_from_capture(capture: _LearnCapture) -> RemoteIdentity:
-    """Derive the calibrated identity from one accepted sniff capture."""
-    return RemoteIdentity(
-        prefix=capture.prefix,
-        remote_id=capture.remote_id,
-        bases=derive_bases(
-            capture.channels,
-            capture.button,
-            capture.command,
-            capture.remote_id,
+def _remote_identity_from_captures(
+    captures: Mapping[str, _LearnCapture],
+) -> tuple[RemoteIdentity, tuple[str, ...]]:
+    """Build the calibrated identity from measured captures, deriving any gaps.
+
+    Every captured action contributes its OWN measured base. Only a button the
+    user could not capture falls back to ``derive_bases``, whose action opcode
+    table held for 10 of the 11 remotes surveyed in #26 -- for the eleventh it
+    produced an UP command the motor provably ignored while the measured one
+    worked. So derivation is now the exception, and the returned action names
+    exist so the confirmation step can tell the user which bases are guesses.
+
+    ``derive_bases`` raises when the reference's own opcode byte is outside
+    that table, which is exactly the remote this fallback cannot serve; the
+    caller surfaces that as a failed capture rather than storing a guess.
+    """
+    if not captures:
+        msg = "at least one captured action is required"
+        raise ValueError(msg)
+    reference = next(iter(captures.values()))
+    measured = {action: capture.base for action, capture in captures.items()}
+    derived_actions = tuple(action for action in _LEARN_ACTIONS if action not in measured)
+    if derived_actions:
+        # Try every measured capture, not just the first. `derive_bases` only
+        # works from a reference whose own opcode is inside the table, and
+        # insertion order is the order the WIZARD asked for buttons -- so a user
+        # whose UP is untabled but whose DOWN is not was refused the fallback
+        # they had explicitly chosen, purely because UP came first.
+        fallback = None
+        for candidate in captures.values():
+            try:
+                fallback = derive_bases(
+                    candidate.channels,
+                    candidate.button,
+                    candidate.command,
+                    candidate.remote_id,
+                )
+            except ValueError:
+                continue
+            reference = candidate
+            break
+        if fallback is None:
+            # No captured button can serve as a reference. Surfaced as a failed
+            # capture rather than stored as a guess.
+            msg = "no captured action can serve as a derivation reference"
+            raise ValueError(msg)
+        measured.update({action: fallback.base(action) for action in derived_actions})
+    identity = RemoteIdentity(
+        prefix=reference.prefix,
+        remote_id=reference.remote_id,
+        bases=CommandBases(
+            up=measured["UP"],
+            down=measured["DOWN"],
+            stop=measured["STOP"],
         ),
     )
+    return identity, derived_actions
 
 
 @callback
@@ -339,18 +425,68 @@ def _is_own_emission(hass: HomeAssistant, frame: str) -> bool:
     )
 
 
+def _capture_belongs_to_this_action(
+    attempt: _SniffAttempt,
+    capture: _LearnCapture,
+) -> bool:
+    """Reject a frame that cannot be this action's press on this remote.
+
+    Two ways a capture is disqualified without ever consulting its opcode:
+    it comes from a different remote than the actions already measured, or it
+    repeats a COMMAND we already measured for a different action -- which is
+    what a lingering repeat of the previous button (or the user not pressing
+    anything) looks like on air.
+
+    Compared on the DERIVED BASE rather than the raw command, deliberately.
+    `derive_base` validates its button argument but does not use it -- the
+    recovery is `(cmd - remote_id + group_offset(chans))`, which is
+    action-independent -- so one physical frame yields one base whichever
+    action is currently being solicited, and the comparison works across the
+    action boundary. Because the base is also CHANNEL-normalised, it catches a
+    lingering repeat of the same button on a different channel, which comparing
+    raw commands would miss.
+    """
+    for action, measured in attempt.measured.items():
+        if (measured.prefix, measured.remote_id) != (capture.prefix, capture.remote_id):
+            _LOGGER.debug(
+                "Learn: ignoring a capture from %06x:%02x while learning %s for %06x:%02x",
+                capture.prefix,
+                capture.remote_id,
+                attempt.action,
+                measured.prefix,
+                measured.remote_id,
+            )
+            return False
+        if measured.base == capture.base:
+            _LOGGER.debug(
+                "Learn: ignoring a %s capture that repeats the base already measured for %s",
+                attempt.action,
+                action,
+            )
+            return False
+    return True
+
+
 @callback
 def _handle_sniff_message(
     flow: ZemismartBlindsConfigFlow,
     session_id: str,
     expected_topic: str,
-    capture_future: asyncio.Future[_LearnCapture],
+    attempt: _SniffAttempt,
     message: ReceiveMessage,
 ) -> None:
-    """Resolve the current attempt with its first decodable action frame."""
+    """Offer one received frame to the attempt for the prompted action.
+
+    Capture acceptance is deliberately NOT gated on ``infer_action_button``.
+    In this flow the button is known from the prompt the user is answering, so
+    inference is only a hint about whether to stop listening now; a capture
+    that decodes structurally is accepted even when its opcode byte is
+    unrecognised. Gating on it dropped every UP and STOP press of a real
+    remote silently, with no log and no error (#26).
+    """
     if (
         flow._sniff_session_id != session_id
-        or capture_future.done()
+        or attempt.future.done()
         or message.retain
         or message.topic != expected_topic
     ):
@@ -358,7 +494,7 @@ def _handle_sniff_message(
     try:
         text = _payload_text(message.payload)
         decoded_payload: object = json.loads(text)
-    except UnicodeDecodeError, json.JSONDecodeError:
+    except _PAYLOAD_ERRORS:
         return
     if not isinstance(decoded_payload, Mapping):
         return
@@ -366,23 +502,48 @@ def _handle_sniff_message(
     if not isinstance(frame, str):
         return
     try:
-        decoded = decode_b0(frame)
+        # Learning is a RECEIVE path, so it decodes like every other one:
+        # trailer-tolerant. Not every OEM remote puts the nominal [1, 0]
+        # trailer on air (PROTOCOL.md), and the strict decoder used here until
+        # #27 rejected those captures before any handler saw them -- the user
+        # got a capture timeout on a remote that was transmitting perfectly.
+        decoded = decode_rx_capture(frame)
         channels = tuple(decoded["chans"])
-        button = infer_action_button(channels, decoded["cmd"])
-    except TypeError, ValueError:
+        inferred = infer_action_button(channels, decoded["cmd"])
+        base = derive_base(channels, attempt.action, decoded["cmd"], decoded["remote_id"])
+    except _COERCION_ERRORS:
         return
-    if button not in {"UP", "DOWN", "STOP"} or _is_own_emission(flow.hass, frame):
+    if _is_own_emission(flow.hass, frame):
         return
-    capture_future.set_result(
-        _LearnCapture(
-            frame=frame,
-            prefix=decoded["prefix"],
-            remote_id=decoded["remote_id"],
-            channels=channels,
-            command=decoded["cmd"],
-            button=button,
-        )
+    capture = _LearnCapture(
+        frame=frame,
+        prefix=decoded["prefix"],
+        remote_id=decoded["remote_id"],
+        channels=channels,
+        command=decoded["cmd"],
+        button=attempt.action,
+        inferred_button=inferred,
+        base=base,
     )
+    if not _capture_belongs_to_this_action(attempt, capture):
+        return
+    if inferred == attempt.action:
+        attempt.future.set_result(capture)
+        return
+    if inferred is not None:
+        _LOGGER.debug(
+            "Learn: ignoring a frame that decodes as %s while %s was requested",
+            inferred,
+            attempt.action,
+        )
+        return
+    if attempt.unrecognized is None:
+        _LOGGER.debug(
+            "Learn: holding a capture with unrecognised opcode 0x%02x as the %s candidate",
+            decoded["cmd"] >> 8,
+            attempt.action,
+        )
+        attempt.unrecognized = capture
 
 
 def _flatten_details(user_input: Mapping[str, Any]) -> dict[str, Any]:
@@ -541,7 +702,7 @@ def _cover_display_values(
     """Convert stored cover data to values suitable for form suggestions."""
     try:
         cover = CoverConfig.from_stored(cover_id, data)
-    except TypeError, ValueError:
+    except _COERCION_ERRORS:
         suggested: dict[str, object] = {CONF_NAME: title}
         if (raw_channels := data.get(CONF_CHANNELS)) is not None:
             if isinstance(raw_channels, str):
@@ -590,7 +751,7 @@ def _validate_cover_input(
             travel_down=float(raw_down) if raw_down is not None else None,
             cover_id=_PENDING_COVER_ID,
         )
-    except TypeError, ValueError:
+    except _COERCION_ERRORS:
         return None, {"base": "invalid_config"}
     return cover, {}
 
@@ -643,7 +804,7 @@ def _sibling_channel_sets(
             continue
         try:
             channels = CoverConfig.from_stored(cover_id, row).channels
-        except TypeError, ValueError:
+        except _COERCION_ERRORS:
             try:
                 channels = parse_channels(row.get(CONF_CHANNELS, ""))
             except (TypeError, ValueError) as err:
@@ -734,11 +895,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 2
 
-    _capture: _LearnCapture | None = None
+    _captures: dict[str, _LearnCapture] | None = None
     _cover_id: str | None = None
     _covers: list[CoverConfig] | None = None
     _identity: RemoteIdentity | None = None
+    _learn_action: str = _LEARN_ACTIONS[0]
     _learn_area_id: str | None = None
+    _learn_captured: str | None = None
     _learn_bridge: str | None = None
     _learn_name: str | None = None
     _learn_registry: BridgeRegistry | None = None
@@ -903,7 +1066,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 _find_cover_row(rows, cover_id)
                 refusal = _cover_removal_refusal(entry, cover_id)
-            except TypeError, ValueError:
+            except _COERCION_ERRORS:
                 errors[CONF_COVER_ID] = "cover_not_found"
             else:
                 if refusal is not None:
@@ -928,7 +1091,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             rows = _entry_cover_rows(entry)
             index, stored = _find_cover_row(rows, self._cover_id)
             refusal = _cover_removal_refusal(entry, self._cover_id)
-        except TypeError, ValueError:
+        except _COERCION_ERRORS:
             return self.async_abort(reason="cover_not_found")
         if refusal is not None:
             return self.async_abort(reason=refusal)
@@ -1060,7 +1223,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                     cover_rows=current.cover_rows,
                 )
-            except TypeError, ValueError:
+            except _COERCION_ERRORS:
                 errors["base"] = "invalid_config"
             else:
                 self.hass.config_entries.async_update_entry(
@@ -1121,6 +1284,8 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._learn_name = name
                     self._learn_area_id = area_id
                     self._learn_bridge = bridge_id
+                    self._captures = {}
+                    self._learn_action = _LEARN_ACTIONS[0]
                     self._learn_suggested = {
                         **(self._learn_suggested or {}),
                         CONF_NAME: name,
@@ -1138,9 +1303,19 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    def _learn_failure_menu_options(self, retry_step: str) -> list[str]:
+    def _learn_failure_menu_options(
+        self,
+        retry_step: str,
+        *,
+        offer_derive: bool = False,
+    ) -> list[str]:
         """Return failure recovery paths appropriate to the flow source."""
         menu_options = [retry_step]
+        if offer_derive and self._captures:
+            # Something was already measured, so the derivation fallback is
+            # available -- and only here, where the user has demonstrably run
+            # out of buttons the wizard can hear.
+            menu_options.append("learn_derive")
         if self.source != config_entries.SOURCE_RECONFIGURE:
             menu_options.append("advanced")
         return menu_options
@@ -1166,11 +1341,10 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._sniff_task is not None and self._sniff_task.done():
             outcome = "timeout" if self._sniff_task.cancelled() else self._sniff_task.result()
             self._sniff_task = None
-            next_step = "learn_confirm" if outcome == "captured" else "learn_timeout"
+            next_step = "learn_next" if outcome == "captured" else "learn_timeout"
             return self.async_show_progress_done(next_step_id=next_step)
 
         if self._sniff_task is None:
-            self._capture = None
             session_id = secrets.token_hex(16)
             self._sniff_session_id = session_id
             self._sniff_task = self.hass.async_create_task(
@@ -1183,6 +1357,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             progress_action="sniffing",
             progress_task=self._sniff_task,
             description_placeholders={
+                "action": self._learn_action,
                 "bridge": self._learn_bridge or "",
                 "seconds": str(DEFAULT_SNIFF_WINDOW_SECONDS),
             },
@@ -1192,36 +1367,99 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Invalidate the prior capture before starting a fresh attempt."""
+        """Invalidate this action's capture before starting a fresh attempt."""
         del user_input
         self._sniff_session_id = None
         self._sniff_task = None
+        if self._captures is not None:
+            self._captures.pop(self._learn_action, None)
         return await self.async_step_learn_sniff()
+
+    async def async_step_learn_recapture(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Discard the action just measured and capture that one again.
+
+        Distinct from learn_retry, which always targets the action currently
+        being prompted: by the time learn_next is on screen the prompt has
+        already advanced, so retrying there would silently re-arm the NEXT
+        button instead of the one the user is unhappy with.
+        """
+        del user_input
+        if self._learn_captured is not None:
+            self._learn_action = self._learn_captured
+        return await self.async_step_learn_retry()
+
+    async def async_step_learn_next(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Report the action just measured and prompt for the next one."""
+        del user_input
+        captures = self._captures
+        if not captures:
+            return await self.async_step_learn_timeout()
+        remaining = [action for action in _LEARN_ACTIONS if action not in captures]
+        if not remaining:
+            return await self.async_step_learn_confirm()
+        captured = self._learn_captured = self._learn_action
+        self._learn_action = remaining[0]
+        # No `learn_derive` here. This is the SUCCESS path -- a button was just
+        # measured and the next one is being asked for -- and offering
+        # extrapolation from it makes derivation an ordinary way to finish
+        # onboarding rather than the fallback #26 requires. Taking it after UP
+        # invents DOWN and STOP from an opcode table that held for only 10 of
+        # the 11 remotes surveyed, and the eleventh's invented UP frame was
+        # transmitted, heard by five bridges, and ignored by the motor.
+        #
+        # A user who genuinely cannot capture a button still reaches it: press
+        # the button we ask for, let the window time out, and `learn_timeout`
+        # offers derivation because a capture attempt has demonstrably failed.
+        return self.async_show_menu(
+            step_id="learn_next",
+            menu_options=["learn_sniff", "learn_recapture"],
+            description_placeholders={
+                "captured": captured,
+                "measured": ", ".join(captures),
+                "action": self._learn_action,
+            },
+        )
+
+    async def async_step_learn_derive(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Stop capturing and complete the uncaptured bases by extrapolation."""
+        del user_input
+        return await self.async_step_learn_confirm()
 
     async def async_step_learn_timeout(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Offer a fresh capture attempt or the Advanced fallbacks."""
+        """Offer a fresh capture attempt, derivation, or Advanced fallbacks."""
         del user_input
         return self.async_show_menu(
             step_id="learn_timeout",
-            menu_options=self._learn_failure_menu_options("learn_retry"),
+            menu_options=self._learn_failure_menu_options("learn_retry", offer_derive=True),
+            description_placeholders={"action": self._learn_action},
         )
 
     async def async_step_learn_confirm(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Summarize decoded identity/action without exposing raw capture hex."""
+        """Summarize the calibration without exposing raw capture hex."""
         del user_input
-        capture = self._capture
-        if capture is None:
+        captures = self._captures
+        if not captures:
             return await self.async_step_learn_timeout()
         try:
-            self._identity = _remote_identity_from_capture(capture)
+            self._identity, derived = _remote_identity_from_captures(captures)
         except ValueError:
             return await self.async_step_learn_timeout()
+        reference = next(iter(captures.values()))
         menu_options = ["remote_settings", "learn_retry", "advanced"]
         if self.source == config_entries.SOURCE_RECONFIGURE:
             menu_options = ["reconfigure_apply", "learn_retry"]
@@ -1229,10 +1467,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="learn_confirm",
             menu_options=menu_options,
             description_placeholders={
-                "prefix": f"0x{capture.prefix:06x}",
-                "remote_id": f"0x{capture.remote_id:02x}",
-                "channels": ",".join(map(str, capture.channels)),
-                "button": capture.button,
+                "prefix": f"0x{reference.prefix:06x}",
+                "remote_id": f"0x{reference.remote_id:02x}",
+                "channels": ",".join(map(str, reference.channels)),
+                "measured": ", ".join(captures),
+                # Named explicitly rather than silently substituted: a derived
+                # base is a guess from a table that is wrong for some real
+                # remotes, and the user is the only one who can test it (#26).
+                "derived": ", ".join(derived) or "none",
                 "name": self._learn_name or "",
                 "bridge": self._learn_bridge or "",
             },
@@ -1243,7 +1485,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Offer manual and virtual identity paths."""
-        self._capture = None
+        self._captures = None
         self._sniff_session_id = None
         del user_input
         return self.async_show_menu(
@@ -1294,7 +1536,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_COALESCE_WINDOW_MS,
                     ),
                 )
-            except TypeError, ValueError:
+            except _COERCION_ERRORS:
                 errors["base"] = "invalid_config"
             else:
                 await self.async_set_unique_id(remote.key)
@@ -1329,8 +1571,9 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._covers.append(cover)
                 return await self.async_step_cover_menu()
         suggested: dict[str, object] = {}
-        if not self._covers and self._capture is not None:
-            suggested[CONF_CHANNELS] = ",".join(map(str, self._capture.channels))
+        if not self._covers and self._captures:
+            reference = next(iter(self._captures.values()))
+            suggested[CONF_CHANNELS] = ",".join(map(str, reference.channels))
         if user_input is not None:
             suggested = dict(user_input)
         data_schema = _cover_schema(suggested)
@@ -1436,12 +1679,24 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None
         return session.registry
 
+    def _store_capture(
+        self,
+        session_id: str,
+        capture: _LearnCapture,
+    ) -> Literal["captured", "timeout"]:
+        """Record one measured action unless its attempt was already retired."""
+        if self._sniff_session_id != session_id or self._captures is None:
+            return "timeout"
+        self._captures[capture.button] = capture
+        return "captured"
+
     async def _async_capture(self, session_id: str) -> Literal["captured", "timeout"]:
         """Capture one action and always release/stop the bridge sniff session."""
         from homeassistant.components import mqtt
 
         bridge = self._learn_bridge
-        if bridge is None:
+        captures = self._captures
+        if bridge is None or captures is None:
             return "timeout"
         owner_key = (id(self.hass), bridge)
         if owner_key in _CAPTURE_OWNERS:
@@ -1451,7 +1706,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _CAPTURE_OWNERS[owner_key] = session_id
         rx_topic = f"{MQTT_ROOT}/{bridge}/rx"
         command_topic = MQTT_CMD_TEMPLATE.format(bridge=bridge)
-        capture_future: asyncio.Future[_LearnCapture] = self.hass.loop.create_future()
+        attempt = _SniffAttempt(
+            action=self._learn_action,
+            measured=dict(captures),
+            future=self.hass.loop.create_future(),
+        )
+        capture_future = attempt.future
         unsubscribe: Unsubscriber | None = None
         try:
             async with asyncio.timeout(_CAPTURE_TIMEOUT_SECONDS):
@@ -1466,7 +1726,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             self,
                             session_id,
                             rx_topic,
-                            capture_future,
+                            attempt,
                         ),
                     )
                     await mqtt.async_publish(
@@ -1483,12 +1743,15 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         retain=False,
                     )
                 capture = await capture_future
-            if self._sniff_session_id != session_id:
-                return "timeout"
-            self._capture = capture
-            return "captured"
+            return self._store_capture(session_id, capture)
         except TimeoutError:
-            return "timeout"
+            # An unrecognised opcode cannot end the window early: nothing
+            # distinguishes it from the OEM trailer burst until the window
+            # closes with no recognised frame for this action. Only then is
+            # the held candidate the best evidence we have (#26).
+            if attempt.unrecognized is None:
+                return "timeout"
+            return self._store_capture(session_id, attempt.unrecognized)
         except asyncio.CancelledError:
             raise
         except Exception:

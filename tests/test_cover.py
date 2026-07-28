@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
+from contextlib import suppress
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
 from homeassistant.components.cover import ATTR_CURRENT_POSITION, ATTR_POSITION
 from homeassistant.core import State
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers.entity import EntityPlatformState
+from homeassistant.helpers.event import async_track_state_change_event
 
 from custom_components.zemismart_blinds import cover as cover_module
 from custom_components.zemismart_blinds import models as models_module
@@ -23,16 +28,20 @@ from custom_components.zemismart_blinds.models import (
     RemoteConfig,
     RemoteIdentity,
     RemoteRuntime,
+    Role,
     ZemismartHub,
 )
 from custom_components.zemismart_blinds.state_sync import HeardEvent, LedgerFrameSpec
 from tests.synthetic import TEST_ACTION_BASES, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
     from homeassistant.core import HomeAssistant
-    from homeassistant.helpers.entity_platform import EntityPlatform
+    from homeassistant.helpers.entity_platform import (
+        AddConfigEntryEntitiesCallback,
+        EntityPlatform,
+    )
 
 _GENERIC_DISARM_DEADLINE_SECONDS: Final = 0.02
 _LATE_LISTENER_DISARM_DEADLINE_SECONDS: Final = 0.2
@@ -85,6 +94,13 @@ async def attach_cover(
     entity.platform = platform_stub()
     await entity.async_internal_added_to_hass()
     await entity.async_added_to_hass()
+    # Production reaches this via EntityPlatform. Without it every
+    # async_write_ha_state() on the entity is silently discarded before the
+    # state machine, so anything observing states -- hass.states.get, the
+    # coordinator's state-change subscription -- sees nothing and the test
+    # quietly asserts less than it appears to.
+    entity._platform_state = EntityPlatformState.ADDED
+    entity.async_write_ha_state()
     return entity
 
 
@@ -293,8 +309,14 @@ async def test_ack_timeout_marks_position_unknown_and_degraded(hass: HomeAssista
     entity = await attach_cover(hass, hub)
     entity._position = 50.0
     try:
-        with pytest.raises(HomeAssistantError, match="acknowledgement"):
+        with pytest.raises(HomeAssistantError) as timeout:
             await entity.async_open_cover()
+        # Translated at the boundary; the transport's own detail is the
+        # placeholder, so the assertion still pins what the user is told.
+        assert timeout.value.translation_key == "command_timeout"
+        # No placeholder: the message is fully translated, and embedding
+        # str(exc) is what left English model text in a localized string (#37).
+        assert not timeout.value.translation_placeholders
 
         assert entity.current_cover_position is None
         assert entity.extra_state_attributes["degraded_bridge"] is True
@@ -330,8 +352,14 @@ async def test_publish_failure_preserves_prior_motion_tracking(
         await asyncio.sleep(0.01)
         before = entity.current_cover_position
 
-        with pytest.raises(HomeAssistantError, match="broker down"):
+        with pytest.raises(HomeAssistantError) as publish_failure:
             await entity.async_stop_cover()
+        # An OSError from the broker is a transport failure and says so in its
+        # own message. It deliberately carries NO placeholder: interpolating
+        # str(exc) put untranslated English ("broker down") inside an otherwise
+        # localized string (#37). The detail goes to the log instead.
+        assert publish_failure.value.translation_key == "transport_failed"
+        assert not publish_failure.value.translation_placeholders
 
         assert entity.is_opening
         await asyncio.sleep(0.02)
@@ -340,6 +368,51 @@ async def test_publish_failure_preserves_prior_motion_tracking(
         assert entity.current_cover_position > before
     finally:
         await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_leaf_transmit_marks_position_unknown(hass: HomeAssistant) -> None:
+    """A transmit cancelled after publication invalidates the estimate (#28).
+
+    `CancelledError` derives from `BaseException`, so it used to pass through
+    both of `_async_transmit`'s handlers and unwind without touching the model
+    -- while the published frame reached the air and moved the blind. The cover
+    kept a confident, specific, wrong position. Drives the ENTITY, which the
+    existing hub-lifecycle cancellation tests do not.
+    """
+    hub: ZemismartHub
+    published = asyncio.Event()
+    bodies: list[dict[str, Any]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        if not topic.endswith("/tx"):
+            return
+        # Published -- the frame is on air -- but deliberately never
+        # acknowledged, so the entity is still awaiting `started`.
+        bodies.append(json.loads(payload))
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=5.0))
+    entity._position = 50.0
+    try:
+        closing = asyncio.create_task(entity.async_close_cover())
+        await asyncio.wait_for(published.wait(), timeout=1.0)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        assert entity.current_cover_position is None
+        assert entity.position_confidence == "unknown"
+
+        # A `started` arriving after the cancellation must not resurrect it:
+        # nobody modelled the travel, so there is nothing to resume.
+        acknowledge(hub, "bridge-a", bodies[0])
+        await hass.async_block_till_done()
+        assert entity.current_cover_position is None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -3626,6 +3699,56 @@ async def test_restored_state_from_different_hardware_is_ignored(
 
 
 @pytest.mark.asyncio
+async def test_restored_state_from_the_other_role_is_ignored(
+    hass: HomeAssistant,
+) -> None:
+    """A cover_id that changed role must not inherit the old role's position.
+
+    The sibling half of this guard -- remote and channels -- is pinned by
+    test_restored_state_from_different_hardware_is_ignored. The role half was
+    pinned by nothing: making the comparison always-true left all 860 tests
+    green, because every restore fixture supplies a role that matches by
+    construction.
+
+    It is reachable and it is the worst failure mode this integration has. An
+    aggregate publishes `role` precisely so a restore can discriminate, and the
+    position it publishes is DERIVED from its members. Flip that cover_id to a
+    leaf -- a topology edit in options -- and without this check that
+    member-derived number is reinstated as the new leaf's own dead-reckoned
+    estimate: a confident, specific position for hardware it never measured.
+    """
+    restored_state = State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 70,
+            # Same hardware, so the remote/channels half of the guard passes
+            # and only the role half can reject this.
+            "remote": cover_config().remote_key,
+            "channels": list(cover_config().channels),
+            "role": Role.AGGREGATE.value,
+        },
+    )
+
+    class RestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(online_registry(), publish),
+        cover_type=RestoredCover,
+    )
+    try:
+        assert entity.current_cover_position is None
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
 async def test_full_travel_interrupted_before_completion_keeps_anchor_revocable(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
@@ -4384,7 +4507,13 @@ async def test_aggregate_command_yields_to_press_heard_during_transmit(
 
 @pytest.mark.asyncio
 async def test_aggregate_state_derives_from_members(hass: HomeAssistant) -> None:
-    """Position is the member mean; closed only when every member is closed."""
+    """Position is the member mean; closed only when every member is closed.
+
+    An unknown member takes the whole aggregate position to None (#32): the
+    mean of the remaining members is a confident number describing only part of
+    the hardware. `is_closed` keeps its own, weaker rule -- one member known
+    open is enough to know the group is not closed.
+    """
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -4402,7 +4531,7 @@ async def test_aggregate_state_derives_from_members(hass: HomeAssistant) -> None
         assert aggregate.is_closed is True
 
         leaf_one._position = None
-        assert aggregate.current_cover_position == 0  # only known members average
+        assert aggregate.current_cover_position is None  # one unknown: no honest mean
         assert aggregate.is_closed is None  # none open, one unknown
 
         leaf_two._position = 60.0
@@ -4483,23 +4612,151 @@ async def test_aggregate_set_position_fans_out_with_member_timing(
 
 
 @pytest.mark.asyncio
-async def test_aggregate_set_position_names_failing_members(hass: HomeAssistant) -> None:
-    """A member without a known position fails the call by name; others move."""
+async def test_aggregate_set_position_preflights_before_any_frame(
+    hass: HomeAssistant,
+) -> None:
+    """One unpositionable member aborts the call before ANY frame goes on air.
+
+    The old fan-out transmitted to the healthy members first and only then hit
+    the unknown one, so the service reported failure after half the group had
+    physically moved -- and a retry would then move those members again from
+    their new positions (#32). Asserted on the transmit mock, not just on the
+    exception.
+    """
     hub: ZemismartHub
+    tx_frames: list[str] = []
 
     async def publish(topic: str, payload: str) -> None:
-        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+        body = json.loads(payload)
+        if topic.endswith("/tx"):
+            tx_frames.append(body["raw"])
+        acknowledge(hub, topic.split("/")[1], body)
 
     hub = ZemismartHub(online_registry(), publish)
     leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
     leaf_one._position = 20.0
     leaf_two._position = None  # unknown: set_position must reject this member
     try:
-        with pytest.raises(HomeAssistantError, match="Channel 2"):
+        with pytest.raises(HomeAssistantError) as delegation:
             await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
-        assert leaf_one._motion_target == 60.0  # the healthy member still moved
+        assert tx_frames == []  # nothing reached the air
+        assert leaf_one._motion_target is None  # the healthy member did NOT move
+        assert not leaf_one.is_opening
+        # Preflight refuses BEFORE the fan-out, so this is the unknown-position
+        # rejection, not the post-hoc delegation failure it used to be (#32),
+        # and it is translated rather than raw English (#37).
+        assert delegation.value.translation_key == "member_position_unknown"
+        assert "Channel 2" in (delegation.value.translation_placeholders or {})["members"]
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
+
+
+async def attach_weighted_family(
+    hass: HomeAssistant,
+    hub: ZemismartHub,
+    *,
+    travel: float = 1.0,
+) -> tuple[ZemismartCover, ZemismartCover, cover_module.ZemismartAggregateCover]:
+    """Attach leaves of UNEQUAL channel cardinality ({1,2} and {3}) plus their group."""
+    from custom_components.zemismart_blinds.models import CoverConfig
+    from custom_components.zemismart_blinds.models import Role as _Role
+
+    covers = {
+        "sub-wide": CoverConfig(
+            name="Pair",
+            channels=(1, 2),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-wide",
+        ),
+        "sub-solo": CoverConfig(
+            name="Single",
+            channels=(3,),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-solo",
+        ),
+        "sub-agg": CoverConfig(name="All three", channels=(1, 2, 3), cover_id="sub-agg"),
+    }
+    coordinator = RemoteCoordinator(hass, covers)
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    wide_config = BlindConfig(
+        name="Pair",
+        remote=remote,
+        channels=(1, 2),
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+    solo_config = BlindConfig(
+        name="Single",
+        remote=remote,
+        channels=(3,),
+        travel_up=travel,
+        travel_down=travel,
+        area_id="living_room",
+        repeats=2,
+    )
+    aggregate_config = BlindConfig(
+        name="All three",
+        remote=remote,
+        channels=(1, 2, 3),
+        travel_up=None,
+        travel_down=None,
+        area_id="living_room",
+        repeats=2,
+        role=_Role.AGGREGATE,
+    )
+    wide = ZemismartCover("sub-wide", "remote-entry", wide_config, hub, coordinator)
+    solo = ZemismartCover("sub-solo", "remote-entry", solo_config, hub, coordinator)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg", "remote-entry", aggregate_config, hub, coordinator
+    )
+    for entity, entity_id in (
+        (wide, "cover.pair"),
+        (solo, "cover.single"),
+        (aggregate, "cover.all_three"),
+    ):
+        entity.hass = hass
+        entity.entity_id = entity_id
+        entity.platform = platform_stub()
+        await entity.async_internal_added_to_hass()
+        await entity.async_added_to_hass()
+    return wide, solo, aggregate
+
+
+@pytest.mark.asyncio
+async def test_aggregate_position_weights_members_by_channel_count(
+    hass: HomeAssistant,
+) -> None:
+    """A member is a motor set, not a vote (#32).
+
+    A leaf covering {1,2} and one covering {3} are three motors; the group must
+    report the mean of the MOTORS, not the midpoint of the two leaves.
+    """
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    wide, solo, aggregate = await attach_weighted_family(hass, hub)
+    try:
+        wide._position = 100.0
+        solo._position = 0.0
+        # Unweighted this reads 50; two of the three motors are fully open.
+        assert aggregate.current_cover_position == 67
+
+        wide._position = 0.0
+        solo._position = 100.0
+        assert aggregate.current_cover_position == 33
+
+        # And one unknown member still takes the whole group to None.
+        solo._position = None
+        assert aggregate.current_cover_position is None
+    finally:
+        await detach_family(wide, solo, aggregate)
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -4606,6 +4863,125 @@ async def test_aggregate_open_cancels_inflight_fanout(hass: HomeAssistant) -> No
     finally:
         blocked.set()
         await detach_family(leaf_one, leaf_two, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fanout_marks_every_member_unknown(hass: HomeAssistant) -> None:
+    """Cancelling a fan-out mid-flight invalidates every member it published (#28).
+
+    `_cancel_fanout()` runs from `async_will_remove_from_hass`, so an entry
+    reload or options change during a group position move cancels every
+    member's transmit after its frame is already on air.
+
+    The queue is globally serialized, so exactly one member's frame is
+    published while the other is still queued behind it -- and both go unknown:
+    the entity cannot tell which side of publication its cancellation landed
+    on, and the pessimistic answer is the only safe one.
+    """
+    hub: ZemismartHub
+    published = asyncio.Event()
+    bodies: list[dict[str, Any]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        if not topic.endswith("/tx"):
+            return
+        # On air, never acknowledged: the fan-out is awaiting `started`.
+        bodies.append(json.loads(payload))
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 80.0
+    try:
+        fanout = asyncio.create_task(aggregate.async_set_cover_position(**{ATTR_POSITION: 60}))
+        await asyncio.wait_for(published.wait(), timeout=1.0)
+        aggregate._cancel_fanout()
+        with pytest.raises(asyncio.CancelledError):
+            await fanout
+
+        assert leaf_one.current_cover_position is None
+        assert leaf_two.current_cover_position is None
+        assert aggregate.current_cover_position is None
+
+        for body in bodies:
+            acknowledge(hub, "bridge-a", body)
+        await hass.async_block_till_done()
+        assert aggregate.current_cover_position is None
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_group_frame_marks_every_member_unknown(hass: HomeAssistant) -> None:
+    """A cancelled group frame moved every channel, so every member is unknown (#28).
+
+    The aggregate owns no position model, and the members cannot learn of the
+    loss themselves -- the command was never theirs.
+    """
+    hub: ZemismartHub
+    published = asyncio.Event()
+
+    async def publish(topic: str, _payload: str) -> None:
+        if topic.endswith("/tx"):
+            published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 80.0
+    try:
+        closing = asyncio.create_task(aggregate.async_close_cover())
+        await asyncio.wait_for(published.wait(), timeout=1.0)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        assert leaf_one.current_cover_position is None
+        assert leaf_two.current_cover_position is None
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_fanout_reraises_unexpected_member_exception(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected member exception fails the service call with its traceback (#33).
+
+    `delegate()` catches only `HomeAssistantError` and the gather results were
+    discarded, so a `TypeError` or `AttributeError` in a member's command path
+    produced no traceback, no service failure, and a group where some blinds
+    moved and some did not.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=5.0)
+    leaf_one._position = 20.0
+    leaf_two._position = 80.0
+
+    async def broken_member_command(_target: int) -> None:
+        msg = "member command path is broken"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(leaf_two, "async_set_member_position", broken_member_command)
+    try:
+        with pytest.raises(ValueError, match="member command path is broken") as caught:
+            await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+
+        # Re-raised, not wrapped: the raising frame is still in the traceback.
+        frames = traceback.format_tb(caught.value.__traceback__)
+        assert any("broken_member_command" in frame for frame in frames)
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -4963,8 +5339,41 @@ async def test_reanchor_service_drives_leaf_to_endpoint_from_unknown(
         await asyncio.sleep(0.02 + 0.01 + 0.06)
 
         assert entity.current_cover_position == 0
-        assert entity.position_confidence == "verified"
+        assert entity.position_confidence == "anchored"
         assert entity._suspect is False
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_endpoint_travel_publishes_anchored_not_verified(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The published attribute reads `anchored`; `verified` is gone (#31).
+
+    A completed timer against a hard limit is the strongest claim this
+    integration can make, and it is not motor confirmation -- the vocabulary
+    must not say otherwise. Asserted on the ATTRIBUTE an automation reads, not
+    only on the property behind it.
+    """
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        if topic.endswith("/tx"):
+            acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.02))
+    try:
+        await entity.async_close_cover()
+        await asyncio.sleep(0.02 + 0.01 + 0.06)
+
+        assert entity.extra_state_attributes["position_confidence"] == "anchored"
+        assert cover_module.CONFIDENCE_ANCHORED == "anchored"
+        assert not hasattr(cover_module, "CONFIDENCE_VERIFIED")
     finally:
         await entity.async_will_remove_from_hass()
         hub.close()
@@ -5000,7 +5409,7 @@ async def test_reanchor_on_aggregate_is_one_group_frame(
         assert leaf_one.current_cover_position == 100
         assert leaf_two.current_cover_position == 100
         assert aggregate.current_cover_position == 100
-        assert aggregate.position_confidence == "verified"
+        assert aggregate.position_confidence == "anchored"
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
         hub.close()
@@ -5155,14 +5564,14 @@ async def test_suspect_survives_a_restart(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.asyncio
-async def test_downtime_completion_earns_no_verified_and_keeps_suspect(
+async def test_downtime_completion_earns_no_anchor_and_keeps_suspect(
     hass: HomeAssistant,
 ) -> None:
     """A travel that finished while HA was down settles nothing (review).
 
     Nobody was listening while it ran: any press in that gap, real or phantom,
     was invisible. The position lands on the target -- that part is unchanged
-    -- but it must not earn `verified`, and a restored suspect must stay.
+    -- but it must not earn `anchored`, and a restored suspect must stay.
     """
 
     async def quiet_publish(_topic: str, _payload: str) -> None:
@@ -5200,8 +5609,8 @@ async def test_downtime_completion_earns_no_verified_and_keeps_suspect(
     try:
         # Position completes to the target as before...
         assert entity.current_cover_position == 0
-        # ...but an unobserved completion earns no verified and keeps the doubt.
-        assert entity._position_verified is False
+        # ...but an unobserved completion earns no anchor and keeps the doubt.
+        assert entity._position_anchored is False
         assert entity._suspect is True
         assert entity.position_confidence == "suspect"
     finally:
@@ -5210,13 +5619,13 @@ async def test_downtime_completion_earns_no_verified_and_keeps_suspect(
 
 
 @pytest.mark.asyncio
-async def test_verified_deliberately_does_not_survive_a_restart(
+async def test_anchored_deliberately_does_not_survive_a_restart(
     hass: HomeAssistant,
 ) -> None:
-    """A restart downgrades verified to assumed, by design (review).
+    """A restart downgrades anchored to assumed, by design (review).
 
     During HA's downtime no RX listener runs, so a physical press in that gap
-    is invisible -- restoring `verified` verbatim would overclaim across
+    is invisible -- restoring `anchored` verbatim would overclaim across
     exactly the window in which the integration was blind. A cover re-earns it
     with its next observed completed travel.
     """
@@ -5234,7 +5643,7 @@ async def test_verified_deliberately_does_not_survive_a_restart(
             "channels": list(config.channels),
             "role": config.role.value,
             "motion_direction": 0,
-            "position_confidence": "verified",
+            "position_confidence": "anchored",
             "position_suspect": False,
         },
     )
@@ -5278,7 +5687,7 @@ async def test_suspect_cleared_by_a_completed_endpoint_travel(
 
         assert entity.current_cover_position == 0
         assert entity._suspect is False
-        assert entity.position_confidence == "verified"
+        assert entity.position_confidence == "anchored"
     finally:
         await entity.async_will_remove_from_hass()
         hub.close()
@@ -5288,12 +5697,16 @@ async def test_suspect_cleared_by_a_completed_endpoint_travel(
 async def test_aggregate_confidence_is_the_worst_of_its_members(
     hass: HomeAssistant,
 ) -> None:
-    """Aggregate confidence derives from members: suspect > assumed > verified.
+    """Aggregate confidence takes the worst member value: suspect > unknown > assumed > anchored.
 
-    An unknown member cannot vote on which known value wins, but it caps the
-    group at `assumed` -- reporting verified over a broken sibling would hide
-    exactly the member an automation gating on this attribute needs to fix
-    (review finding). Only an all-unknown group is itself unknown.
+    One rule throughout: no position means `unknown`, so any member without one
+    makes the GROUP unknown. It used to cap at `assumed` instead, which was
+    right while the group position was the mean of the members that HAD one --
+    but once a single unknown member began withholding the whole position (#32),
+    `assumed` was claiming an estimate that no longer existed.
+
+    `suspect` still outranks unknown: a blind frozen by a STOP nobody could
+    corroborate says more about the group than a sibling merely being blank.
     """
 
     async def quiet_publish(_topic: str, _payload: str) -> None:
@@ -5302,29 +5715,39 @@ async def test_aggregate_confidence_is_the_worst_of_its_members(
     hub = ZemismartHub(online_registry(), quiet_publish)
     leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=1.0)
     try:
-        # All members verified -> verified.
-        leaf_one._position, leaf_one._position_verified = 0.0, True
-        leaf_two._position, leaf_two._position_verified = 0.0, True
-        assert aggregate.position_confidence == "verified"
+        # All members anchored -> anchored.
+        leaf_one._position, leaf_one._position_anchored = 0.0, True
+        leaf_two._position, leaf_two._position_anchored = 0.0, True
+        assert aggregate.position_confidence == "anchored"
 
         # One merely assumed drags it down to assumed.
-        leaf_two._position_verified, leaf_two._position = False, 50.0
+        leaf_two._position_anchored, leaf_two._position = False, 50.0
         assert aggregate.position_confidence == "assumed"
 
         # Suspect outranks assumed even when BOTH are present at once: leaf_one
         # is assumed, leaf_two suspect, and suspect must win (order matters).
-        leaf_one._position_verified, leaf_one._position = False, 20.0
+        leaf_one._position_anchored, leaf_one._position = False, 20.0
         leaf_two._suspect = True
         assert aggregate.position_confidence == "suspect"
 
-        # An unknown member caps the group at assumed: it cannot vote on the
-        # known values, but verified over a broken sibling would overclaim.
-        leaf_one._position, leaf_one._position_verified = 0.0, True
+        # An unknown member makes the GROUP unknown, not merely assumed. It used
+        # to cap at assumed, which was right while the position was the mean of
+        # the members that had one -- but #32 made a single unknown member
+        # withhold the whole position, so `assumed` began claiming an estimate
+        # that no longer existed.
+        leaf_one._position, leaf_one._position_anchored = 0.0, True
         leaf_two._position, leaf_two._suspect = None, False
         assert leaf_two.position_confidence == "unknown"
-        assert aggregate.position_confidence == "assumed"
+        assert aggregate.current_cover_position is None
+        assert aggregate.position_confidence == "unknown"
 
-        # No member has a position -> the aggregate is itself unknown.
+        # Suspect still outranks it: a member frozen by an uncorroborated heard
+        # STOP says more about the group than a sibling merely being blank.
+        leaf_one._suspect = True
+        assert aggregate.position_confidence == "suspect"
+        leaf_one._suspect = False
+
+        # No member has a position -> still unknown.
         leaf_one._position = None
         assert aggregate.position_confidence == "unknown"
     finally:
@@ -5435,3 +5858,1244 @@ async def test_reanchor_entity_service_registers_on_the_platform(
         hub.close()
 
     assert ("reanchor", "async_reanchor") in registered
+
+
+@pytest.mark.asyncio
+async def test_platform_setup_adds_every_entity_in_one_batch(
+    hass: HomeAssistant,
+) -> None:
+    """All of a remote's covers reach HA through a single add call.
+
+    One call per cover schedules one add pass per cover; a sixteen-cover remote
+    paid sixteen of them at every reload.
+    """
+    from homeassistant.helpers import entity_platform
+
+    added: list[list[object]] = []
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    runtime = RemoteRuntime(
+        remote=RemoteConfig(
+            name="Remote",
+            remote=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES),
+            area_id="living_room",
+            repeats=2,
+            cover_rows=(
+                {
+                    "cover_id": "sub-1",
+                    "name": "Channel 1",
+                    "channels": [1],
+                    "travel_up": 4.0,
+                    "travel_down": 4.0,
+                },
+                {
+                    "cover_id": "sub-2",
+                    "name": "Channel 2",
+                    "channels": [2],
+                    "travel_up": 4.0,
+                    "travel_down": 4.0,
+                },
+                {"cover_id": "sub-agg", "name": "Both", "channels": [1, 2]},
+            ),
+        ),
+        hub=hub,
+    )
+    entry = cast(
+        "Any",
+        SimpleNamespace(
+            runtime_data=runtime,
+            entry_id="entry-1",
+            async_on_unload=lambda _cb: None,
+        ),
+    )
+
+    def record_add(
+        entities: Iterable[Any],
+        update_before_add: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        del update_before_add, kwargs
+        added.append(list(entities))
+
+    token = entity_platform.current_platform.set(None)
+    try:
+        await cover_module.async_setup_entry(
+            hass,
+            entry,
+            cast("AddConfigEntryEntitiesCallback", record_add),
+        )
+    finally:
+        entity_platform.current_platform.reset(token)
+        hub.close()
+
+    assert len(added) == 1
+    assert len(added[0]) == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_add_releases_every_registration(hass: HomeAssistant) -> None:
+    """A restore that raises leaves nothing registered on the hub.
+
+    HA logs an entity-add failure without calling
+    async_will_remove_from_hass(), so registrations acquired before the restore
+    await used to stay on the hub for the lifetime of the entry.
+    """
+
+    class ExplodingCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            msg = "restore store unavailable"
+            raise RuntimeError(msg)
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    config = cover_config()
+    coordinator = RemoteCoordinator(
+        hass,
+        {"sub-1": models_module.CoverConfig(name="Channel 1", channels=(1,), cover_id="sub-1")},
+    )
+    entity = ExplodingCover("sub-1", "remote-entry", config, hub, coordinator)
+    entity.hass = hass
+    entity.entity_id = "cover.living_room_left"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+
+    try:
+        with pytest.raises(RuntimeError, match="restore store unavailable"):
+            await entity.async_added_to_hass()
+        # Exactly what EntityPlatform does when add_to_platform_finish raises.
+        entity.add_to_platform_abort()
+
+        assert hub.displaced_listeners == []
+        assert hub.emission_proof_listeners == []
+        assert hub.bridge_listeners == []
+        assert hub._rx_listeners == []
+        assert coordinator._leaf_entities == {}
+        assert coordinator._entity_cover_ids == {}
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_aggregate_add_releases_every_registration(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aggregate whose add fails leaves no RX listener or coordinator row."""
+    from homeassistant.components import mqtt
+
+    def exploding_subscribe(_hass: HomeAssistant, _callback: Any) -> Callable[[], None]:
+        msg = "mqtt dispatcher unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        mqtt,
+        "async_subscribe_connection_status",
+        exploding_subscribe,
+        raising=False,
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _leaf_one, _leaf_two, aggregate_config = aggregate_family(hass, hub)
+    entity = cover_module.ZemismartAggregateCover(
+        "sub-agg",
+        "remote-entry",
+        aggregate_config,
+        hub,
+        coordinator,
+    )
+    entity.hass = hass
+    entity.entity_id = "cover.living_room_group"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+
+    try:
+        with pytest.raises(RuntimeError, match="mqtt dispatcher unavailable"):
+            await entity.async_added_to_hass()
+        entity.add_to_platform_abort()
+
+        assert hub._rx_listeners == []
+        assert coordinator._aggregate_entities == {}
+    finally:
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_only_subscribes_to_its_own_leaf_entities(
+    hass: HomeAssistant,
+) -> None:
+    """Unrelated state changes never reach the coordinator.
+
+    One unfiltered EVENT_STATE_CHANGED listener per config entry meant every
+    state change anywhere in the instance was dispatched into every
+    coordinator; the subscription now names the registered leaf entity ids.
+    """
+    delivered: list[str] = []
+
+    class RecordingCoordinator(RemoteCoordinator):
+        def _on_state_changed(self, event: Any) -> None:
+            delivered.append(event.data["entity_id"])
+            super()._on_state_changed(event)
+
+    coordinator = RecordingCoordinator(
+        hass,
+        {
+            "sub-1": models_module.CoverConfig(name="Channel 1", channels=(1,), cover_id="sub-1"),
+            "sub-2": models_module.CoverConfig(name="Channel 2", channels=(2,), cover_id="sub-2"),
+            "sub-agg": models_module.CoverConfig(name="Both", channels=(1, 2), cover_id="sub-agg"),
+        },
+    )
+    seen: list[str] = []
+
+    class RecordingAggregate:
+        def async_write_ha_state(self) -> None:
+            seen.append("flush")
+
+    leaf = cast(
+        "Any",
+        SimpleNamespace(entity_id="cover.leaf_one", async_write_ha_state=lambda: None),
+    )
+    coordinator.register_aggregate("sub-agg", cast("Any", RecordingAggregate()))
+
+    try:
+        # No leaf registered yet: nothing to listen to, so nothing is installed.
+        assert coordinator._unsub_state_changed is None
+
+        coordinator.register_leaf("sub-1", leaf)
+        assert coordinator._unsub_state_changed is not None
+        # Registration itself marks the container dirty; let that flush land
+        # before measuring what the subscription delivers.
+        await hass.async_block_till_done()
+        seen.clear()
+        delivered.clear()
+
+        hass.states.async_set("light.unrelated", "on")
+        await hass.async_block_till_done()
+        # Not merely filtered out in Python: never dispatched here at all.
+        assert delivered == []
+        assert seen == []
+
+        hass.states.async_set("cover.leaf_one", "open")
+        await hass.async_block_till_done()
+        assert delivered == ["cover.leaf_one"]
+        assert seen == ["flush"]
+
+        # Unregistering the last leaf drops the subscription entirely.
+        coordinator.unregister_leaf("sub-1")
+        assert coordinator._unsub_state_changed is None
+        # Unregistration re-derives the container too; flush that first.
+        await hass.async_block_till_done()
+        seen.clear()
+        hass.states.async_set("cover.leaf_one", "closed")
+        await hass.async_block_till_done()
+        assert seen == []
+    finally:
+        coordinator.detach()
+
+
+@pytest.mark.asyncio
+async def test_motion_internals_are_excluded_from_the_recorder(hass: HomeAssistant) -> None:
+    """Motion/anchor internals are unrecorded but stay in the state machine.
+
+    Restore reads the state machine, not the recorder, so excluding them costs
+    nothing at restart while dropping twelve of seventeen attributes from every
+    travel-rate history row.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub)
+    # attach_cover stops short of the platform's own add bookkeeping, and HA
+    # drops state writes from an entity that is not ADDED.
+    try:
+        entity._position = 40.0
+        entity.async_write_ha_state()
+        state = hass.states.get("cover.living_room_left")
+        assert state is not None
+        assert state.state_info is not None
+        unrecorded = state.state_info["unrecorded_attributes"]
+
+        assert unrecorded == {
+            "motion_started",
+            "motion_deadline",
+            "motion_start_position",
+            "motion_bridge",
+            "motion_command_id",
+            "motion_timed",
+            "motion_absolute_anchor",
+            "motion_direction",
+            "motion_target",
+            "unverified_anchor_bridge",
+            "unverified_anchor_command_id",
+            "unverified_anchor_offline",
+        }
+        # The signals a user or an automation looks back at stay recorded.
+        assert unrecorded.isdisjoint(
+            {
+                "channels",
+                "remote",
+                "role",
+                "position_confidence",
+                "last_bridge",
+                "degraded_bridge",
+                "position_suspect",
+            }
+        )
+        # Excluded from history only: restore still sees every one of them.
+        assert set(state.attributes) >= unrecorded
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_intermediate_progress_writes_are_throttled(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A travel integrates at 0.25 s but reaches the state machine at ~1 s.
+
+    The tick rate is what makes the position smooth; the recorder gained
+    nothing from 4 Hz history of a dead-reckoned estimate (~120 rows of 17
+    attributes per 30 s travel, per cover).
+    """
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+        await real_sleep(0)
+
+    # cover.py calls asyncio.sleep through the module, so patching it here is
+    # what the travel loop actually sees.
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    ticks: list[float] = []
+    writes: list[float] = []
+
+    original_sync = entity._sync_position
+
+    def counting_sync(at: float | None = None) -> None:
+        ticks.append(clock["now"])
+        original_sync(at)
+
+    monkeypatch.setattr(entity, "_sync_position", counting_sync)
+
+    unsub = async_track_state_change_event(
+        hass,
+        ["cover.living_room_left"],
+        lambda _event: writes.append(clock["now"]),
+    )
+    try:
+        entity._position = 0.0
+        entity._direction = 1
+        entity._motion_started = clock["now"]
+        entity._motion_start_position = 0.0
+        entity._motion_target = 100.0
+        entity._motion_duration = 10.0
+        entity._motion_deadline = clock["now"] + 10.0
+        entity._create_motion_task("throttle test")
+        task = entity._motion_task
+        assert task is not None
+        await task
+
+        # 10 s of travel at the 0.25 s integration interval.
+        assert len(ticks) == 40
+        # ~1 write/second of travel plus the completion write, not 41.
+        assert 10 <= len(writes) <= 12
+        assert entity.current_cover_position == 100
+
+        # The count alone does NOT pin the completion write: ten throttled
+        # progress writes already satisfy the range above, so deleting the
+        # settle write left this green while HA stayed stuck on `opening` for
+        # good. Assert the FINAL state separately -- that is the one write whose
+        # absence a user actually sees.
+        final = hass.states.get("cover.living_room_left")
+        assert final is not None
+        assert final.state == "open"
+        assert final.attributes["current_position"] == 100
+        assert final.attributes["motion_direction"] == 0
+        assert final.attributes["motion_target"] is None
+        assert final.attributes["motion_deadline"] is None
+    finally:
+        unsub()
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_programmer_defect_in_the_command_path_keeps_its_traceback(
+    hass: HomeAssistant,
+) -> None:
+    """A TypeError is not a bridge failure and must not be reported as one.
+
+    `except Exception` turned every defect into a bland service failure with no
+    traceback and a `degraded` flag misattributing the cause to the bridge.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        # Stands in for a defect anywhere below the transmit call.
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub)
+    try:
+        with pytest.raises(TypeError):
+            await entity.async_open_cover()
+
+        assert entity.extra_state_attributes["degraded_bridge"] is False
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_position_partial_move_is_a_validation_error(
+    hass: HomeAssistant,
+) -> None:
+    """Asking for a partial move with no estimate is bad input, not a failure."""
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub)
+    try:
+        entity._position = None
+        with pytest.raises(ServiceValidationError) as unknown:
+            await entity.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert unknown.value.translation_key == "position_unknown"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_with_an_unrepresented_channel_reports_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """A group whose members do not cover all its channels has no position.
+
+    The laminar topology permits it: `members_of` returns the live configured
+    leaves strictly inside the aggregate, and nothing requires their union to
+    equal the aggregate's own channels. `async_setup_entry` also skips any cover
+    whose config fails to derive, so a member can go missing at runtime.
+
+    Before #32 the group averaged the members it had and published a confident
+    number -- possibly `anchored` -- for hardware it had no model of.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    # Leaves {1,2} and {3} under a group of {1,2,3,4}: channel 4 has no model.
+    wide, solo, aggregate = await attach_weighted_family(hass, hub)
+    aggregate._config = replace(aggregate._config, channels=(1, 2, 3, 4))
+    try:
+        wide._position = 50.0
+        solo._position = 50.0
+        wide.async_write_ha_state()
+        solo.async_write_ha_state()
+        await hass.async_block_till_done()
+
+        assert aggregate.current_cover_position is None
+        # `unknown`, not merely "not anchored": there is no position at all in
+        # this state, and an automation gating on `!= 'unknown'` must not be
+        # told otherwise.
+        assert aggregate.position_confidence == "unknown"
+
+        with pytest.raises(HomeAssistantError) as incomplete:
+            await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert incomplete.value.translation_key == "aggregate_incomplete"
+        assert "4" in (incomplete.value.translation_placeholders or {})["missing"]
+        # and the members it DID have were not moved
+        assert wide._motion_target is None
+        assert solo._motion_target is None
+    finally:
+        await detach_family(wide, solo, aggregate)
+
+
+@pytest.mark.asyncio
+async def test_programmer_defect_in_an_aggregate_command_keeps_its_traceback(
+    hass: HomeAssistant,
+) -> None:
+    """The aggregate's transmit must not launder a defect either.
+
+    The leaf-side version of this test left the aggregate's own handler
+    unpinned: reverting `ZemismartAggregateCover._async_transmit` to
+    `except Exception` kept the suite green, so the narrowing there was
+    protected by nothing (#37).
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        # Stands in for a defect anywhere below the transmit call.
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        with pytest.raises(TypeError):
+            await aggregate.async_open_cover()
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_timeout_invalidates_every_member(hass: HomeAssistant) -> None:
+    """A group command that never reports `started` leaves no confident member.
+
+    The leaf invalidates itself on a timeout; the aggregate has to do it for its
+    members, because the command was never any member's own. Without it
+    `_async_move_full` never starts member tracking, `async_stop_cover` never
+    freezes it, and members keep integrating -- possibly through a STOP that did
+    fire -- while still reporting `anchored`.
+    """
+
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        # ACCEPTED but never started: this is the CommandStartedTimeoutError
+        # path specifically. Acknowledging neither only ever reaches
+        # CommandAckTimeoutError, so removing StartedTimeout from the handler
+        # would have left this test green.
+        body = json.loads(payload)
+        hub.handle_status(
+            topic.split("/")[1],
+            {"status": "accepted", "command_id": body["command_id"]},
+        )
+
+    hub = ZemismartHub(online_registry(), publish, ack_timeout=0.5, started_timeout=0.01)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        leaf_one._position = 40.0
+        leaf_one._position_anchored = True
+        leaf_two._position = 40.0
+        leaf_two._position_anchored = True
+
+        with pytest.raises(HomeAssistantError) as timeout:
+            await aggregate.async_open_cover()
+        assert timeout.value.translation_key == "command_timeout"
+        assert not timeout.value.translation_placeholders
+
+        for member in (leaf_one, leaf_two):
+            assert member.current_cover_position is None
+            assert member.position_confidence == "unknown"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_aggregate_is_never_reported_closed(hass: HomeAssistant) -> None:
+    """`closed` is the entity's PRIMARY state and needs full channel coverage.
+
+    position and confidence already refuse an incomplete group, but `is_closed`
+    did not -- so an aggregate over {1,2,3,4} whose live members cover {1,2,3}
+    published itself to HA as `closed` with channel 4 entirely unmodelled. The
+    other incomplete-group test uses mid-travel positions and never reaches this
+    state.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    wide, solo, aggregate = await attach_weighted_family(hass, hub)
+    aggregate._config = replace(aggregate._config, channels=(1, 2, 3, 4))
+    try:
+        wide._position = 0.0
+        solo._position = 0.0
+        assert wide.is_closed is True
+        assert solo.is_closed is True
+
+        assert aggregate.is_closed is None, "an unmodelled channel cannot be called closed"
+
+        # One member open still makes the GROUP open, coverage or not: that
+        # answer does not depend on the channels we have no model for.
+        solo._position = 60.0
+        assert aggregate.is_closed is False
+    finally:
+        await detach_family(wide, solo, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_full_surfaces_as_a_translated_error(hass: HomeAssistant) -> None:
+    """The outstanding-work cap must not leak a raw RuntimeError to the user.
+
+    `CommandQueueFullError` derives from RuntimeError, and the cover boundaries
+    listed only the other defined transport failures -- so once the cap was
+    reached the next movement surfaced an untranslated traceback rather than a
+    service error, despite the exception's own docstring claiming otherwise
+    (#34).
+    """
+    from custom_components.zemismart_blinds import models as models_module
+
+    async def publish(_topic: str, _payload: str) -> None:
+        # Never acknowledged: everything stays outstanding.
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub)
+    raw = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (7,), "UP", bases=TEST_ACTION_BASES))
+    floods = [
+        asyncio.create_task(hub.async_send_raw("bridge-a", raw, 1))
+        for _ in range(models_module._MAX_OUTSTANDING_COMMANDS)
+    ]
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        with pytest.raises(HomeAssistantError) as full:
+            await entity.async_open_cover()
+        assert not isinstance(full.value, asyncio.CancelledError)
+        assert full.value.translation_key == "queue_full"
+        assert entity.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        for task in floods:
+            task.cancel()
+        await asyncio.gather(*floods, return_exceptions=True)
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_full_is_translated_at_the_aggregate_boundary_too(
+    hass: HomeAssistant,
+) -> None:
+    """Both cover boundaries translate the cap error, not just the leaf.
+
+    The leaf-only version left the aggregate's tuple unpinned: removing
+    CommandQueueFullError from it kept the suite green while a saturated queue
+    surfaced a raw RuntimeError from any group command (#34).
+    """
+    from custom_components.zemismart_blinds import models as models_module
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    raw = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (7,), "UP", bases=TEST_ACTION_BASES))
+    floods = [
+        asyncio.create_task(hub.async_send_raw("bridge-a", raw, 1))
+        for _ in range(models_module._MAX_OUTSTANDING_COMMANDS)
+    ]
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        with pytest.raises(HomeAssistantError) as full:
+            await aggregate.async_open_cover()
+        assert full.value.translation_key == "queue_full"
+    finally:
+        for task in floods:
+            task.cancel()
+        await asyncio.gather(*floods, return_exceptions=True)
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_no_online_bridge_is_translated_at_both_boundaries(
+    hass: HomeAssistant,
+) -> None:
+    """Losing every bridge must surface a translated error, not a RuntimeError.
+
+    `queue_full` was pinned at both boundaries but the other four defined
+    transport failures were not, and two of them were pinned NOWHERE: deleting
+    `NoOnlineBridgeError` and `CommandRejectedError` from the caught set left
+    the whole suite green while a remote with no reachable bridge raised a raw
+    RuntimeError straight through the service layer.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        raise AssertionError("nothing may be published without an online bridge")
+
+    # Same-area bridge that has gone offline: the registry knows it, so this is
+    # the real deployment shape (a bridge that dropped) rather than an empty
+    # registry that never had one.
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_availability("bridge-a", "offline")
+
+    hub = ZemismartHub(registry, publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        with pytest.raises(HomeAssistantError) as leaf_failure:
+            await leaf_one.async_open_cover()
+        assert leaf_failure.value.translation_key == "no_bridge_online"
+        assert leaf_one.extra_state_attributes["degraded_bridge"] is True
+
+        with pytest.raises(HomeAssistantError) as aggregate_failure:
+            await aggregate.async_open_cover()
+        assert aggregate_failure.value.translation_key == "no_bridge_online"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", list(cover_module._TRANSPORT_FAILURE_KEYS))
+async def test_every_defined_transport_failure_is_translated_at_both_boundaries(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    """Every type in the mapping must be caught and translated by BOTH covers.
+
+    Parametrized over the mapping itself, so a type added there is pinned the
+    moment it is added rather than whenever someone remembers to write a test.
+
+    This drives the failure in through the hub rather than through a real
+    broker, which is deliberately weaker than the neighbouring tests that lose
+    a bridge or take a NACK for real -- those stay. What this one adds is
+    TOTALITY, and totality is what was missing: dropping ValueError from the
+    caught set left all 853 tests green.
+
+    ValueError has no KNOWN route from a cover command today -- async_transmit
+    rejects a non-positive stop_after_ms, but the cover clamps it to at least 1
+    before calling (an earlier version of this docstring claimed that route was
+    live; it is not). It stays pinned anyway, because the mapping is what both
+    boundaries derive their caught set from: an entry that is mapped but
+    untested is one refactor away from being mapped but uncaught, and the
+    failure would be a raw RuntimeError reaching a user through the service
+    layer.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    async def failing_transmit(*_args: Any, **_kwargs: Any) -> None:
+        raise failure_type("synthetic transport failure")
+
+    expected = cover_module._TRANSPORT_FAILURE_KEYS[failure_type]
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    monkeypatch.setattr(hub, "async_transmit", failing_transmit)
+    try:
+        for entity in (leaf_one, aggregate):
+            with pytest.raises(HomeAssistantError) as failure:
+                await entity.async_open_cover()
+            assert failure.value.translation_key == expected, (
+                f"{type(entity).__name__} did not translate {failure_type.__name__}"
+            )
+        # Uniform across all five at the leaf, because they share one handler:
+        # every defined transport failure also means the bridge is degraded.
+        # The aggregate owns no such flag -- its members carry the state.
+        assert leaf_one.extra_state_attributes["degraded_bridge"] is True
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejection_is_translated_at_both_boundaries(
+    hass: HomeAssistant,
+) -> None:
+    """A bridge NACK must reach the user as its own translated message.
+
+    The other half of the gap above: `CommandRejectedError` was caught by both
+    transmit paths but asserted by neither, so the rejection path could stop
+    being translated without a single test noticing.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        assert hub.handle_status(
+            topic.split("/")[1],
+            {
+                "status": "rejected",
+                "command_id": body["command_id"],
+                "reason": "unsupported frame",
+            },
+        )
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        with pytest.raises(HomeAssistantError) as leaf_failure:
+            await leaf_one.async_open_cover()
+        assert leaf_failure.value.translation_key == "command_rejected"
+        assert leaf_one.extra_state_attributes["degraded_bridge"] is True
+
+        with pytest.raises(HomeAssistantError) as aggregate_failure:
+            await aggregate.async_open_cover()
+        assert aggregate_failure.value.translation_key == "command_rejected"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_survives_a_restore_still_in_flight(hass: HomeAssistant) -> None:
+    """A pending restore must not put a confident position back over a cancel.
+
+    This is the exact round-one defect the `_restore_epoch` bumps were added
+    for, and none of the existing cancellation tests could see it: they all
+    await fully completed attachment, so the restore has already run and there
+    is nothing left to race. Deleting both `_restore_epoch += 1` statements left
+    every one of them green.
+
+    Leaves register their listeners BEFORE awaiting restored state, so a command
+    can be issued, published and cancelled while `_async_restore_state` is still
+    suspended -- and when it resumes, its guard compares the epoch it captured
+    on entry.
+    """
+    release = asyncio.Event()
+    restored = State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 70,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [1, 2],
+            "role": "leaf",
+        },
+    )
+
+    class SlowRestoreCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            await release.wait()
+            return restored
+
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        # Published, never acknowledged: the caller is cancelled mid-lifecycle,
+        # which is exactly when the frame may already be on air.
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = SlowRestoreCover("cover-slow", "entry-slow", cover_config(), hub)
+    entity.hass = hass
+    entity.entity_id = "cover.living_room_left"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+    adding = hass.async_create_task(entity.async_added_to_hass())
+    try:
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not adding.done(), "the restore must still be suspended"
+
+        # A REAL command, published and then cancelled, while the restore is
+        # still suspended. Calling invalidate_for_cancelled_command() directly
+        # would pin only the helper's own bump and leave the leaf's
+        # CancelledError handler unpinned.
+        moving = hass.async_create_task(entity.async_open_cover())
+        await published.wait()
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+        assert entity.current_cover_position is None
+
+        release.set()
+        await adding
+        await hass.async_block_till_done()
+
+        assert entity.current_cover_position is None, (
+            "the pending restore overwrote an invalidation it is older than"
+        )
+        assert entity.position_confidence == "unknown"
+    finally:
+        release.set()
+        with suppress(Exception):
+            await adding
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_survives_a_members_pending_restore(
+    hass: HomeAssistant,
+) -> None:
+    """The helper's own epoch bump is pinned, not just the leaf handler's.
+
+    Rewriting the leaf race test to drive a real cancelled command pinned
+    `cover.py`'s CancelledError bump but removed the only exercise of
+    `invalidate_for_cancelled_command()`, unpinning the bump inside it -- a gap
+    opened by closing another one.
+
+    The aggregate is the caller that matters here: its frame addresses the whole
+    channel set, so a member that never issued the command is invalidated
+    through the helper, and a member whose restore is still suspended would
+    otherwise put its cached confident position straight back.
+    """
+    release = asyncio.Event()
+    published = asyncio.Event()
+    restored = State(
+        "cover.member_slow",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 80,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [1],
+            "role": "leaf",
+        },
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        # leaf_one's restore is still in flight when the group frame is cancelled.
+        leaf_one._restore_epoch = 0
+        guard = (leaf_one._intent_generation, leaf_one._restore_epoch)
+        pending = hass.async_create_task(leaf_one._async_restore_state(guard))
+
+        async def slow_last_state() -> State:
+            await release.wait()
+            return restored
+
+        leaf_one.async_get_last_state = slow_last_state  # type: ignore[method-assign]
+        pending.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending
+        pending = hass.async_create_task(leaf_one._async_restore_state(guard))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert leaf_one.current_cover_position is None
+
+        release.set()
+        await pending
+        await hass.async_block_till_done()
+
+        assert leaf_one.current_cover_position is None, (
+            "a member's pending restore overwrote an invalidation it is older than"
+        )
+    finally:
+        release.set()
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_cover_registration_supplies_bases_to_the_hub(hass: HomeAssistant) -> None:
+    """The bases reach the hub through cover.py's OWN registration call.
+
+    The RX regressions in test_models.py call `register_rx_listener(bases=...)`
+    by hand, so deleting `bases=self._config.remote.bases` from both cover
+    registration sites left the whole suite green -- inert production wiring
+    behind a passing test, which is the exact defect class this round began with
+    (#30).
+    """
+    from tests.synthetic import UNTABLED_BASES, UNTABLED_PREFIX, UNTABLED_REMOTE_ID
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    config = replace(
+        cover_config(),
+        remote=RemoteIdentity(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, UNTABLED_BASES),
+        channels=(1,),
+    )
+    entity = await attach_cover(hass, hub, config=config)
+    entity._position = 50.0
+    try:
+        frame = encode_b0(
+            make_payload(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1,), "UP", bases=UNTABLED_BASES)
+        )
+        hub.handle_rx("bridge-a", {"frame": frame, "t": 1_000, "boot": 7})
+
+        # Observed through the entity's own model, not a patched callback: the
+        # listener the hub holds was bound at registration, so replacing the
+        # method afterwards would test nothing. Dispatch is synchronous all the
+        # way from handle_rx into _start_heard_motion, so no waiting is needed
+        # -- and waiting would only run the travel to completion.
+        assert entity.is_opening, (
+            "an untabled remote's press only classifies if the entity handed its bases over"
+        )
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_still_invalidates_after_a_heard_stop_with_no_motion(
+    hass: HomeAssistant,
+) -> None:
+    """A STOP that stopped nothing does not earn the position it leaves behind.
+
+    The companion test covers a heard DOWN, which installs a replacement model
+    and rightly survives the cancellation. A heard STOP arriving before the
+    command's result has committed any motion is different: `_apply_stop` finds
+    nothing tracked and simply preserves the OLD estimate, which predates the
+    frame we already published. The blind may have moved.
+
+    Keying the skip on `_intent_generation` -- which every intersecting press
+    bumps, usable model or not -- stranded exactly that unearned position.
+    """
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    entity._position = 50.0
+    try:
+        moving = hass.async_create_task(entity.async_open_cover())
+        await published.wait()
+        assert entity._direction == 0, "no motion is tracked yet: the ack has not landed"
+
+        entity._on_heard_press(
+            HeardEvent(
+                button="STOP",
+                chans=frozenset(entity._config.channels),
+                remote_key=entity._config.remote_key,
+                heard_at=cover_module.WALL_CLOCK(),
+                bridge_id="bridge-a",
+            )
+        )
+        assert entity.current_cover_position == 50, "the STOP left the old estimate in place"
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert entity.current_cover_position is None, (
+            "a STOP that stopped nothing cannot save a position from invalidation"
+        )
+        assert entity.position_confidence == "unknown"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_invalidates_even_when_a_press_was_heard(
+    hass: HomeAssistant,
+) -> None:
+    """Cancellation after publication is unknown, press or no press.
+
+    Two rejected attempts are pinned here, because the tempting behaviour is
+    wrong in a way that only shows up on the RF timeline.
+
+    Cancellation invalidates after ANY intervening press. Sparing a cover whose
+    model a press has just replaced looks right -- the press seems newer than the
+    cancelled command -- but it is not, because cancellation says nothing about
+    RF ORDERING. The hub deliberately keeps an
+    already-published command alive after its caller is cancelled, so the bridge
+    may first-dispatch it AFTER the press was heard -- with no cover task left to
+    observe the result. The blind then moves under a command nobody is tracking
+    while the cover confidently reports what the press installed.
+
+    Waiting on the publisher, as this test does, is entry to the MQTT publish --
+    NOT the `started` status that is this project's proof of first dispatch. No
+    generation or revision counter available here can express the ordering that
+    would make preservation safe.
+    """
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
+    entity._position = 50.0
+    try:
+        moving = hass.async_create_task(entity.async_open_cover())
+        await published.wait()
+
+        entity._on_heard_press(
+            HeardEvent(
+                button="DOWN",
+                chans=frozenset(entity._config.channels),
+                remote_key=entity._config.remote_key,
+                heard_at=cover_module.WALL_CLOCK(),
+                bridge_id="bridge-a",
+            )
+        )
+        assert entity.is_closing, "the press installed a model of its own"
+        # ...which is nonetheless discarded below. There is no "the press wins"
+        # case: see the companion STOP test for the other half of the rule.
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert entity.current_cover_position is None, (
+            "the published UP may still dispatch after the press; only unknown is honest"
+        )
+        assert entity.position_confidence == "unknown"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_invalidates_a_member_that_joined_late(
+    hass: HomeAssistant,
+) -> None:
+    """A member registered DURING the group transmit is invalidated too.
+
+    Snapshotting members before the await missed them. A leaf registers with the
+    coordinator before awaiting its restore, and entities are added in stored
+    order -- so an automation can drive an already-added aggregate while a later
+    leaf is still registering. The group frame addresses that leaf's channel, so
+    leaving it out of the invalidation lets its pending restore publish a stale
+    specific position for hardware the frame just moved.
+    """
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        leaf_one._position = 40.0
+        leaf_two._position = 40.0
+        # leaf_two is absent when the frame goes out, and rejoins mid-flight.
+        aggregate._coordinator.unregister_leaf(leaf_two._cover_id)
+
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        aggregate._coordinator.register_leaf(leaf_two._cover_id, leaf_two)
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert leaf_two.current_cover_position is None, (
+            "a member that joined during the transmit was left with a stale position"
+        )
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_survives_a_restore_still_in_flight(hass: HomeAssistant) -> None:
+    """A command that times out cannot be undone by a pending restore either.
+
+    HA inserts an entity into the entity-service mapping BEFORE awaiting
+    `async_added_to_hass`, so an available cover can be commanded while its own
+    restore is still suspended. The cancellation path bumps `_restore_epoch` for
+    exactly this reason; the timeout path marked unknown without it, so the
+    restore resumed, passed its guard, and reinstalled the cached position --
+    reporting a specific estimate after a command that may have reached the air.
+    """
+    release = asyncio.Event()
+    published = asyncio.Event()
+    restored = State(
+        "cover.living_room_left",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 70,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [1, 2],
+            "role": "leaf",
+        },
+    )
+
+    class SlowRestoreCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            await release.wait()
+            return restored
+
+    async def publish(_topic: str, _payload: str) -> None:
+        # Published, never acknowledged: this is the ack-timeout path.
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish, ack_timeout=0.01, started_timeout=0.01)
+    entity = SlowRestoreCover("cover-timeout", "entry-timeout", cover_config(), hub)
+    entity.hass = hass
+    entity.entity_id = "cover.living_room_left"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+    adding = hass.async_create_task(entity.async_added_to_hass())
+    try:
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not adding.done(), "the restore must still be suspended"
+
+        with pytest.raises(HomeAssistantError):
+            await entity.async_open_cover()
+        assert published.is_set()
+        assert entity.current_cover_position is None
+
+        release.set()
+        await adding
+        await hass.async_block_till_done()
+
+        assert entity.current_cover_position is None, (
+            "the pending restore reinstated a position after a command timed out"
+        )
+    finally:
+        release.set()
+        with suppress(Exception):
+            await adding
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_invalidates_a_member_that_left_mid_flight(
+    hass: HomeAssistant,
+) -> None:
+    """A member that deregistered during the group transmit is invalidated too.
+
+    The mirror of the late-joining case. Iterating only CURRENT members at
+    failure time misses a leaf that unloaded while the frame was awaiting
+    `accepted`/`started`: it is gone from `_members()`, but the frame that
+    addressed its channels is already on air, so its known position survives and
+    a later reload can restore it as though nothing happened.
+    """
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        leaf_one._position = 40.0
+        leaf_two._position = 40.0
+
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        # leaf_two unloads while the group frame is in flight.
+        aggregate._coordinator.unregister_leaf(leaf_two._cover_id)
+        assert leaf_two not in aggregate._members()
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert leaf_two.current_cover_position is None, (
+            "a member that left during the transmit kept a position the frame may have moved"
+        )
+        assert leaf_one.current_cover_position is None
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
