@@ -91,6 +91,7 @@ CONFIDENCE_ASSUMED: Final = "assumed"
 CONFIDENCE_SUSPECT: Final = "suspect"
 CONFIDENCE_UNKNOWN: Final = "unknown"
 WALL_CLOCK = time.time
+MONOTONIC_CLOCK = time.monotonic
 _UNTIMED_DISARM_DRAIN_SECONDS: Final = 10.0
 # Intermediate travel progress reaches the STATE MACHINE at this rate, while
 # the estimate itself keeps integrating every POSITION_UPDATE_INTERVAL_SECONDS.
@@ -146,6 +147,10 @@ _TRANSPORT_FAILURE_KEYS: Final = {
 # failure with a `degraded` flag blaming the bridge. OSError stays: a broker
 # socket giving way mid-publish is a transport failure, not a defect.
 _TRANSPORT_FAILURES: Final[tuple[type[Exception], ...]] = tuple(_TRANSPORT_FAILURE_KEYS)
+_COMMAND_TIMEOUT_FAILURES: Final = (
+    CommandAckTimeoutError,
+    CommandStartedTimeoutError,
+)
 
 
 def _failure_translation_key(exc: BaseException) -> str:
@@ -194,7 +199,9 @@ class _MotionStart:
 
     source: str
     started_at: float
+    started_at_monotonic: float
     deadline: float | None
+    deadline_monotonic: float | None
     bridge_id: str | None
     command_id: str | None
 
@@ -393,11 +400,13 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._coordinator = coordinator
         self._position: float | None = None
         self._direction = 0
-        self._motion_started = 0.0
+        self._motion_started_monotonic = 0.0
+        self._motion_started_wall = 0.0
         self._motion_start_position: float | None = None
         self._motion_target: float | None = None
         self._motion_duration = 0.0
-        self._motion_deadline = 0.0
+        self._motion_deadline_monotonic = 0.0
+        self._motion_deadline_wall = 0.0
         self._motion_bridge: str | None = None
         self._motion_command_id: str | None = None
         self._motion_timed = False
@@ -485,8 +494,8 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             _ATTR_DEGRADED: self._degraded,
             _ATTR_MOTION_DIRECTION: self._direction,
             _ATTR_MOTION_TARGET: self._motion_target,
-            _ATTR_MOTION_STARTED: self._motion_started or None,
-            _ATTR_MOTION_DEADLINE: self._motion_deadline or None,
+            _ATTR_MOTION_STARTED: self._motion_started_wall or None,
+            _ATTR_MOTION_DEADLINE: self._motion_deadline_wall or None,
             _ATTR_MOTION_START_POSITION: self._motion_start_position,
             _ATTR_MOTION_BRIDGE: self._motion_bridge,
             _ATTR_MOTION_COMMAND_ID: self._motion_command_id,
@@ -645,8 +654,8 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # _on_bridge_change via the restored _motion_timed flag.
             self._mark_unknown()
             return
-        now = WALL_CLOCK()
-        if now >= deadline:
+        wall_now = WALL_CLOCK()
+        if wall_now >= deadline:
             self._position = target
             self._clear_motion()
             if absolute_anchor or target in {0.0, 100.0}:
@@ -677,20 +686,29 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             and start_position is not None
             and 0 <= start_position <= 100
             and started < deadline
-            and started <= now
+            and started <= wall_now
         ):
-            self._motion_started = started
+            motion_started_wall = started
             self._motion_start_position = start_position
         else:
-            self._motion_started = now
+            motion_started_wall = wall_now
             self._motion_start_position = self._position
+        monotonic_now = MONOTONIC_CLOCK()
+        # This is the one deliberate wall→monotonic boundary. A reboot resets
+        # the monotonic epoch, so persisted wall timestamps are interpreted
+        # once as durations relative to this restore instant; every later live
+        # comparison stays on the fresh monotonic axis.
+        remaining = deadline - wall_now
+        self._motion_deadline_monotonic = monotonic_now + remaining
+        self._motion_started_monotonic = monotonic_now - (wall_now - motion_started_wall)
+        self._motion_started_wall = motion_started_wall
         self._motion_target = target
-        self._motion_deadline = deadline
-        self._motion_duration = deadline - self._motion_started
+        self._motion_deadline_wall = deadline
+        self._motion_duration = self._motion_deadline_monotonic - self._motion_started_monotonic
         self._motion_bridge = bridge
         self._motion_command_id = command_id
         self._motion_timed = timed
-        self._sync_position(now)
+        self._sync_position(monotonic_now)
         self._create_motion_task("recovered travel")
 
     @callback
@@ -755,7 +773,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         if not command_id or command_id != self._motion_command_id:
             return
         if self._motion_timed:
-            self._interrupt_motion(WALL_CLOCK())
+            self._interrupt_motion(MONOTONIC_CLOCK())
             self.async_write_ha_state()
 
     @callback
@@ -891,7 +909,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         normalized = value.strip()
         return normalized or None
 
-    def _estimated_position(self, now: float) -> float | None:
+    def _estimated_position(self, now_monotonic: float) -> float | None:
         """Calculate motion progress without changing entity state."""
         if (
             self._direction == 0
@@ -900,7 +918,13 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             or self._motion_target is None
         ):
             return self._position
-        progress = min(1.0, max(0.0, (now - self._motion_started) / self._motion_duration))
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (now_monotonic - self._motion_started_monotonic) / self._motion_duration,
+            ),
+        )
         estimated = (
             self._motion_start_position
             + (self._motion_target - self._motion_start_position) * progress
@@ -914,9 +938,11 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             return max(1.0, estimated)
         return estimated
 
-    def _sync_position(self, now: float | None = None) -> None:
+    def _sync_position(self, now_monotonic: float | None = None) -> None:
         """Commit elapsed integration from a timer or started command path."""
-        self._position = self._estimated_position(now if now is not None else WALL_CLOCK())
+        self._position = self._estimated_position(
+            now_monotonic if now_monotonic is not None else MONOTONIC_CLOCK(),
+        )
 
     def _cancel_motion_task(self) -> None:
         """Cancel the current completion task without changing model fields."""
@@ -930,19 +956,21 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         """Clear completed or interrupted motion metadata."""
         self._stopped_by_heard = False
         self._direction = 0
-        self._motion_started = 0.0
+        self._motion_started_monotonic = 0.0
+        self._motion_started_wall = 0.0
         self._motion_start_position = self._position
         self._motion_target = None
         self._motion_duration = 0.0
-        self._motion_deadline = 0.0
+        self._motion_deadline_monotonic = 0.0
+        self._motion_deadline_wall = 0.0
         self._motion_bridge = None
         self._motion_command_id = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
 
-    def _interrupt_motion(self, at: float) -> None:
+    def _interrupt_motion(self, at_monotonic: float) -> None:
         """Freeze prior tracking only after the replacing command starts."""
-        self._sync_position(at)
+        self._sync_position(at_monotonic)
         self._cancel_motion_task()
         self._clear_motion()
         # Any interruption ends the moving estimate BEFORE it reaches a limit, so
@@ -1026,7 +1054,9 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         motion = _MotionStart(
             source="commanded",
             started_at=ack.started_at,
+            started_at_monotonic=ack.started_at_monotonic,
             deadline=ack.deadline,
+            deadline_monotonic=ack.deadline_monotonic,
             bridge_id=ack.bridge.bridge_id,
             command_id=ack.command_id,
         )
@@ -1042,7 +1072,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
     def _start_heard_motion(self, event: HeardEvent) -> None:
         """Mirror one fully addressed physical movement event."""
         if event.button == "STOP":
-            self._apply_stop(event.heard_at, provenance="heard")
+            self._apply_stop(event.heard_at_monotonic, provenance="heard")
             return
         if event.button == "UP":
             direction = 1
@@ -1057,7 +1087,9 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         motion = _MotionStart(
             source="heard",
             started_at=event.heard_at,
+            started_at_monotonic=event.heard_at_monotonic,
             deadline=None,
+            deadline_monotonic=None,
             bridge_id=None,
             command_id=None,
         )
@@ -1078,18 +1110,18 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             button = "UP"
         elif self._direction < 0:
             button = "DOWN"
-        disarm_deadline: float | None = None
+        disarm_deadline_monotonic: float | None = None
         if self._motion_bridge is not None and self._motion_command_id is not None:
-            disarm_deadline = (
-                self._motion_deadline
+            disarm_deadline_monotonic = (
+                self._motion_deadline_monotonic
                 if self._motion_timed
-                else WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
+                else MONOTONIC_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS
             )
         return TakeoverCoverState(
             bridge_id=self._motion_bridge,
             command_id=self._motion_command_id,
             button=button,
-            disarm_deadline=disarm_deadline,
+            disarm_deadline_monotonic=disarm_deadline_monotonic,
             stopped_by_heard=self._stopped_by_heard,
         )
 
@@ -1117,7 +1149,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # can commit here first — the stale persisted snapshot must then
         # never be applied over it.
         self._restore_epoch += 1
-        self._interrupt_motion(motion.started_at)
+        self._interrupt_motion(motion.started_at_monotonic)
         if self._timed_motion_bridge_offline(motion):
             # The started status and retained offline LWT can be delivered in
             # one broker batch. The bridge's RAM-only armed STOP may already
@@ -1143,19 +1175,27 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._motion_start_position = self._position
         self._motion_target = target
         self._motion_duration = duration
-        self._motion_started = motion.started_at
+        self._motion_started_monotonic = motion.started_at_monotonic
+        self._motion_started_wall = motion.started_at
         # The model ends at whichever comes first: this cover's own travel
         # (a clamped member reaches its limit switch before the group frame
         # ends) or the bridge-armed STOP deadline. For the cover that owns
         # the command the two coincide.
-        deadline = motion.started_at + duration
+        deadline_monotonic = motion.started_at_monotonic + duration
+        if motion.deadline_monotonic is not None:
+            deadline_monotonic = min(
+                deadline_monotonic,
+                motion.deadline_monotonic,
+            )
+        self._motion_deadline_monotonic = deadline_monotonic
+        deadline_wall = motion.started_at + duration
         if motion.deadline is not None:
-            deadline = min(deadline, motion.deadline)
-        self._motion_deadline = deadline
+            deadline_wall = min(deadline_wall, motion.deadline)
+        self._motion_deadline_wall = deadline_wall
         self._direction = direction
         self._motion_bridge = motion.bridge_id
         self._motion_command_id = motion.command_id
-        self._motion_timed = motion.deadline is not None
+        self._motion_timed = motion.deadline_monotonic is not None
         displaced = (
             motion.source == "commanded"
             and self._motion_timed
@@ -1168,7 +1208,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # freeze immediately instead of tracking a retired command. (A
             # displaced FULL travel still rides to its endpoint on the
             # motor's own limit switch, so its model proceeds normally.)
-            self._interrupt_motion(WALL_CLOCK())
+            self._interrupt_motion(MONOTONIC_CLOCK())
         else:
             label = "heard travel" if motion.source == "heard" else "travel"
             self._create_motion_task(label)
@@ -1176,7 +1216,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
     def _timed_motion_bridge_offline(self, motion: _MotionStart) -> bool:
         """Return whether a timed start depends on a bridge already offline."""
         return (
-            motion.deadline is not None
+            motion.deadline_monotonic is not None
             and motion.bridge_id is not None
             and self._hub.registry.is_known_offline(motion.bridge_id)
         )
@@ -1200,8 +1240,8 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # Compute from the member's estimate AT RF start: if this member was
         # itself still moving, its stored position is up to one update
         # interval stale, and _commit_motion will sync the model origin to
-        # motion.started_at — the target must come from the same instant.
-        origin = self._estimated_position(motion.started_at)
+        # motion.started_at_monotonic — the target must come from the same instant.
+        origin = self._estimated_position(motion.started_at_monotonic)
         if group_target in (0.0, 100.0):
             # A full travel runs each motor to its own limit switch: model it
             # over this member's OWN calibration, not the group's duration (a
@@ -1249,9 +1289,9 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         """Integrate this cover until its RF-start-based motion deadline."""
         # The motion's own start write has just happened at the call site; the
         # first throttled progress write is due one interval after it.
-        last_write = WALL_CLOCK()
+        last_write_monotonic = MONOTONIC_CLOCK()
         while self._motion_token is token:
-            remaining = self._motion_deadline - WALL_CLOCK()
+            remaining = self._motion_deadline_monotonic - MONOTONIC_CLOCK()
             if remaining <= 0:
                 break
             await asyncio.sleep(min(POSITION_UPDATE_INTERVAL_SECONDS, remaining))
@@ -1263,9 +1303,9 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # immediately from their own call sites, so nothing a user or an
             # automation waits on is delayed by this.
             self._sync_position()
-            now = WALL_CLOCK()
-            if now - last_write >= _PROGRESS_WRITE_INTERVAL_SECONDS:
-                last_write = now
+            now_monotonic = MONOTONIC_CLOCK()
+            if now_monotonic - last_write_monotonic >= _PROGRESS_WRITE_INTERVAL_SECONDS:
+                last_write_monotonic = now_monotonic
                 self.async_write_ha_state()
         if self._motion_token is not token:
             return
@@ -1294,7 +1334,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
                 overlap_token=overlap_token,
                 owner=self._remote_entry_id,
             )
-        except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
+        except _COMMAND_TIMEOUT_FAILURES as exc:
             # The frame MAY have reached RF; only unknown is honest. Aggregates
             # containing this leaf re-derive through the coordinator.
             #
@@ -1451,7 +1491,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # still aborts rather than publishing an older intent over the newer one.
         displaced = self._hub.was_displaced(ack.command_id)
         self._record_ack(ack)
-        self._apply_stop(ack.started_at, provenance="commanded")
+        self._apply_stop(ack.started_at_monotonic, provenance="commanded")
         return not displaced
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
@@ -1487,7 +1527,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # hub resolves the movement as superseded instead of letting the
         # OLDER intent overwrite the newer command on air.
         overlap_token = self._hub.overlap_token(self._config)
-        current = self._estimated_position(WALL_CLOCK())
+        current = self._estimated_position(MONOTONIC_CLOCK())
         if current is None:
             # A ServiceValidationError, not a HomeAssistantError: nothing
             # failed, the caller asked for a partial move the model cannot
@@ -1512,7 +1552,12 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         if ack is None or intent_generation != self._intent_generation:
             return
         acknowledged_duration = (
-            max(0.001, ack.deadline - ack.started_at) if ack.deadline is not None else duration
+            max(
+                0.001,
+                ack.deadline_monotonic - ack.started_at_monotonic,
+            )
+            if ack.deadline_monotonic is not None
+            else duration
         )
         self._start_motion(
             ack,
@@ -1546,7 +1591,7 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         self._last_command_bridge: str | None = None
         self._last_command_id: str | None = None
         self._last_command_button: Button | None = None
-        self._last_command_at = 0.0
+        self._last_command_at_monotonic = 0.0
         self._fanout_tasks: set[asyncio.Task[None]] = set()
 
     async def async_added_to_hass(self) -> None:
@@ -1757,20 +1802,22 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         long-retired command forever would spawn pointless disarm retries on
         every later physical press.
         """
-        expired = WALL_CLOCK() > self._last_command_at + _UNTIMED_DISARM_DRAIN_SECONDS
+        expired = (
+            MONOTONIC_CLOCK() > self._last_command_at_monotonic + _UNTIMED_DISARM_DRAIN_SECONDS
+        )
         if self._last_command_bridge is None or self._last_command_id is None or expired:
             return TakeoverCoverState(
                 bridge_id=None,
                 command_id=None,
                 button=None,
-                disarm_deadline=None,
+                disarm_deadline_monotonic=None,
                 stopped_by_heard=self._stopped_by_heard,
             )
         return TakeoverCoverState(
             bridge_id=self._last_command_bridge,
             command_id=self._last_command_id,
             button=self._last_command_button,
-            disarm_deadline=WALL_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS,
+            disarm_deadline_monotonic=(MONOTONIC_CLOCK() + _UNTIMED_DISARM_DRAIN_SECONDS),
             stopped_by_heard=self._stopped_by_heard,
         )
 
@@ -1817,7 +1864,7 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
                 member.invalidate_for_cancelled_command()
             self.async_write_ha_state()
             raise
-        except (CommandAckTimeoutError, CommandStartedTimeoutError) as exc:
+        except _COMMAND_TIMEOUT_FAILURES as exc:
             # The leaf invalidates itself on a timeout; the aggregate has to do
             # it for its members. The frame MAY have reached RF, and this
             # command was never any member's own, so nothing else records the
@@ -1843,7 +1890,7 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         self._last_command_bridge = result.bridge.bridge_id
         self._last_command_id = result.command_id
         self._last_command_button = button
-        self._last_command_at = WALL_CLOCK()
+        self._last_command_at_monotonic = result.started_at_monotonic
         self._stopped_by_heard = False
         return result
 
@@ -1860,7 +1907,9 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         motion = _MotionStart(
             source="commanded",
             started_at=ack.started_at,
+            started_at_monotonic=ack.started_at_monotonic,
             deadline=ack.deadline,
+            deadline_monotonic=ack.deadline_monotonic,
             bridge_id=ack.bridge.bridge_id,
             command_id=ack.command_id,
         )
@@ -1922,7 +1971,10 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
                     # this member; its own heard model wins the freeze.
                     continue
                 member._record_ack(ack)
-                member._apply_stop(ack.started_at, provenance="commanded")
+                member._apply_stop(
+                    ack.started_at_monotonic,
+                    provenance="commanded",
+                )
             self.async_write_ha_state()
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:

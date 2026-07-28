@@ -807,7 +807,7 @@ def _sibling_channel_sets(
         except _COERCION_ERRORS:
             try:
                 channels = parse_channels(row.get(CONF_CHANNELS, ""))
-            except (TypeError, ValueError) as err:
+            except _COERCION_ERRORS as err:
                 msg = f"invalid sibling cover channels: {cover_id}"
                 raise ValueError(msg) from err
         channel_sets.append(channels)

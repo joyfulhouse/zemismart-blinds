@@ -32,6 +32,7 @@ from custom_components.zemismart_blinds.models import (
     ZemismartHub,
 )
 from custom_components.zemismart_blinds.state_sync import HeardEvent, LedgerFrameSpec
+from tests.clocks import SteppableClocks
 from tests.synthetic import TEST_ACTION_BASES, TEST_PREFIX, TEST_REMOTE_ID
 
 if TYPE_CHECKING:
@@ -163,9 +164,196 @@ def dispatch_heard_press(
             chans=frozenset(channels),
             remote_key=config.remote_key,
             heard_at=at,
+            heard_at_monotonic=(cover_module.MONOTONIC_CLOCK() - (cover_module.WALL_CLOCK() - at)),
             bridge_id="synthetic-rx-bridge",
         ),
     )
+
+
+@pytest.mark.parametrize("wall_step", [-3_600.0, 3_600.0], ids=["backward", "forward"])
+@pytest.mark.asyncio
+async def test_wall_step_does_not_change_live_partial_move_deadline(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    wall_step: float,
+) -> None:
+    """A partial move completes after physical elapsed time, not adjusted wall time."""
+    # Deliberately far apart: started equal, a monotonic read swapped for a wall
+    # one is invisible because the two values coincide. A realistic unix-epoch
+    # wall clock against a small uptime-style monotonic clock makes any
+    # confusion between the two axes structural rather than a coincidence.
+    wall = {"now": 1_700_000_000.0}
+    monotonic = {"now": 200.0}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
+    monkeypatch.setattr(
+        cover_module,
+        "MONOTONIC_CLOCK",
+        lambda: monotonic["now"],
+        raising=False,
+    )
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 10_000.0)
+    real_sleep = asyncio.sleep
+
+    async def elapse(seconds: float) -> None:
+        if seconds > 0:
+            assert entity.position_confidence != "anchored"
+        wall["now"] += seconds
+        monotonic["now"] += seconds
+        await real_sleep(0)
+
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        now=lambda: wall["now"],
+        monotonic_now=lambda: monotonic["now"],
+    )
+    entity = await attach_cover(hass, hub, config=cover_config(travel=1.0))
+    entity._position = 50.0
+    try:
+        await entity.async_set_cover_position(**{ATTR_POSITION: 80})
+        expected_elapsed = entity._motion_duration
+        entity._cancel_motion_task()
+        wall["now"] += wall_step
+        monkeypatch.setattr(asyncio, "sleep", elapse)
+        token = object()
+        entity._motion_token = token
+        started_at_monotonic = monotonic["now"]
+
+        await entity._async_track_motion(token)
+
+        assert monotonic["now"] - started_at_monotonic == pytest.approx(expected_elapsed)
+        assert entity.current_cover_position == 80
+        assert not entity.is_opening
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.parametrize("wall_step", [-3_600.0, 3_600.0], ids=["backward", "forward"])
+@pytest.mark.asyncio
+async def test_wall_step_does_not_false_anchor_live_full_travel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    wall_step: float,
+) -> None:
+    """A fractional full travel cannot become anchored after a wall-clock step."""
+    # Deliberately far apart: started equal, a monotonic read swapped for a wall
+    # one is invisible because the two values coincide. A realistic unix-epoch
+    # wall clock against a small uptime-style monotonic clock makes any
+    # confusion between the two axes structural rather than a coincidence.
+    wall = {"now": 1_700_000_000.0}
+    monotonic = {"now": 200.0}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
+    monkeypatch.setattr(
+        cover_module,
+        "MONOTONIC_CLOCK",
+        lambda: monotonic["now"],
+        raising=False,
+    )
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 10_000.0)
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.1)
+    real_sleep = asyncio.sleep
+
+    async def elapse(seconds: float) -> None:
+        if seconds > 0:
+            assert entity.position_confidence != "anchored"
+        wall["now"] += seconds
+        monotonic["now"] += seconds
+        await real_sleep(0)
+
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        now=lambda: wall["now"],
+        monotonic_now=lambda: monotonic["now"],
+    )
+    entity = await attach_cover(hass, hub, config=cover_config(travel=0.2))
+    entity._position = 50.0
+    try:
+        await entity.async_open_cover()
+        expected_elapsed = entity._motion_duration
+        entity._cancel_motion_task()
+        wall["now"] += wall_step
+        monkeypatch.setattr(asyncio, "sleep", elapse)
+        token = object()
+        entity._motion_token = token
+        started_at_monotonic = monotonic["now"]
+
+        await entity._async_track_motion(token)
+
+        elapsed = monotonic["now"] - started_at_monotonic
+        assert elapsed == pytest.approx(expected_elapsed)
+        assert entity.current_cover_position == 100
+        assert entity.position_confidence == "anchored"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.parametrize("wall_step", [-2.0, 2.0], ids=["backward", "forward"])
+@pytest.mark.asyncio
+async def test_wall_step_restore_projects_remaining_duration_once(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    wall_step: float,
+) -> None:
+    """Restore maps the persisted wall pair once onto the new monotonic epoch."""
+    config = cover_config(travel=10.0)
+    persisted_started = 1_000.0
+    persisted_deadline = 1_010.0
+    wall = {"now": 1_004.0 + wall_step}
+    monotonic = {"now": 50.0}
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
+    monkeypatch.setattr(
+        cover_module,
+        "MONOTONIC_CLOCK",
+        lambda: monotonic["now"],
+        raising=False,
+    )
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 20,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 1,
+            "motion_target": 80,
+            "motion_started": persisted_started,
+            "motion_deadline": persisted_deadline,
+            "motion_start_position": 20,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "restored-command",
+            "motion_timed": True,
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(online_registry(), quiet_publish),
+        config=config,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        remaining = persisted_deadline - wall["now"]
+        assert entity._motion_deadline_monotonic == pytest.approx(monotonic["now"] + remaining)
+        assert entity.extra_state_attributes["motion_started"] == persisted_started
+        assert entity.extra_state_attributes["motion_deadline"] == persisted_deadline
+    finally:
+        await entity.async_will_remove_from_hass()
 
 
 @pytest.mark.asyncio
@@ -636,7 +824,7 @@ def test_current_position_getter_is_pure() -> None:
     entity._direction = 1
     entity._motion_start_position = 40.0
     entity._motion_target = 80.0
-    entity._motion_started = 0.0
+    entity._motion_started_monotonic = 0.0
     entity._motion_duration = 10.0
 
     assert entity.current_cover_position == 40
@@ -1331,7 +1519,9 @@ async def test_heard_stop_freezes_every_fully_contained_group(
     motion = cover_module._MotionStart(
         source="heard",
         started_at=started_at,
+        started_at_monotonic=cover_module.MONOTONIC_CLOCK(),
         deadline=None,
+        deadline_monotonic=None,
         bridge_id=None,
         command_id=None,
     )
@@ -1559,7 +1749,7 @@ async def test_heard_up_disarm_ack_keeps_mirrored_motion(
     try:
         await entity.async_set_cover_position(**{ATTR_POSITION: 75})
         command_id = entity._motion_command_id
-        old_deadline = entity._motion_deadline
+        old_deadline = entity._motion_deadline_monotonic
         assert command_id is not None
         assert entity._motion_timed
 
@@ -1584,7 +1774,7 @@ async def test_heard_up_disarm_ack_keeps_mirrored_motion(
             {"status": "disarmed", "command_id": command_id},
         )
 
-        await asyncio.sleep(max(0.0, old_deadline - cover_module.WALL_CLOCK()) + 0.02)
+        await asyncio.sleep(max(0.0, old_deadline - cover_module.MONOTONIC_CLOCK()) + 0.02)
 
         assert entity.is_opening
         assert entity._motion_target == 100.0
@@ -1620,7 +1810,7 @@ async def test_heard_up_disarm_timeout_marks_mirrored_motion_unknown(
     try:
         await entity.async_set_cover_position(**{ATTR_POSITION: 75})
         command_id = entity._motion_command_id
-        old_deadline = entity._motion_deadline
+        old_deadline = entity._motion_deadline_monotonic
         assert command_id is not None
 
         dispatch_heard_press(
@@ -1631,7 +1821,7 @@ async def test_heard_up_disarm_timeout_marks_mirrored_motion_unknown(
             at=cover_module.WALL_CLOCK(),
         )
         await asyncio.wait_for(disarm_published.wait(), timeout=1.0)
-        await asyncio.sleep(max(0.0, old_deadline - cover_module.WALL_CLOCK()) + 0.02)
+        await asyncio.sleep(max(0.0, old_deadline - cover_module.MONOTONIC_CLOCK()) + 0.02)
 
         assert [item for item in published if item[0].endswith("/cmd")]
         assert entity.current_cover_position is None
@@ -1886,10 +2076,13 @@ async def test_lost_disarm_invalidates_unmodeled_covers_outside_the_press(
 @pytest.mark.asyncio
 async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A command retained only for echoes cannot threaten idle members."""
     published: list[tuple[str, dict[str, Any]]] = []
-    clock = {"now": cover_module.WALL_CLOCK()}
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -1902,7 +2095,8 @@ async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
         online_registry(),
         publish,
         command_id_factory=lambda: "completed-timed-group",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
     unpressed = await attach_cover(
@@ -1920,7 +2114,7 @@ async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
             "UP",
             stop_after_ms=_TIMED_COMMAND_STOP_AFTER_MS,
         )
-        clock["now"] += _COMPLETED_COMMAND_ADVANCE_SECONDS
+        clocks.advance(_COMPLETED_COMMAND_ADVANCE_SECONDS)
 
         dispatch_heard_press(
             hub,
@@ -1948,8 +2142,9 @@ async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeo
 ) -> None:
     """Cover-owned takeover ignores a command whose RF window has ended."""
     published: list[tuple[str, dict[str, Any]]] = []
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -1962,7 +2157,8 @@ async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeo
         online_registry(),
         publish,
         command_id_factory=lambda: "untimed-member-up",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
     entity._position = 50.0
@@ -1970,14 +2166,14 @@ async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeo
         await entity.async_open_cover()
         assert entity.is_opening
         assert entity._motion_command_id == "untimed-member-up"
-        clock["now"] += _UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS
+        clocks.advance(_UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS)
 
         dispatch_heard_press(
             hub,
             entity._config,
             "DOWN",
             (1,),
-            at=clock["now"],
+            at=clocks.wall,
         )
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -3190,7 +3386,9 @@ async def test_group_motion_during_restore_supersedes_cached_motion(
                 cover_module._MotionStart(
                     source="commanded",
                     started_at=cover_module.WALL_CLOCK(),
+                    started_at_monotonic=cover_module.MONOTONIC_CLOCK(),
                     deadline=None,
+                    deadline_monotonic=None,
                     bridge_id="bridge-a",
                     command_id="group-up",
                 ),
@@ -3327,10 +3525,10 @@ async def test_clamped_member_deadline_matches_its_own_duration(
         await group.async_set_cover_position(**{ATTR_POSITION: 60})
         await asyncio.sleep(0.02)
 
-        assert member._motion_deadline == pytest.approx(
-            member._motion_started + member._motion_duration
+        assert member._motion_deadline_monotonic == pytest.approx(
+            member._motion_started_monotonic + member._motion_duration
         )
-        assert member._motion_deadline < group._motion_deadline
+        assert member._motion_deadline_monotonic < group._motion_deadline_monotonic
     finally:
         await group.async_will_remove_from_hass()
         await member.async_will_remove_from_hass()
@@ -3584,7 +3782,9 @@ async def test_group_member_clamped_to_its_limit_re_anchors(
             cover_module._MotionStart(
                 source="commanded",
                 started_at=cover_module.WALL_CLOCK(),
+                started_at_monotonic=cover_module.MONOTONIC_CLOCK(),
                 deadline=None,
+                deadline_monotonic=None,
                 bridge_id="bridge-b",
                 command_id="group-down",
             ),
@@ -4220,8 +4420,9 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A restarted full travel retains its hard-limit anchoring semantics."""
-    clock = [1_000.0]
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock[0])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
     monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.001)
     registry = online_registry("bridge-b")
@@ -4230,7 +4431,12 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
     async def publish(topic: str, payload: str) -> None:
         acknowledge(hub, topic.split("/")[1], json.loads(payload))
 
-    hub = ZemismartHub(registry, publish, now=lambda: clock[0])
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     original = await attach_cover(hass, hub, config=cover_config(travel=0.2))
     original._position = 80.0
     original._unverified_anchor_bridge = "bridge-a"
@@ -4248,7 +4454,12 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
         return
 
     restored_registry = online_registry("bridge-b")
-    restored_hub = ZemismartHub(restored_registry, quiet_publish, now=lambda: clock[0])
+    restored_hub = ZemismartHub(
+        restored_registry,
+        quiet_publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     restored = await attach_cover(
         hass,
         restored_hub,
@@ -4260,7 +4471,7 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
         assert restored.extra_state_attributes["motion_absolute_anchor"] is True
         assert restored.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
 
-        clock[0] = 1_001.0
+        clocks.advance(1.0)
         await asyncio.sleep(0.02)
 
         assert restored.current_cover_position == 100
@@ -5001,10 +5212,10 @@ async def test_aggregate_takeover_state_expires_and_tracks_heard_stop(
         state = aggregate._takeover_state()
         assert state.command_id is not None
 
-        aggregate._last_command_at = cover_module.WALL_CLOCK() - 3600.0
+        aggregate._last_command_at_monotonic = cover_module.MONOTONIC_CLOCK() - 3600.0
         expired = aggregate._takeover_state()
         assert expired.command_id is None
-        assert expired.disarm_deadline is None
+        assert expired.disarm_deadline_monotonic is None
 
         dispatch_heard_press(
             hub,
@@ -5172,8 +5383,9 @@ async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
     changes BOTH unconditionally the moment it runs at all; equality after
     the phantom frame is direct proof the callback never ran.
     """
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -5184,7 +5396,8 @@ async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
     hub = ZemismartHub(
         online_registry(_ROUND_ROBIN_BRIDGE_ID),
         publish,
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     entity = await attach_cover(
         hass,
@@ -5204,12 +5417,12 @@ async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
         assert entity.is_closing
         real_command_id = entity._motion_command_id
         assert real_command_id is not None
-        handoff = clock["now"]
+        handoff = clocks.monotonic
         generation_before = entity._intent_generation
 
         _register_round_robin_peers(hub, entity._config.remote_key, handoff)
 
-        clock["now"] += _ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS
+        clocks.advance(_ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS)
         raw_frame = encode_b0(
             make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "DOWN", bases=TEST_ACTION_BASES)
         )
@@ -5241,8 +5454,9 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
     like an aggregate whose displayed state spans more channels than any one
     contributing leaf command addresses.
     """
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -5253,7 +5467,8 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
     hub = ZemismartHub(
         online_registry(_ROUND_ROBIN_BRIDGE_ID),
         publish,
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     group = await attach_cover(
         hass,
@@ -5287,12 +5502,12 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
     try:
         await leaf.async_close_cover()
         assert leaf.is_closing
-        handoff = clock["now"]
+        handoff = clocks.monotonic
         group_generation_before = group._intent_generation
 
         _register_round_robin_peers(hub, leaf._config.remote_key, handoff)
 
-        clock["now"] += _ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS
+        clocks.advance(_ROUND_ROBIN_LATE_OWN_REPEAT_SECONDS)
         raw_frame = encode_b0(
             make_payload(TEST_PREFIX, TEST_REMOTE_ID, (2,), "DOWN", bases=TEST_ACTION_BASES)
         )
@@ -5417,7 +5632,7 @@ async def test_reanchor_on_aggregate_is_one_group_frame(
 
 async def _commanded_untimed_full_close(
     hass: HomeAssistant,
-    clock: dict[str, float],
+    clocks: SteppableClocks,
 ) -> tuple[ZemismartCover, ZemismartHub]:
     """Attach a leaf at 100 and start a commanded untimed full close on it.
 
@@ -5430,7 +5645,12 @@ async def _commanded_untimed_full_close(
         if topic.endswith("/tx"):
             acknowledge(hub, topic.split("/")[1], json.loads(payload))
 
-    hub = ZemismartHub(online_registry(), publish, now=lambda: clock["now"])
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
     entity._position = 100.0
     await entity.async_close_cover()
@@ -5446,15 +5666,16 @@ async def test_heard_stop_early_in_untimed_full_travel_marks_suspect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A heard STOP early in an untimed full close leaves the estimate suspect."""
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
-    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
-        started = entity._motion_started
+        started = entity._motion_started_monotonic
         duration = entity._motion_duration
         # STOP heard near the START of travel: the blind is still near open.
-        clock["now"] = started + 0.1 * duration
-        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+        clocks.set_monotonic(started + 0.1 * duration)
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clocks.wall)
 
         assert entity._suspect is True
         assert entity.position_confidence == "suspect"
@@ -5477,15 +5698,16 @@ async def test_heard_stop_late_in_untimed_full_travel_marks_suspect(
     truth here: heard late, a phantom STOP means the motor already ran nearly
     to its limit while the model froze near it.
     """
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
-    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
-        started = entity._motion_started
+        started = entity._motion_started_monotonic
         duration = entity._motion_duration
         # STOP heard near the END of travel: the blind is nearly closed.
-        clock["now"] = started + 0.9 * duration
-        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+        clocks.set_monotonic(started + 0.9 * duration)
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clocks.wall)
 
         assert entity._suspect is True
         assert entity.position_confidence == "suspect"
@@ -5668,21 +5890,22 @@ async def test_suspect_cleared_by_a_completed_endpoint_travel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A completed hard-limit travel (a reanchor) settles the suspect doubt."""
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
-    entity, hub = await _commanded_untimed_full_close(hass, clock)
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
-        started = entity._motion_started
+        started = entity._motion_started_monotonic
         duration = entity._motion_duration
-        clock["now"] = started + 0.5 * duration
-        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clock["now"])
+        clocks.set_monotonic(started + 0.5 * duration)
+        dispatch_heard_press(hub, entity._config, "STOP", (1, 2), at=clocks.wall)
         assert entity._suspect is True
         assert entity.position_confidence == "suspect"
 
         # Reanchor: a fresh full close that runs to the limit clears the doubt.
         await entity.async_reanchor("close")
         assert entity.is_closing
-        clock["now"] = entity._motion_deadline + 1.0
+        clocks.set_monotonic(entity._motion_deadline_monotonic + 1.0)
         await asyncio.sleep(0.4)
 
         assert entity.current_cover_position == 0
@@ -5763,8 +5986,9 @@ async def test_heard_stop_through_handle_rx_marks_suspect(
     """The incident end to end: a genuine STOP, decoded from a real frame and
     delivered through the production RX path while a commanded untimed full
     close runs, leaves the estimate suspect."""
-    clock = {"now": cover_module.WALL_CLOCK()}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -5772,7 +5996,12 @@ async def test_heard_stop_through_handle_rx_marks_suspect(
         if topic.endswith("/tx"):
             acknowledge(hub, topic.split("/")[1], body)
 
-    hub = ZemismartHub(online_registry(), publish, now=lambda: clock["now"])
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     entity = await attach_cover(
         hass,
         hub,
@@ -5796,7 +6025,7 @@ async def test_heard_stop_through_handle_rx_marks_suspect(
         # A real STOP heard AFTER our RF started: record_commanded_start (set by
         # the hub on `started`) cannot dismiss it as our own late echo, and its
         # STOP signature matches no armed window, so it is dispatched as a press.
-        clock["now"] += 2.0
+        clocks.advance(2.0)
         stop_frame = encode_b0(
             make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "STOP", bases=TEST_ACTION_BASES)
         )
@@ -6168,13 +6397,14 @@ async def test_intermediate_progress_writes_are_throttled(
     nothing from 4 Hz history of a dead-reckoned estimate (~120 rows of 17
     attributes per 30 s travel, per cover).
     """
-    clock = {"now": 1_000.0}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: clock["now"])
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
 
     real_sleep = asyncio.sleep
 
     async def fake_sleep(seconds: float) -> None:
-        clock["now"] += seconds
+        clocks.advance(seconds)
         await real_sleep(0)
 
     # cover.py calls asyncio.sleep through the module, so patching it here is
@@ -6192,7 +6422,7 @@ async def test_intermediate_progress_writes_are_throttled(
     original_sync = entity._sync_position
 
     def counting_sync(at: float | None = None) -> None:
-        ticks.append(clock["now"])
+        ticks.append(clocks.monotonic)
         original_sync(at)
 
     monkeypatch.setattr(entity, "_sync_position", counting_sync)
@@ -6200,16 +6430,16 @@ async def test_intermediate_progress_writes_are_throttled(
     unsub = async_track_state_change_event(
         hass,
         ["cover.living_room_left"],
-        lambda _event: writes.append(clock["now"]),
+        lambda _event: writes.append(clocks.monotonic),
     )
     try:
         entity._position = 0.0
         entity._direction = 1
-        entity._motion_started = clock["now"]
+        entity._motion_started_monotonic = clocks.monotonic
         entity._motion_start_position = 0.0
         entity._motion_target = 100.0
         entity._motion_duration = 10.0
-        entity._motion_deadline = clock["now"] + 10.0
+        entity._motion_deadline_monotonic = clocks.monotonic + 10.0
         entity._create_motion_task("throttle test")
         task = entity._motion_task
         assert task is not None
@@ -6873,6 +7103,7 @@ async def test_cancellation_still_invalidates_after_a_heard_stop_with_no_motion(
                 chans=frozenset(entity._config.channels),
                 remote_key=entity._config.remote_key,
                 heard_at=cover_module.WALL_CLOCK(),
+                heard_at_monotonic=cover_module.MONOTONIC_CLOCK(),
                 bridge_id="bridge-a",
             )
         )
@@ -6932,6 +7163,7 @@ async def test_cancellation_invalidates_even_when_a_press_was_heard(
                 chans=frozenset(entity._config.channels),
                 remote_key=entity._config.remote_key,
                 heard_at=cover_module.WALL_CLOCK(),
+                heard_at_monotonic=cover_module.MONOTONIC_CLOCK(),
                 bridge_id="bridge-a",
             )
         )

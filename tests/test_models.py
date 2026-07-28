@@ -38,6 +38,11 @@ from custom_components.zemismart_blinds.state_sync import (
     StateSyncConsumer,
     frame_signature,
 )
+from tests.clocks import (
+    TEST_MONOTONIC_TIME,
+    TEST_WALL_TIME,
+    SteppableClocks,
+)
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_ACTION_BASES,
@@ -60,7 +65,8 @@ _name, OTHER_PREFIX, OTHER_REMOTE_ID, OTHER_BASES, _payload = SYNTHETIC_REMOTES[
 
 _STATE_SYNC_BOOT: Final = 7
 _STATE_SYNC_T: Final = 2_000
-_STATE_SYNC_RECV_TIME: Final = 100.0
+_STATE_SYNC_RECV_TIME: Final = TEST_WALL_TIME
+_STATE_SYNC_RECV_TIME_MONOTONIC: Final = TEST_MONOTONIC_TIME
 _LEDGER_STOP_AFTER_MS: Final = 3_250
 _MILLISECONDS_PER_SECOND: Final = 1_000
 _BRIDGE_STATE_CAP: Final = 256
@@ -78,20 +84,23 @@ _TAKEOVER_OWNED_DEADLINE_SECONDS: Final = 0.16
 _TAKEOVER_AFTER_GENERIC_SECONDS: Final = 0.07
 _TAKEOVER_TIMEOUT_LOWER_BOUND_SECONDS: Final = 0.13
 _DISPLACED_STOP_AFTER_MS: Final = 120_000
-_DISPLACED_AT: Final = 140.0
-_DISPLACED_FLUSH_AT: Final = 140.1
-_DISPLACED_ORIGINAL_STOP_AT: Final = 220.0
+_DISPLACED_AT: Final = 240.0
+_DISPLACED_FLUSH_AT: Final = 240.1
+_DISPLACED_ORIGINAL_STOP_AT: Final = 320.0
 _DISPLACED_ORIGINAL_STOP_T: Final = 81_900
 _SEEDED_BRIDGE_T: Final = 10_000
 _STARTED_STATUS_T: Final = 10_250
 _STARTED_STATUS_AGE_MS: Final = 250
-_STARTED_DELIVERY_TIME: Final = 102.0
-_CLAMPED_DELIVERY_TIME: Final = 200.0
+_STARTED_DELIVERY_TIME: Final = TEST_WALL_TIME + 2.0
+_STARTED_DELIVERY_TIME_MONOTONIC: Final = TEST_MONOTONIC_TIME + 2.0
+_CLAMPED_DELIVERY_TIME: Final = TEST_WALL_TIME + 100.0
+_CLAMPED_DELIVERY_TIME_MONOTONIC: Final = TEST_MONOTONIC_TIME + 100.0
 _CLAMPED_AGE_MS: Final = 20_000
 _CLAMPED_STATUS_T: Final = 70_000
 _REPLAY_AGE_MS: Final = 600_000
 _REPLAY_STATUS_T: Final = 610_000
-_REPLAY_DELIVERY_TIME: Final = 700.0
+_REPLAY_DELIVERY_TIME: Final = TEST_WALL_TIME + 600.0
+_REPLAY_DELIVERY_TIME_MONOTONIC: Final = TEST_MONOTONIC_TIME + 600.0
 
 
 def test_role_is_str_enum() -> None:
@@ -496,6 +505,63 @@ def accept_and_start(hub: ZemismartHub, bridge_id: str, body: Mapping[str, Any])
     assert hub.handle_status(bridge_id, started(body))
 
 
+@pytest.mark.parametrize("wall_step", [-3_600.0, 3_600.0], ids=["backward", "forward"])
+@pytest.mark.asyncio
+async def test_wall_step_does_not_reclassify_confirmed_echo_as_physical_press(
+    wall_step: float,
+) -> None:
+    """A confirmed command's own echo stays inside its monotonic ledger window.
+
+    The two epochs are deliberately FAR APART. Started equal, this test could not
+    see a monotonic read swapped for a wall one -- the two values coincided, so
+    the exact mutation this test exists to catch (confirming the ledger with the
+    wall `started_at`) passed. A realistic unix-epoch wall clock against a small
+    uptime-style monotonic clock makes any confusion between them structural.
+    """
+    wall = {"now": 1_700_000_000.0}
+    monotonic = {"now": 200.0}
+    published: list[dict[str, Any]] = []
+    events: list[HeardEvent] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        body: dict[str, Any] = json.loads(payload)
+        published.append(body)
+        accept_and_start(hub, topic.split("/")[1], body)
+
+    config = action_only_config()
+    hub = ZemismartHub(
+        _online_registry(),
+        publish,
+        now=lambda: wall["now"],
+        monotonic_now=lambda: monotonic["now"],
+    )
+    unsubscribe = hub.register_rx_listener(
+        config.remote.key,
+        frozenset(config.channels),
+        events.append,
+        bases=TEST_ACTION_BASES,
+    )
+    try:
+        await hub.async_transmit(config, "UP")
+        wall["now"] += wall_step
+        monotonic["now"] += 0.1
+
+        hub.handle_rx(
+            "bridge-b",
+            {
+                "frame": published[0]["raw"],
+                "t": 1_000,
+                "boot": 1,
+            },
+        )
+
+        assert events == []
+    finally:
+        unsubscribe()
+        hub.close()
+
+
 def acking_hub(**hub_kwargs: Any) -> tuple[ZemismartHub, list[dict[str, Any]]]:
     """Return a hub on one online bridge that acks everything it publishes.
 
@@ -807,16 +873,15 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
     registry.update_info("bridge-a", {"area": "living_room"})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, Mapping[str, Any]]] = []
-    clock = {"now": 0.0}
+    clocks = SteppableClocks()
 
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         body: dict[str, Any] = json.loads(payload)
         published.append((topic, body))
-        clock["now"] = 1_000.0
         assert hub.handle_status("bridge-a", bytearray(json.dumps(accepted(body)).encode()))
-        clock["now"] = 1_010.0
+        clocks.advance(10.0)
         assert hub.handle_status("bridge-a", bytearray(json.dumps(started(body)).encode()))
 
     config = blind_config()
@@ -825,7 +890,8 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
         publish,
         ack_timeout=0.001,
         command_id_factory=lambda: "command-1",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     ack = asyncio.run(
         hub.async_transmit(
@@ -838,9 +904,9 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
     assert isinstance(ack, CommandAck)
     assert ack.bridge.bridge_id == "bridge-a"
     assert ack.command_id == "command-1"
-    assert ack.acknowledged_at == 1_000.0
-    assert ack.started_at == 1_010.0
-    assert ack.deadline == 1_013.25
+    assert ack.acknowledged_at == TEST_WALL_TIME
+    assert ack.started_at == TEST_WALL_TIME + 10.0
+    assert ack.deadline == TEST_WALL_TIME + 13.25
     assert published == [
         (
             "rf433/bridge-a/tx",
@@ -996,14 +1062,19 @@ def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> N
     def observe(boot: int, t: int, recv_time: float) -> None:
         observed.append((boot, t, recv_time))
 
-    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     bridge_clock = hub._resolve_bridge_clock("bridge-a")
     monkeypatch.setattr(bridge_clock, "observe", observe)
 
     result = asyncio.run(hub.async_transmit(blind_config(), "UP"))
 
     assert isinstance(result, CommandAck)
-    assert observed == [(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME)]
+    assert observed == [(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME_MONOTONIC)]
 
 
 @pytest.mark.asyncio
@@ -1019,7 +1090,12 @@ async def test_rf_start_records_commanded_start_for_press_staleness(
     async def publish(_topic: str, payload: str) -> None:
         accept_and_start(hub, "bridge-a", json.loads(payload))
 
-    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     monkeypatch.setattr(
         hub._state_sync,
         "record_commanded_start",
@@ -1036,7 +1112,7 @@ async def test_rf_start_records_commanded_start_for_press_staleness(
         (
             config.remote.key,
             frozenset(config.channels),
-            _STATE_SYNC_RECV_TIME,
+            _STATE_SYNC_RECV_TIME_MONOTONIC,
         )
     ]
     hub.close()
@@ -1064,7 +1140,12 @@ async def test_raw_command_stamps_start_only_for_movement_frames(
     async def publish(_topic: str, payload: str) -> None:
         accept_and_start(hub, "bridge-a", json.loads(payload))
 
-    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     channels = frozenset({1})
     config = blind_config()
     raw = encode_b0(
@@ -1086,9 +1167,10 @@ async def test_raw_command_stamps_start_only_for_movement_frames(
         hub._state_sync._dispatch_press(
             (config.remote.key, channels, "DOWN"),
             _STATE_SYNC_RECV_TIME - 1.0,
+            _STATE_SYNC_RECV_TIME_MONOTONIC - 1.0,
             "bridge-b",
-            _STATE_SYNC_RECV_TIME + 1.0,
-            _STATE_SYNC_RECV_TIME + 1.0,
+            _STATE_SYNC_RECV_TIME_MONOTONIC + 1.0,
+            _STATE_SYNC_RECV_TIME_MONOTONIC + 1.0,
         )
 
         assert tuple(event.button for event in events) == expected_buttons
@@ -1138,11 +1220,16 @@ async def test_started_stamp_rejects_older_press_in_same_callback_batch() -> Non
             },
         )
 
-    hub = ZemismartHub(registry, publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     hub._resolve_bridge_clock("bridge-b").observe(
         _STATE_SYNC_BOOT,
         _SEEDED_BRIDGE_T,
-        _STATE_SYNC_RECV_TIME,
+        _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
 
@@ -1189,7 +1276,12 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     member_events: list[HeardEvent] = []
     group_events: list[HeardEvent] = []
     partial_events: list[HeardEvent] = []
@@ -1219,6 +1311,7 @@ def test_handle_rx_dispatches_to_channel_intersecting_listeners() -> None:
         chans=frozenset({1, 2}),
         remote_key=remote_key,
         heard_at=_STATE_SYNC_RECV_TIME,
+        heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
         bridge_id="bridge-a",
     )
     # Contained (member, group) AND partial-overlap ({1, 3} shares channel 1)
@@ -1243,6 +1336,7 @@ def test_dispatch_heard_supersedes_only_matched_configured_channels() -> None:
             chans=frozenset({1}),
             remote_key=foreign_key,
             heard_at=_STATE_SYNC_RECV_TIME,
+            heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
             bridge_id="bridge-a",
         )
     )
@@ -1256,6 +1350,7 @@ def test_dispatch_heard_supersedes_only_matched_configured_channels() -> None:
         chans=frozenset({1, 2, 9}),
         remote_key=remote_key,
         heard_at=_STATE_SYNC_RECV_TIME,
+        heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
         bridge_id="bridge-a",
     )
     hub._dispatch_heard(event)
@@ -1300,6 +1395,7 @@ def test_dispatch_heard_gathers_all_listener_state_before_callbacks() -> None:
             chans=frozenset({1, 2}),
             remote_key=remote_key,
             heard_at=_STATE_SYNC_RECV_TIME,
+            heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
             bridge_id="bridge-a",
         )
     )
@@ -1318,8 +1414,13 @@ def test_handle_rx_maintains_independent_bridge_clocks() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    clock = {"now": 100.0}
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: clock["now"])
+    clocks = SteppableClocks()
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -1334,32 +1435,32 @@ def test_handle_rx_maintains_independent_bridge_clocks() -> None:
         "bridge-a",
         {"frame": frame, "t": 1_000, "boot": _STATE_SYNC_BOOT},
     )
-    clock["now"] = 100.1
+    clocks.advance(0.1)
     hub.handle_rx(
         "bridge-b",
         {"frame": frame, "t": 9_000, "boot": _STATE_SYNC_BOOT + 1},
     )
-    clock["now"] = 101.0
+    clocks.advance(0.9)
     hub.handle_rx(
         "bridge-a",
         {"frame": frame, "t": 2_000, "boot": _STATE_SYNC_BOOT},
     )
-    clock["now"] = 101.1
+    clocks.advance(0.1)
     hub.handle_rx(
         "bridge-b",
         {"frame": frame, "t": 10_000, "boot": _STATE_SYNC_BOOT + 1},
     )
 
-    assert hub._bridge_clocks["bridge-a"].to_ha_time(
+    assert hub._bridge_clocks["bridge-a"].to_monotonic_time(
         _STATE_SYNC_BOOT,
         2_500,
-        101.5,
-    ) == pytest.approx(101.5)
-    assert hub._bridge_clocks["bridge-b"].to_ha_time(
+        TEST_MONOTONIC_TIME + 1.5,
+    ) == pytest.approx(TEST_MONOTONIC_TIME + 1.5)
+    assert hub._bridge_clocks["bridge-b"].to_monotonic_time(
         _STATE_SYNC_BOOT + 1,
         10_500,
-        101.6,
-    ) == pytest.approx(101.6)
+        TEST_MONOTONIC_TIME + 1.6,
+    ) == pytest.approx(TEST_MONOTONIC_TIME + 1.6)
 
 
 def test_bridge_clock_resolver_evicts_least_recently_observed() -> None:
@@ -1386,7 +1487,12 @@ def test_heard_press_from_a_different_remote_reaches_no_listener() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     events: list[HeardEvent] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     hub.register_rx_listener(remote_key, frozenset({1}), events.append)
@@ -1414,7 +1520,12 @@ def test_identical_identity_press_is_mirrored_accepted_residual_risk() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     events: list[HeardEvent] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     hub.register_rx_listener(remote_key, frozenset({1}), events.append)
@@ -1435,6 +1546,7 @@ def test_identical_identity_press_is_mirrored_accepted_residual_risk() -> None:
             chans=frozenset({1}),
             remote_key=remote_key,
             heard_at=_STATE_SYNC_RECV_TIME,
+            heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
             bridge_id="bridge-c",
         )
     ]
@@ -1447,7 +1559,7 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
-    clock = {"now": _STATE_SYNC_RECV_TIME}
+    clocks = SteppableClocks()
 
     async def publish(_topic: str, payload: str) -> None:
         published.append(json.loads(payload))
@@ -1457,7 +1569,8 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
         registry,
         publish,
         command_id_factory=lambda: "ledger-confirmed",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     events: list[HeardEvent] = []
     config = blind_config()
@@ -1491,7 +1604,7 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
         assert not hub._state_sync._holds
         assert "ledger-confirmed" in hub._recent_emission_proofs
 
-        clock["now"] += _LEDGER_STOP_AFTER_MS / _MILLISECONDS_PER_SECOND
+        clocks.advance(_LEDGER_STOP_AFTER_MS / _MILLISECONDS_PER_SECOND)
         hub.handle_rx(
             "bridge-b",
             {
@@ -1542,6 +1655,7 @@ async def test_heard_stop_disarms_published_unstarted_command() -> None:
                 chans=frozenset(config.channels),
                 remote_key=config.remote.key,
                 heard_at=_STATE_SYNC_RECV_TIME,
+                heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
                 bridge_id="bridge-b",
             )
         )
@@ -1597,6 +1711,7 @@ async def test_heard_press_disarms_confirmed_stop_command() -> None:
             chans=frozenset(config.channels),
             remote_key=config.remote.key,
             heard_at=_STATE_SYNC_RECV_TIME,
+            heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
             bridge_id="bridge-b",
         )
     )
@@ -1649,6 +1764,7 @@ async def test_heard_press_does_not_disarm_displaced_confirmed_command() -> None
             chans=frozenset(config.channels),
             remote_key=config.remote.key,
             heard_at=_STATE_SYNC_RECV_TIME,
+            heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
             bridge_id="bridge-b",
         )
     )
@@ -1679,6 +1795,7 @@ async def test_unconfirmed_command_retires_ledger_and_releases_peer_hold(
         publish,
         command_id_factory=lambda: f"ledger-{terminal_status}",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     events: list[HeardEvent] = []
     config = blind_config()
@@ -1727,7 +1844,12 @@ def test_handle_rx_bounds_forged_bridge_ids() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -1753,12 +1875,21 @@ def test_close_clears_state_sync_registries_and_stops_callbacks() -> None:
     async def publish(_topic: str, _payload: str) -> None:
         return
 
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     events: list[HeardEvent] = []
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     hub.register_rx_listener(remote_key, frozenset({1}), events.append)
     bridge_clock = hub._resolve_bridge_clock("bridge-a")
-    bridge_clock.observe(_STATE_SYNC_BOOT, _STATE_SYNC_T, _STATE_SYNC_RECV_TIME)
+    bridge_clock.observe(
+        _STATE_SYNC_BOOT,
+        _STATE_SYNC_T,
+        _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     for index in range(_FORGED_BRIDGE_COUNT):
         hub._record_emission_proof(f"command-{index}")
 
@@ -1808,7 +1939,7 @@ async def test_disarm_retries_are_deduped_by_bridge_and_command(
             acknowledged.set()
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    deadline = hub._now() + _DISARM_TEST_DEADLINE_SECONDS
+    deadline = hub._monotonic_now() + _DISARM_TEST_DEADLINE_SECONDS
     request = hub._start_disarm_request("bridge-a", "timed-command", deadline)
     joined = hub._start_disarm_request("bridge-a", "timed-command", deadline)
     assert joined is request
@@ -1839,7 +1970,7 @@ async def test_joined_disarm_extends_deadline_for_a_late_ack() -> None:
         return
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    now = hub._now()
+    now = hub._monotonic_now()
     request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
@@ -1873,7 +2004,7 @@ async def test_joined_disarm_times_out_at_widest_deadline() -> None:
         return
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    now = hub._now()
+    now = hub._monotonic_now()
     request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
@@ -1934,6 +2065,7 @@ async def test_later_cover_owned_press_widens_live_ledger_disarm(
         chans=frozenset({1}),
         remote_key=remote_key,
         heard_at=hub._now(),
+        heard_at_monotonic=hub._monotonic_now(),
         bridge_id="synthetic-rx-bridge",
     )
     started_at = asyncio.get_running_loop().time()
@@ -1941,7 +2073,7 @@ async def test_later_cover_owned_press_widens_live_ledger_disarm(
     request = hub._disarm_requests[("bridge-a", "ledger-command")]
     generic_deadline = request.deadline
     generic_loop_deadline = request.loop_deadline
-    owned_deadline = hub._now() + _TAKEOVER_OWNED_DEADLINE_SECONDS
+    owned_deadline = hub._monotonic_now() + _TAKEOVER_OWNED_DEADLINE_SECONDS
     state = TakeoverCoverState(
         "bridge-a",
         "ledger-command",
@@ -1991,7 +2123,7 @@ async def test_disarm_does_not_republish_while_puback_is_pending(
     request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
-        hub._now() + _DISARM_PENDING_DEADLINE_SECONDS,
+        hub._monotonic_now() + _DISARM_PENDING_DEADLINE_SECONDS,
     )
     task = request.task
     assert task is not None
@@ -2027,7 +2159,7 @@ async def test_disarm_retry_backoff_doubles_and_caps(
     request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
-        hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
+        hub._monotonic_now() + _DISARM_TEST_DEADLINE_SECONDS,
     )
     task = request.task
     assert task is not None
@@ -2052,7 +2184,7 @@ async def test_close_cancels_disarm_task_and_waiter_before_publish() -> None:
     request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
-        hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
+        hub._monotonic_now() + _DISARM_TEST_DEADLINE_SECONDS,
     )
     task = request.task
     assert task is not None
@@ -2565,7 +2697,7 @@ async def test_execute_drains_started_exception_after_prestart_disarm() -> None:
         hub._start_disarm_request(
             "bridge-a",
             command_id,
-            hub._now() + _DISARM_TEST_DEADLINE_SECONDS,
+            hub._monotonic_now() + _DISARM_TEST_DEADLINE_SECONDS,
         )
         assert hub.handle_status(
             "bridge-a",
@@ -2609,11 +2741,11 @@ async def test_execute_drains_started_exception_after_prestart_disarm() -> None:
 async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     """Flushed STOPs are echoes, while a STOP at the freed deadline is physical."""
     events: list[HeardEvent] = []
-    clock = {"now": _STATE_SYNC_RECV_TIME}
+    clocks = SteppableClocks()
     hub, published = acking_hub(
         command_id_factory=lambda: "displaced-confirmed",
-        now=lambda: clock["now"],
-        monotonic_now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2624,16 +2756,16 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     )
     assert isinstance(result, CommandAck)
     body = published[0]
-    assert len(hub._air.reservation_snapshot(now=clock["now"])) == 1
+    assert len(hub._air.reservation_snapshot(now=clocks.monotonic)) == 1
 
-    clock["now"] = _DISPLACED_AT
+    clocks.set_monotonic(_DISPLACED_AT)
     assert hub.handle_status(
         "bridge-a",
         {"status": "displaced", "command_id": "displaced-confirmed"},
     )
-    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
-    assert hub._air.drain_until("bridge-a", now=clock["now"]) == pytest.approx(143.145)
-    clock["now"] = _DISPLACED_FLUSH_AT
+    assert hub._air.reservation_snapshot(now=clocks.monotonic) == ()
+    assert hub._air.drain_until("bridge-a", now=clocks.monotonic) == pytest.approx(243.145)
+    clocks.set_monotonic(_DISPLACED_FLUSH_AT)
     hub.handle_rx(
         "bridge-b",
         {
@@ -2644,7 +2776,7 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     )
     assert events == []
 
-    clock["now"] = _DISPLACED_ORIGINAL_STOP_AT
+    clocks.set_monotonic(_DISPLACED_ORIGINAL_STOP_AT)
     hub.handle_rx(
         "bridge-b",
         {
@@ -2664,7 +2796,7 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
-    clock = {"now": _STATE_SYNC_RECV_TIME}
+    clocks = SteppableClocks()
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -2677,8 +2809,8 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         registry,
         publish,
         command_id_factory=lambda: "displaced-disarmed",
-        now=lambda: clock["now"],
-        monotonic_now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2690,12 +2822,12 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
     assert isinstance(result, CommandAck)
     body = published[0]
 
-    clock["now"] = _DISPLACED_AT
+    clocks.set_monotonic(_DISPLACED_AT)
     assert hub.handle_status(
         "bridge-a",
         {"status": "displaced", "command_id": "displaced-disarmed"},
     )
-    displaced_drain = hub._air.drain_until("bridge-a", now=clock["now"])
+    displaced_drain = hub._air.drain_until("bridge-a", now=clocks.monotonic)
     hub._start_disarm_request(
         "bridge-a",
         "displaced-disarmed",
@@ -2705,10 +2837,10 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         "bridge-a",
         {"status": "disarmed", "command_id": "displaced-disarmed"},
     )
-    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
-    assert hub._air.drain_until("bridge-a", now=clock["now"]) == displaced_drain
+    assert hub._air.reservation_snapshot(now=clocks.monotonic) == ()
+    assert hub._air.drain_until("bridge-a", now=clocks.monotonic) == displaced_drain
 
-    clock["now"] = _DISPLACED_FLUSH_AT
+    clocks.set_monotonic(_DISPLACED_FLUSH_AT)
     hub.handle_rx(
         "bridge-b",
         {
@@ -2736,7 +2868,7 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
-    clock = {"now": _STATE_SYNC_RECV_TIME}
+    clocks = SteppableClocks()
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
@@ -2754,8 +2886,8 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
         registry,
         publish,
         command_id_factory=lambda: "displaced-race",
-        now=lambda: clock["now"],
-        monotonic_now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2766,10 +2898,10 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
     )
     assert isinstance(result, CommandAck)
     body = published[0]
-    assert hub._air.reservation_snapshot(now=clock["now"]) == ()
-    assert hub._air.drain_until("bridge-a", now=clock["now"]) == pytest.approx(106.19)
+    assert hub._air.reservation_snapshot(now=clocks.monotonic) == ()
+    assert hub._air.drain_until("bridge-a", now=clocks.monotonic) == pytest.approx(206.19)
 
-    clock["now"] = _STATE_SYNC_RECV_TIME + 0.1
+    clocks.advance(0.1)
     hub.handle_rx(
         "bridge-b",
         {
@@ -2780,7 +2912,7 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
     )
     assert events == []
 
-    clock["now"] = _DISPLACED_ORIGINAL_STOP_AT
+    clocks.set_monotonic(_DISPLACED_ORIGINAL_STOP_AT)
     hub.handle_rx(
         "bridge-b",
         {
@@ -2798,12 +2930,12 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
     """A clamped projection never anchors a delayed delivery at NOW.
 
     With a small age_ms the corroboration tolerance alone would accept a
-    projection that to_ha_time clamped to recv_time; the exact-recv guard
+    projection that to_monotonic_time clamped to recv_time; the exact-recv guard
     must reject it and keep the recv - age baseline anchor.
     """
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
-    clock = {"now": _STATE_SYNC_RECV_TIME}
+    clocks = SteppableClocks()
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
@@ -2820,7 +2952,12 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
             },
         )
 
-    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     seed_frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -2834,7 +2971,7 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
         "bridge-a",
         {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
     )
-    clock["now"] = _CLAMPED_DELIVERY_TIME
+    clocks.set_monotonic(_CLAMPED_DELIVERY_TIME_MONOTONIC)
 
     ack = await hub.async_transmit(blind_config(), "DOWN")
 
@@ -2856,7 +2993,7 @@ async def test_disarm_after_resolved_waiter_starts_fresh_request() -> None:
         return
 
     hub = ZemismartHub(BridgeRegistry(), publish)
-    now = hub._now()
+    now = hub._monotonic_now()
 
     old_request = hub._start_disarm_request(
         "bridge-a",
@@ -2869,7 +3006,7 @@ async def test_disarm_after_resolved_waiter_starts_fresh_request() -> None:
     new_request = hub._start_disarm_request(
         "bridge-a",
         "timed-command",
-        hub._now() + _DISARM_SHORT_DEADLINE_SECONDS,
+        hub._monotonic_now() + _DISARM_SHORT_DEADLINE_SECONDS,
     )
     try:
         assert new_request is not old_request
@@ -3115,12 +3252,17 @@ async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
             {"status": "started", "command_id": body["command_id"], "age_ms": 5_000},
         )
 
-    clock = {"now": 100.0}
-    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    clocks = SteppableClocks()
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     ack = await hub.async_transmit(blind_config(), "UP")
 
     assert isinstance(ack, CommandAck)
-    assert ack.started_at == pytest.approx(95.0)
+    assert ack.started_at == pytest.approx(TEST_WALL_TIME - 5.0)
 
 
 @pytest.mark.asyncio
@@ -3128,7 +3270,7 @@ async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
     """A seeded bridge clock removes network delay from STARTED handoff time."""
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
-    clock = {"now": 100.0}
+    clocks = SteppableClocks()
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
@@ -3145,7 +3287,12 @@ async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
             },
         )
 
-    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     seed_frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -3159,12 +3306,12 @@ async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
         "bridge-a",
         {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
     )
-    clock["now"] = _STARTED_DELIVERY_TIME
+    clocks.set_monotonic(_STARTED_DELIVERY_TIME_MONOTONIC)
 
     ack = await hub.async_transmit(blind_config(), "DOWN")
 
     assert isinstance(ack, CommandAck)
-    assert ack.started_at == pytest.approx(100.0)
+    assert ack.started_at == pytest.approx(TEST_WALL_TIME)
 
 
 @pytest.mark.asyncio
@@ -3192,6 +3339,7 @@ async def test_started_status_without_seed_falls_back_to_delivery_age() -> None:
         registry,
         publish,
         now=lambda: _STARTED_DELIVERY_TIME,
+        monotonic_now=lambda: _STARTED_DELIVERY_TIME_MONOTONIC,
     )
 
     ack = await hub.async_transmit(blind_config(), "DOWN")
@@ -3206,14 +3354,14 @@ async def test_started_status_without_seed_falls_back_to_delivery_age() -> None:
 async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
     """A replay older than the projection clamp still back-dates by age_ms.
 
-    to_ha_time collapses any projection older than 30 s to receive time; a
+    to_monotonic_time collapses any projection older than 30 s to receive time; a
     QoS-1 replayed STARTED can be legitimately minutes old, so the clamped
     projection must be rejected in favor of the recv - age baseline anchor
     instead of anchoring the model at delivery time.
     """
     registry = BridgeRegistry()
     registry.update_availability("bridge-a", "online")
-    clock = {"now": 100.0}
+    clocks = SteppableClocks()
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
@@ -3230,7 +3378,12 @@ async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
             },
         )
 
-    hub = ZemismartHub(registry, publish, now=lambda: clock["now"])
+    hub = ZemismartHub(
+        registry,
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     seed_frame = encode_b0(
         make_payload(
             TEST_PREFIX,
@@ -3244,7 +3397,7 @@ async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
         "bridge-a",
         {"frame": seed_frame, "t": _SEEDED_BRIDGE_T, "boot": _STATE_SYNC_BOOT},
     )
-    clock["now"] = _REPLAY_DELIVERY_TIME
+    clocks.set_monotonic(_REPLAY_DELIVERY_TIME_MONOTONIC)
 
     ack = await hub.async_transmit(blind_config(), "DOWN")
 
@@ -3513,7 +3666,10 @@ async def test_stale_overlap_token_supersedes_the_movement() -> None:
 @pytest.mark.asyncio
 async def test_heard_press_invalidates_overlap_token_before_publish() -> None:
     """A physical press makes a pre-press set-position movement stale."""
-    hub, published = acking_hub(now=lambda: _STATE_SYNC_RECV_TIME)
+    hub, published = acking_hub(
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
     token = hub.overlap_token(config)
@@ -3592,6 +3748,7 @@ async def test_press_heard_during_lock_contention_supersedes_the_timed_rf(
                 chans=frozenset(config.channels),
                 remote_key=config.remote.key,
                 heard_at=_STATE_SYNC_RECV_TIME,
+                heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
                 bridge_id="bridge-b",
             )
         )
@@ -3613,6 +3770,7 @@ async def test_scheduled_heard_press_supersedes_full_move_before_publisher_enque
         chans=frozenset(config.channels),
         remote_key=config.remote.key,
         heard_at=_STATE_SYNC_RECV_TIME,
+        heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
         bridge_id="bridge-b",
     )
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
@@ -3649,6 +3807,7 @@ async def test_chained_scheduled_press_is_rechecked_inside_publisher_task(
         chans=frozenset(config.channels),
         remote_key=config.remote.key,
         heard_at=_STATE_SYNC_RECV_TIME,
+        heard_at_monotonic=_STATE_SYNC_RECV_TIME_MONOTONIC,
         bridge_id="bridge-b",
     )
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), lambda _event: None)
@@ -3898,6 +4057,7 @@ async def test_ledger_registers_the_final_under_lock_coalesced_frame(
         publish,
         command_id_factory=lambda: "ledger-final-frame",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     original_rebuild = hub._rebuild_from_live_contributors
 
@@ -3973,6 +4133,7 @@ async def test_started_stamp_uses_final_under_lock_coalesced_channels(
         publish,
         command_id_factory=lambda: "final-started-channels",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     original_rebuild = hub._rebuild_from_live_contributors
 
@@ -3997,14 +4158,16 @@ async def test_started_stamp_uses_final_under_lock_coalesced_channels(
     accept_and_start(hub, "bridge-a", published[0])
     assert isinstance(await first, CommandAck)
     older_at = _STATE_SYNC_RECV_TIME - 1.0
-    seen_at = _STATE_SYNC_RECV_TIME + 1.0
+    older_at_monotonic = _STATE_SYNC_RECV_TIME_MONOTONIC - 1.0
+    seen_at_monotonic = _STATE_SYNC_RECV_TIME_MONOTONIC + 1.0
     for channels in (frozenset({2}), frozenset({1})):
         hub._state_sync._dispatch_press(
             (first_config.remote.key, channels, "DOWN"),
             older_at,
+            older_at_monotonic,
             "bridge-b",
-            seen_at,
-            seen_at,
+            seen_at_monotonic,
+            seen_at_monotonic,
         )
 
     assert [event.chans for event in events] == [frozenset({2})]
@@ -4449,7 +4612,11 @@ async def test_disarm_idle_callback_fires_once_when_last_request_resolves() -> N
     hub = ZemismartHub(BridgeRegistry(), publisher)
     assert hub.has_pending_disarms is False
 
-    request = hub._start_disarm_request("bridge-a", "cmd-live", hub._now() + 30.0)
+    request = hub._start_disarm_request(
+        "bridge-a",
+        "cmd-live",
+        hub._monotonic_now() + 30.0,
+    )
     assert hub.has_pending_disarms is True
 
     fired: list[int] = []
@@ -4461,7 +4628,11 @@ async def test_disarm_idle_callback_fires_once_when_last_request_resolves() -> N
     assert hub.has_pending_disarms is False
 
     # One-shot: a later drain must not re-fire the consumed callback.
-    second = hub._start_disarm_request("bridge-a", "cmd-live-2", hub._now() + 30.0)
+    second = hub._start_disarm_request(
+        "bridge-a",
+        "cmd-live-2",
+        hub._monotonic_now() + 30.0,
+    )
     hub.on_disarmed("bridge-a", "cmd-live-2")
     assert second.task is not None
     await asyncio.wait_for(second.task, timeout=1.0)
@@ -4527,7 +4698,7 @@ def test_dispatched_press_resets_overlapping_debounce_signatures() -> None:
         clock_resolver=lambda bridge_id: clocks.setdefault(bridge_id, BridgeClock()),
         dispatch=dispatched.append,
         on_emission_proof=lambda _proof: None,
-        now=lambda: now_value[0],
+        monotonic_now=lambda: now_value[0],
     )
     up = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_BASES))
     stop = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "STOP", bases=TEST_BASES))
@@ -4602,7 +4773,7 @@ def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
     """A high-repeats command's tail echo stays recognized as our own emission."""
     registry = _online_registry()
     published: list[tuple[str, dict[str, Any]]] = []
-    clock = {"now": 1_000.0}
+    clocks = SteppableClocks()
 
     async def publish(topic: str, payload: str) -> None:
         body = json.loads(payload)
@@ -4617,17 +4788,18 @@ def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
         registry,
         publish,
         command_id_factory=lambda: "command-repeats",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=None))
     action_raw = published[0][1]["raw"]
     assert isinstance(action_raw, str)
 
     # Still inside the envelope 10 s after handoff.
-    clock["now"] = 1_010.0
+    clocks.advance(10.0)
     assert hub.frame_is_own_emission(action_raw) is True
     # Well past the whole train, a genuine press is no longer masked.
-    clock["now"] = 1_100.0
+    clocks.advance(90.0)
     assert hub.frame_is_own_emission(action_raw) is False
 
 
@@ -4648,7 +4820,7 @@ def test_timed_move_envelope_stops_at_the_preempting_stop_deadline() -> None:
     """An armed timed STOP preempts action repeats, so the window must shrink."""
     registry = _online_registry()
     published: list[dict[str, Any]] = []
-    clock = {"now": 1_000.0}
+    clocks = SteppableClocks()
 
     async def publish(topic: str, payload: str) -> None:
         body = json.loads(payload)
@@ -4662,18 +4834,19 @@ def test_timed_move_envelope_stops_at_the_preempting_stop_deadline() -> None:
         registry,
         publish,
         command_id_factory=lambda: "command-timed",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=1_000))
     action_raw = published[0]["raw"]
     assert isinstance(action_raw, str)
 
     # Shortly after the deadline the action frame is still plausibly ours.
-    clock["now"] = 1_001.5
+    clocks.advance(1.5)
     assert hub.frame_is_own_emission(action_raw) is True
     # Long after the preempting STOP, a same-direction press is a REAL press
     # and must not be swallowed as our own echo.
-    clock["now"] = 1_010.0
+    clocks.advance(8.5)
     assert hub.frame_is_own_emission(action_raw) is False
 
 
@@ -4686,7 +4859,7 @@ def test_pending_command_is_not_proof_of_emission() -> None:
     """
     registry = _online_registry()
     verdict: dict[str, bool] = {}
-    clock = {"now": 500.0}
+    clocks = SteppableClocks()
 
     async def publish(topic: str, payload: str) -> None:
         # Acknowledge admission but NEVER report `started`: published and
@@ -4704,7 +4877,8 @@ def test_pending_command_is_not_proof_of_emission() -> None:
         ack_timeout=0.05,
         started_timeout=0.05,
         command_id_factory=lambda: "command-pending",
-        now=lambda: clock["now"],
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
     )
     with suppress(CommandStartedTimeoutError, CommandAckTimeoutError):
         asyncio.run(hub.async_transmit(blind_config(), "UP", stop_after_ms=None))
@@ -5703,7 +5877,12 @@ def _rx_hub() -> tuple[ZemismartHub, list[HeardEvent]]:
         return
 
     events: list[HeardEvent] = []
-    return ZemismartHub(BridgeRegistry(), publish, now=lambda: _STATE_SYNC_RECV_TIME), events
+    return ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
+    ), events
 
 
 def test_hub_rx_rejects_a_miscalibrated_frame_through_the_real_wiring() -> None:
@@ -5811,6 +5990,7 @@ async def test_untabled_remotes_command_is_registered_in_the_ledger() -> None:
         publish,
         command_id_factory=lambda: "untabled-1",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     config = replace(
         blind_config(),
@@ -5934,6 +6114,7 @@ async def test_untabled_timed_command_registers_its_armed_stop() -> None:
         publish,
         command_id_factory=lambda: "untabled-timed",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     config = replace(
         blind_config(),
@@ -6000,6 +6181,7 @@ async def test_untabled_own_emission_is_recognised_by_the_learn_guard() -> None:
         publish,
         command_id_factory=lambda: "untabled-learn",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     config = replace(
         blind_config(),
@@ -6058,6 +6240,7 @@ async def test_untabled_command_records_its_commanded_start() -> None:
         publish,
         command_id_factory=lambda: "untabled-start",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     config = replace(
         blind_config(),
@@ -6110,6 +6293,7 @@ async def test_raw_frame_for_a_loaded_untabled_remote_is_ledgered() -> None:
         publish,
         command_id_factory=lambda: "raw-untabled",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     remote_key = f"{UNTABLED_PREFIX:06x}:{UNTABLED_REMOTE_ID:02x}"
     events: list[HeardEvent] = []
@@ -6202,6 +6386,7 @@ async def test_raw_resolves_bases_registered_before_any_listener() -> None:
         publish,
         command_id_factory=lambda: "raw-window",
         now=lambda: _STATE_SYNC_RECV_TIME,
+        monotonic_now=lambda: _STATE_SYNC_RECV_TIME_MONOTONIC,
     )
     remote_key = f"{UNTABLED_PREFIX:06x}:{UNTABLED_REMOTE_ID:02x}"
     # Registered like async_setup_entry does -- and deliberately NO rx listener,

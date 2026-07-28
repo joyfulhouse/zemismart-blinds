@@ -66,6 +66,7 @@ _LOGGER = logging.getLogger(__name__)
 # with no useful message. A named tuple is left alone by the formatter and
 # parses everywhere (#43).
 _PAYLOAD_ERRORS: Final = (UnicodeDecodeError, json.JSONDecodeError)
+_COERCION_ERRORS: Final = (TypeError, ValueError)
 
 Button = Literal["UP", "DOWN", "STOP", "TRAILER"]
 Publisher = Callable[[str, str], Awaitable[None]]
@@ -480,7 +481,7 @@ class RemoteConfig:
                 raise ValueError(msg)
             try:
                 cover = CoverConfig.from_stored(cover_id, row)
-            except (TypeError, ValueError) as err:
+            except _COERCION_ERRORS as err:
                 row_id = normalized_cover_id or repr(raw_cover_id)
                 msg = f"invalid cover row {row_id}: {err}"
                 raise ValueError(msg) from err
@@ -904,12 +905,20 @@ class _BridgeStatus:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _StartedStatus:
+    """Carry one RF start in both publication and live clock domains."""
+
+    started_at: float
+    started_at_monotonic: float
+
+
 @dataclass(slots=True)
 class _PendingStatuses:
     """Lifecycle waiters and RF identity for one correlated command."""
 
     admission: asyncio.Future[_BridgeStatus]
-    started: asyncio.Future[float]
+    started: asyncio.Future[_StartedStatus]
     remote_key: str | None
     channels: frozenset[int]
 
@@ -937,7 +946,7 @@ class TakeoverCoverState:
     bridge_id: str | None
     command_id: str | None
     button: Button | None
-    disarm_deadline: float | None
+    disarm_deadline_monotonic: float | None
     stopped_by_heard: bool
 
 
@@ -950,7 +959,7 @@ class _TakeoverTarget:
     channels: frozenset[int]
     button: str
     confirmed: bool | None
-    owned_deadline: float | None = None
+    owned_deadline_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -991,7 +1000,9 @@ class CommandAck:
     command_id: str
     acknowledged_at: float
     started_at: float
+    started_at_monotonic: float
     deadline: float | None
+    deadline_monotonic: float | None
 
 
 type CommandResult = CommandAck | Literal["superseded"]
@@ -1121,7 +1132,7 @@ class ZemismartHub:
             resolve_bases=self._resolve_remote_bases,
             dispatch=self._dispatch_heard,
             on_emission_proof=self._record_emission_proof,
-            now=self._now,
+            monotonic_now=self._monotonic_now,
         )
         self._pending: dict[tuple[str, str], _PendingStatuses] = {}
         self._disarm_requests: dict[tuple[str, str], _DisarmRequest] = {}
@@ -1169,7 +1180,7 @@ class ZemismartHub:
         """
         if len(command_id) > _DISPLACED_MAX_ID_LENGTH:
             return
-        now = self._now()
+        now = self._monotonic_now()
         self._recent_displaced[command_id] = now
         expired = [
             key
@@ -1190,7 +1201,7 @@ class ZemismartHub:
         otherwise be lost.
         """
         seen = self._recent_displaced.get(command_id)
-        return seen is not None and self._now() - seen <= _DISPLACED_MEMORY_SECONDS
+        return seen is not None and self._monotonic_now() - seen <= _DISPLACED_MEMORY_SECONDS
 
     def diagnostics_snapshot(self) -> dict[str, int]:
         """Return the hub's outstanding-work counts for a diagnostics dump.
@@ -1224,7 +1235,10 @@ class ZemismartHub:
 
     def command_takeover_live(self, command_id: str) -> bool:
         """Return whether a cover-owned command can still affect takeover."""
-        return self._ledger.command_live_for_takeover(command_id, self._now())
+        return self._ledger.command_live_for_takeover(
+            command_id,
+            self._monotonic_now(),
+        )
 
     def frame_is_own_emission(self, frame_hex: str) -> bool:
         """Return whether a captured frame is one this hub PROVABLY put on air.
@@ -1244,14 +1258,14 @@ class ZemismartHub:
         signature = frame_signature(frame_hex, self._resolve_remote_bases)
         if signature is None:
             return False
-        match = self._ledger.match(signature, self._now())
+        match = self._ledger.match(signature, self._monotonic_now())
         return match is not None and match[0] == "confirmed"
 
     def _record_emission_proof(self, command_id: str) -> None:
         """Remember proof and notify only command-id-aware cover listeners."""
         if self._closed or len(command_id) > _EMISSION_PROOF_MAX_ID_LENGTH:
             return
-        now = self._now()
+        now = self._monotonic_now()
         self._recent_emission_proofs.pop(command_id, None)
         self._recent_emission_proofs[command_id] = now
         expired = [
@@ -1269,7 +1283,7 @@ class ZemismartHub:
     def was_emission_proven(self, command_id: str) -> bool:
         """Return whether a peer recently proved this exact command emitted."""
         seen = self._recent_emission_proofs.get(command_id)
-        return seen is not None and self._now() - seen <= _EMISSION_PROOF_MEMORY_SECONDS
+        return seen is not None and self._monotonic_now() - seen <= _EMISSION_PROOF_MEMORY_SECONDS
 
     def register_rx_listener(
         self,
@@ -1374,7 +1388,8 @@ class ZemismartHub:
         payload: Mapping[str, object],
     ) -> None:
         """Validate and classify one bridge RX contract payload."""
-        recv_time = self._now()
+        received_at = self._now()
+        received_at_monotonic = self._monotonic_now()
         frame_hex = payload.get("frame")
         t = _strict_uint32(payload.get("t"))
         boot = _strict_uint32(payload.get("boot"))
@@ -1388,7 +1403,8 @@ class ZemismartHub:
             boot,
             t,
             frame_hex,
-            recv_time,
+            received_at,
+            received_at_monotonic=received_at_monotonic,
         )
 
     def _resolve_bridge_clock(self, bridge_id: str) -> BridgeClock:
@@ -1452,15 +1468,15 @@ class ZemismartHub:
         """Gather, deduplicate, and disarm every live takeover target."""
         if self._closed:
             return
-        now = self._now()
+        now = self._monotonic_now()
         for target in self._takeover_targets(event, listeners, now):
             key = (target.bridge_id, target.command_id)
             request = self._disarm_requests.get(key)
-            if target.owned_deadline is not None:
+            if target.owned_deadline_monotonic is not None:
                 request = self._start_disarm_request(
                     target.bridge_id,
                     target.command_id,
-                    target.owned_deadline,
+                    target.owned_deadline_monotonic,
                 )
             elif request is None or request.waiter.done():
                 request = self._start_disarm_request(
@@ -1523,7 +1539,7 @@ class ZemismartHub:
             state.bridge_id is None
             or state.command_id is None
             or state.button is None
-            or state.disarm_deadline is None
+            or state.disarm_deadline_monotonic is None
         ):
             return
         key = (state.bridge_id, state.command_id)
@@ -1536,14 +1552,17 @@ class ZemismartHub:
                     channels=listener.channels,
                     button=state.button,
                     confirmed=None,
-                    owned_deadline=state.disarm_deadline,
+                    owned_deadline_monotonic=state.disarm_deadline_monotonic,
                 )
             return
         target.channels |= listener.channels
-        if target.owned_deadline is None:
-            target.owned_deadline = state.disarm_deadline
+        if target.owned_deadline_monotonic is None:
+            target.owned_deadline_monotonic = state.disarm_deadline_monotonic
         else:
-            target.owned_deadline = max(target.owned_deadline, state.disarm_deadline)
+            target.owned_deadline_monotonic = max(
+                target.owned_deadline_monotonic,
+                state.disarm_deadline_monotonic,
+            )
 
     @staticmethod
     def _merge_takeover_context(
@@ -1674,12 +1693,15 @@ class ZemismartHub:
                 # runs both callbacks before the awaiter). Confirm from the
                 # resolved future first so displace() re-windows the flushed
                 # STOPs instead of retiring the still-pending entry.
-                self._ledger.confirm(command_id, displaced_pending.started.result())
+                self._ledger.confirm(
+                    command_id,
+                    displaced_pending.started.result().started_at_monotonic,
+                )
         # Unlike "started" this payload carries no age_ms, so the only anchor
         # available is raw receipt and the ledger has to budget the transport
         # lag instead of measuring it. Firmware stamping age_ms here would let
         # this call pass a corrected instant, as _handle_started_status does.
-        flushed = self._ledger.displace(command_id, self._now())
+        flushed = self._ledger.displace(command_id, self._monotonic_now())
         self._state_sync.resume_holds(command_id)
         disarm_request = self._disarm_requests.get((bridge_id, command_id))
         if disarm_request is not None and not disarm_request.waiter.done():
@@ -1705,8 +1727,8 @@ class ZemismartHub:
         """Resolve first dispatch and correlate an optional bridge clock sample."""
         if pending.started.done():
             return False
-        recv_time = self._now()
-        monotonic_receipt = self._monotonic_now()
+        received_at = self._now()
+        received_at_monotonic = self._monotonic_now()
         t = _strict_uint32(decoded.get("t"))
         boot = _strict_uint32(decoded.get("boot"))
         raw_age = decoded.get("age_ms")
@@ -1720,40 +1742,54 @@ class ZemismartHub:
         self._air.started(
             bridge_id,
             command_id,
-            started_at=monotonic_receipt - age_ms / _MILLISECONDS_PER_SECOND,
+            started_at=received_at_monotonic - age_ms / _MILLISECONDS_PER_SECOND,
             boot=boot,
-            now=monotonic_receipt,
+            now=received_at_monotonic,
         )
-        started_at = recv_time - age_ms / _MILLISECONDS_PER_SECOND
+        started_at_monotonic = received_at_monotonic - age_ms / _MILLISECONDS_PER_SECOND
         if t is not None and boot is not None:
             clock = self._resolve_bridge_clock(bridge_id)
             if clock.can_project(boot):
                 handoff_t = (t - age_ms) & _UINT32_MAX
-                projected = clock.to_ha_time(boot, handoff_t, recv_time)
+                projected_monotonic = clock.to_monotonic_time(
+                    boot,
+                    handoff_t,
+                    received_at_monotonic,
+                )
                 # The projection refines the age-based estimate by removing
                 # network delivery delay — but a QoS-1 REPLAYED handoff can be
-                # legitimately hours old, and to_ha_time's plausibility clamp
-                # collapses any projection older than 30 s to recv_time.
+                # legitimately hours old, and the bridge clock's plausibility
+                # clamp collapses any projection older than 30 s to receipt.
                 # Accept the projection only when it corroborates the
                 # age-based estimate; otherwise keep recv - age (the shipped
                 # baseline anchor), never a clamped delivery-time anchor. An
-                # exact recv_time result means to_ha_time clamped an
+                # exact receipt result means the bridge clock clamped an
                 # implausible projection — with a small age_ms the tolerance
                 # alone would accept that clamp and anchor a delayed delivery
                 # at NOW, so a clamped value is always rejected.
                 if (
-                    projected != recv_time
-                    and abs(projected - started_at) <= _STARTED_PROJECTION_TOLERANCE_SECONDS
+                    projected_monotonic != received_at_monotonic
+                    and abs(projected_monotonic - started_at_monotonic)
+                    <= _STARTED_PROJECTION_TOLERANCE_SECONDS
                 ):
-                    started_at = projected
-            clock.observe(boot, t, recv_time)
+                    started_at_monotonic = projected_monotonic
+            clock.observe(boot, t, received_at_monotonic)
+        # Preserve the diagnostic/persistence wall companion by applying the
+        # monotonic age once. No live comparison consumes this projected wall
+        # stamp.
+        started_at = received_at - (received_at_monotonic - started_at_monotonic)
         if pending.remote_key is not None:
             self._state_sync.record_commanded_start(
                 pending.remote_key,
                 pending.channels,
-                started_at,
+                started_at_monotonic,
             )
-        pending.started.set_result(started_at)
+        pending.started.set_result(
+            _StartedStatus(
+                started_at=started_at,
+                started_at_monotonic=started_at_monotonic,
+            ),
+        )
         return True
 
     def on_disarmed(self, bridge_id: str, command_id: str) -> None:
@@ -1801,10 +1837,10 @@ class ZemismartHub:
             existing.deadline = max(existing.deadline, deadline)
             existing.loop_deadline = max(
                 existing.loop_deadline,
-                loop.time() + max(0.0, deadline - self._now()),
+                loop.time() + max(0.0, deadline - self._monotonic_now()),
             )
             return existing
-        remaining = max(0.0, deadline - self._now())
+        remaining = max(0.0, deadline - self._monotonic_now())
         request = _DisarmRequest(
             bridge_id=bridge_id,
             command_id=command_id,
@@ -2571,9 +2607,9 @@ class ZemismartHub:
 
     async def _await_started(
         self,
-        future: asyncio.Future[float],
+        future: asyncio.Future[_StartedStatus],
         command_id: str,
-    ) -> float:
+    ) -> _StartedStatus:
         """Await actual first RF dispatch with a scheduler-sized fixed bound."""
         try:
             return await asyncio.wait_for(future, timeout=self._started_timeout)
@@ -2938,9 +2974,9 @@ class ZemismartHub:
                 command_id,
             )
             status = await self._await_status(pending.admission, command_id)
-            started_at = await self._await_started(pending.started, command_id)
+            started = await self._await_started(pending.started, command_id)
             if command.ledger_registered:
-                self._ledger.confirm(command_id, started_at)
+                self._ledger.confirm(command_id, started.started_at_monotonic)
                 ledger_confirmed = True
                 self._state_sync.resume_holds(command_id)
         except CommandStartedTimeoutError:
@@ -2970,7 +3006,12 @@ class ZemismartHub:
             bridge.bridge_id,
         )
         deadline = (
-            started_at + command.stop_after_ms / 1_000
+            started.started_at + command.stop_after_ms / 1_000
+            if command.stop_after_ms is not None
+            else None
+        )
+        deadline_monotonic = (
+            started.started_at_monotonic + command.stop_after_ms / 1_000
             if command.stop_after_ms is not None
             else None
         )
@@ -2978,8 +3019,10 @@ class ZemismartHub:
             bridge=bridge,
             command_id=command_id,
             acknowledged_at=status.acknowledged_at,
-            started_at=started_at,
+            started_at=started.started_at,
+            started_at_monotonic=started.started_at_monotonic,
             deadline=deadline,
+            deadline_monotonic=deadline_monotonic,
         )
 
     @staticmethod
@@ -3199,7 +3242,7 @@ class ZemismartHub:
         command gets an acknowledged disarm request, awaited (bounded) so no
         old-identity frame can transmit after an identity swap completes.
         """
-        now = self._now()
+        now = self._monotonic_now()
         waiters: list[asyncio.Future[None]] = []
         for command in self._ledger.live_overlapping(
             remote_key,

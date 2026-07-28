@@ -186,7 +186,7 @@ def test_consumer_drops_a_miscalibrated_frame_without_dispatching() -> None:
         clock_resolver=lambda _bridge_id: BridgeClock(),
         dispatch=dispatched.append,
         on_emission_proof=lambda _command_id: None,
-        now=lambda: 10.0,
+        monotonic_now=lambda: 10.0,
         resolve_bases=_configured_bases,
     )
 
@@ -203,7 +203,7 @@ def test_bridge_clock_tracks_steady_samples() -> None:
     clock.observe(_BOOT, 1_000, 10.0)
     clock.observe(_BOOT, 2_000, 11.0)
 
-    assert clock.to_ha_time(_BOOT, 2_500, 11.5) == pytest.approx(11.5)
+    assert clock.to_monotonic_time(_BOOT, 2_500, 11.5) == pytest.approx(11.5)
 
 
 def test_bridge_clock_reseeds_on_boot_change() -> None:
@@ -212,7 +212,7 @@ def test_bridge_clock_reseeds_on_boot_change() -> None:
     clock.observe(_BOOT, 1_000, 10.0)
     clock.observe(_BOOT + 1, 500, 50.0)
 
-    assert clock.to_ha_time(_BOOT + 1, 750, 50.25) == pytest.approx(50.25)
+    assert clock.to_monotonic_time(_BOOT + 1, 750, 50.25) == pytest.approx(50.25)
 
 
 def test_bridge_clock_rejects_stale_sample() -> None:
@@ -222,7 +222,7 @@ def test_bridge_clock_rejects_stale_sample() -> None:
     clock.observe(_BOOT, 101_000, 101.0)
     clock.observe(_BOOT, 100_500, 120.0)
 
-    assert clock.to_ha_time(_BOOT, 101_500, 120.0) == pytest.approx(101.5)
+    assert clock.to_monotonic_time(_BOOT, 101_500, 120.0) == pytest.approx(101.5)
 
 
 def test_bridge_clock_handles_uint32_wrap() -> None:
@@ -231,7 +231,7 @@ def test_bridge_clock_handles_uint32_wrap() -> None:
     clock.observe(_BOOT, _UINT32_MAX - 499, 100.0)
     clock.observe(_BOOT, 500, 101.0)
 
-    assert clock.to_ha_time(_BOOT, 1_000, 101.5) == pytest.approx(101.5)
+    assert clock.to_monotonic_time(_BOOT, 1_000, 101.5) == pytest.approx(101.5)
 
 
 def test_bridge_clock_clamps_future_projection() -> None:
@@ -239,7 +239,7 @@ def test_bridge_clock_clamps_future_projection() -> None:
     clock = BridgeClock()
     clock.observe(_BOOT, 1_000, 10.0)
 
-    assert clock.to_ha_time(_BOOT, 2_000, _CLAMPED_RECV_TIME) == _CLAMPED_RECV_TIME
+    assert clock.to_monotonic_time(_BOOT, 2_000, _CLAMPED_RECV_TIME) == _CLAMPED_RECV_TIME
 
 
 def test_bridge_clock_rejects_single_outlier_without_shifting_projection() -> None:
@@ -250,7 +250,7 @@ def test_bridge_clock_rejects_single_outlier_without_shifting_projection() -> No
 
     clock.observe(_BOOT, _OUTLIER_FUTURE_T, 12.0)
 
-    assert clock.to_ha_time(_BOOT, 3_000, 12.0) == pytest.approx(12.0)
+    assert clock.to_monotonic_time(_BOOT, 3_000, 12.0) == pytest.approx(12.0)
 
 
 def test_bridge_clock_reseeds_after_two_consistent_outliers() -> None:
@@ -260,7 +260,7 @@ def test_bridge_clock_reseeds_after_two_consistent_outliers() -> None:
     clock.observe(_BOOT, 2_000, 11.0)
 
     clock.observe(_BOOT, 3_000, _CLOCK_STEP_RECV_TIME)
-    assert clock.to_ha_time(
+    assert clock.to_monotonic_time(
         _BOOT,
         3_000,
         _INTERMEDIATE_PROJECTION_RECV_TIME,
@@ -268,7 +268,7 @@ def test_bridge_clock_reseeds_after_two_consistent_outliers() -> None:
 
     clock.observe(_BOOT, 4_000, _CLOCK_STEP_RECV_TIME + 1.0)
 
-    assert clock.to_ha_time(
+    assert clock.to_monotonic_time(
         _BOOT,
         4_500,
         _CLOCK_STEP_RECV_TIME + 1.5,
@@ -570,7 +570,7 @@ def _consumer(
         clock_resolver=lambda bridge_id: clocks.setdefault(bridge_id, BridgeClock()),
         dispatch=dispatched.append,
         on_emission_proof=proofs.append,
-        now=lambda: now_value[0],
+        monotonic_now=lambda: now_value[0],
     )
 
 
@@ -587,6 +587,7 @@ def test_consumer_dispatches_fresh_press() -> None:
             chans=frozenset({1}),
             remote_key=_REMOTE_KEY,
             heard_at=10.0,
+            heard_at_monotonic=10.0,
             bridge_id=_BRIDGE_A,
         ),
     ]
@@ -606,8 +607,8 @@ def test_consumer_resolves_independent_clock_per_bridge() -> None:
     now_value[0] = 101.1
     consumer.handle_rx(_BRIDGE_B, _BOOT + 1, 10_000, _frame((2,), "UP"), 101.1)
 
-    assert bridge_clocks[_BRIDGE_A].to_ha_time(_BOOT, 2_500, 101.5) == pytest.approx(101.5)
-    assert bridge_clocks[_BRIDGE_B].to_ha_time(
+    assert bridge_clocks[_BRIDGE_A].to_monotonic_time(_BOOT, 2_500, 101.5) == pytest.approx(101.5)
+    assert bridge_clocks[_BRIDGE_B].to_monotonic_time(
         _BOOT + 1,
         10_500,
         101.6,
@@ -683,7 +684,7 @@ def test_consumer_projects_delayed_echo_before_observing_sample() -> None:
         clock_resolver=lambda _bridge_id: clock,
         dispatch=dispatched.append,
         on_emission_proof=proofs.append,
-        now=lambda: 116.0,
+        monotonic_now=lambda: 116.0,
     )
 
     consumer.handle_rx(_BRIDGE_B, _BOOT, 2_000, _frame((1,), "UP"), 116.0)
@@ -908,15 +909,35 @@ def test_consumer_drops_press_older_than_overlapping_commanded_start() -> None:
     delivered at _LATE_DELIVERY_TIME, after our own RF had already started.
     """
     dispatched: list[HeardEvent] = []
-    consumer = _consumer(CommandLedger(), dispatched, [], [_LATE_DELIVERY_TIME])
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, _OLDER_PRESS_TIME)
+    consumer = _consumer(
+        CommandLedger(),
+        dispatched,
+        [],
+        [_LATE_DELIVERY_TIME],
+        {_BRIDGE_A: clock},
+    )
     consumer.record_commanded_start(
         _REMOTE_KEY,
         frozenset({1}),
         _COMMANDED_START_TIME,
     )
 
-    consumer.handle_rx(_BRIDGE_A, _BOOT, 1_000, _frame((1,), "UP"), _OLDER_PRESS_TIME)
-    consumer.handle_rx(_BRIDGE_A, _BOOT, 7_000, _frame((1,), "UP"), _NEWER_PRESS_TIME)
+    consumer.handle_rx(
+        _BRIDGE_A,
+        _BOOT,
+        1_000,
+        _frame((1,), "UP"),
+        _LATE_DELIVERY_TIME,
+    )
+    consumer.handle_rx(
+        _BRIDGE_A,
+        _BOOT,
+        7_000,
+        _frame((1,), "UP"),
+        _LATE_DELIVERY_TIME,
+    )
 
     assert [event.heard_at for event in dispatched] == [_NEWER_PRESS_TIME]
 
@@ -933,7 +954,7 @@ def test_consumer_projects_fresh_press_at_receipt_after_long_quiet_gap() -> None
         clock_resolver=lambda _bridge_id: clock,
         dispatch=dispatched.append,
         on_emission_proof=lambda _command_id: None,
-        now=lambda: recv_time,
+        monotonic_now=lambda: recv_time,
     )
 
     consumer.handle_rx(_BRIDGE_A, _BOOT, raw_t, _frame((1,), "UP"), recv_time)
@@ -1207,7 +1228,15 @@ def test_suppressed_stale_press_is_logged(caplog: pytest.LogCaptureFixture) -> N
     whole release absorbing real presses without leaving a trace.
     """
     dispatched: list[HeardEvent] = []
-    consumer = _consumer(CommandLedger(), dispatched, [], [_STALE_PRESS_DELIVERY_TIME])
+    clock = BridgeClock()
+    clock.observe(_BOOT, 1_000, _STALE_PRESS_HEARD_TIME)
+    consumer = _consumer(
+        CommandLedger(),
+        dispatched,
+        [],
+        [_STALE_PRESS_DELIVERY_TIME],
+        {_BRIDGE_A: clock},
+    )
     consumer.record_commanded_start(_REMOTE_KEY, frozenset({1}), _COMMANDED_START_TIME)
 
     with caplog.at_level(logging.DEBUG, logger=state_sync_module._LOGGER.name):
@@ -1216,7 +1245,7 @@ def test_suppressed_stale_press_is_logged(caplog: pytest.LogCaptureFixture) -> N
             _BOOT,
             1_000,
             _frame((1,), "UP"),
-            _STALE_PRESS_HEARD_TIME,
+            _STALE_PRESS_DELIVERY_TIME,
         )
 
     assert dispatched == []
@@ -1544,14 +1573,23 @@ def test_emission_proof_reaches_the_command_that_emitted_the_frame() -> None:
     ledger, _action = _sequential_same_signature_ledger()
     dispatched: list[HeardEvent] = []
     proofs: list[str] = []
-    consumer = _consumer(ledger, dispatched, proofs, [_REPEAT_SECOND_HANDOFF])
+    clock = BridgeClock()
+    echo_t = int(_REPEAT_FIRST_ECHO_TIME * _MILLISECONDS_PER_SECOND)
+    clock.observe(_BOOT, echo_t, _REPEAT_FIRST_ECHO_TIME)
+    consumer = _consumer(
+        ledger,
+        dispatched,
+        proofs,
+        [_REPEAT_SECOND_HANDOFF],
+        {_BRIDGE_B: clock},
+    )
 
     consumer.handle_rx(
         _BRIDGE_B,
         _BOOT,
-        int(_REPEAT_FIRST_ECHO_TIME * _MILLISECONDS_PER_SECOND),
+        echo_t,
         _frame((1,), "DOWN"),
-        _REPEAT_FIRST_ECHO_TIME,
+        _REPEAT_SECOND_HANDOFF,
     )
 
     assert dispatched == []

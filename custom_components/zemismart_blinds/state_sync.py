@@ -127,12 +127,12 @@ class _ClockOutlier:
 
     boot: int
     raw_t: int
-    recv_time: float
+    received_at_monotonic: float
     implied_offset: float
 
 
 class BridgeClock:
-    """Correlate one bridge's uint32 millisecond clock with HA time."""
+    """Correlate one bridge's uint32 millisecond clock with monotonic time."""
 
     def __init__(self) -> None:
         """Initialize an unseeded clock correlation."""
@@ -140,22 +140,22 @@ class BridgeClock:
         self._raw_t: int | None = None
         self._unwrapped_seconds: float | None = None
         self._offset_seconds: float | None = None
-        self._last_recv_time: float | None = None
+        self._last_received_at_monotonic: float | None = None
         self._outlier: _ClockOutlier | None = None
 
-    def observe(self, boot: int, t: int, recv_time: float) -> None:
+    def observe(self, boot: int, t: int, received_at_monotonic: float) -> None:
         """Incorporate one ordered bridge timestamp sample into the EMA."""
         raw_t = t & _UINT32_MASK
         if self._boot is None or boot != self._boot:
-            self._seed(boot, raw_t, recv_time)
+            self._seed(boot, raw_t, received_at_monotonic)
             return
-        if self._is_long_gap(recv_time):
-            self._seed(boot, raw_t, recv_time)
+        if self._is_long_gap(received_at_monotonic):
+            self._seed(boot, raw_t, received_at_monotonic)
             return
 
         raw_delta = self._forward_delta(raw_t)
         if raw_delta == _UINT32_HALF_RANGE:
-            self._seed(boot, raw_t, recv_time)
+            self._seed(boot, raw_t, received_at_monotonic)
             return
         if raw_delta == 0 or raw_delta > _UINT32_HALF_RANGE:
             self._outlier = None
@@ -164,26 +164,31 @@ class BridgeClock:
         previous_unwrapped = self._unwrapped_seconds
         previous_offset = self._offset_seconds
         if previous_unwrapped is None or previous_offset is None:
-            self._seed(boot, raw_t, recv_time)
+            self._seed(boot, raw_t, received_at_monotonic)
             return
         unwrapped = previous_unwrapped + raw_delta / _MILLISECONDS_PER_SECOND
-        observed_offset = recv_time - unwrapped
+        observed_offset = received_at_monotonic - unwrapped
         residual = observed_offset - previous_offset
         if not math.isfinite(residual):
             self._outlier = None
             return
         if abs(residual) > _CLOCK_RESEED_RESIDUAL_SECONDS:
-            self._record_or_confirm_outlier(boot, raw_t, recv_time, observed_offset)
+            self._record_or_confirm_outlier(
+                boot,
+                raw_t,
+                received_at_monotonic,
+                observed_offset,
+            )
             return
 
         self._outlier = None
         self._raw_t = raw_t
         self._unwrapped_seconds = unwrapped
         self._offset_seconds = previous_offset + _CLOCK_EMA_ALPHA * residual
-        self._last_recv_time = recv_time
+        self._last_received_at_monotonic = received_at_monotonic
 
     def can_project(self, boot: int) -> bool:
-        """Return whether this boot has a seeded HA-time correlation."""
+        """Return whether this boot has a seeded monotonic correlation."""
         return (
             boot == self._boot
             and self._raw_t is not None
@@ -191,28 +196,36 @@ class BridgeClock:
             and self._offset_seconds is not None
         )
 
-    def to_ha_time(self, boot: int, t: int, recv_time: float) -> float:
-        """Project a bridge timestamp into HA time, never after receipt."""
+    def to_monotonic_time(
+        self,
+        boot: int,
+        t: int,
+        received_at_monotonic: float,
+    ) -> float:
+        """Project a bridge timestamp into monotonic time, never after receipt."""
         if boot != self._boot:
-            return recv_time
+            return received_at_monotonic
         raw_t = t & _UINT32_MASK
         signed_delta = self._signed_delta(raw_t)
         unwrapped = self._unwrapped_seconds
         offset = self._offset_seconds
         if signed_delta is None or unwrapped is None or offset is None:
-            return recv_time
+            return received_at_monotonic
         projected = unwrapped + signed_delta / _MILLISECONDS_PER_SECOND + offset
         if not math.isfinite(projected):
-            return recv_time
-        if projected > recv_time or projected < recv_time - _CLOCK_MAX_PROJECTION_LAG_SECONDS:
-            return recv_time
+            return received_at_monotonic
+        if (
+            projected > received_at_monotonic
+            or projected < received_at_monotonic - _CLOCK_MAX_PROJECTION_LAG_SECONDS
+        ):
+            return received_at_monotonic
         return projected
 
     def _record_or_confirm_outlier(
         self,
         boot: int,
         raw_t: int,
-        recv_time: float,
+        received_at_monotonic: float,
         implied_offset: float,
     ) -> None:
         """Remember one offset outlier or reseed after a consistent successor."""
@@ -223,30 +236,30 @@ class BridgeClock:
             and math.isfinite(implied_offset)
             and abs(implied_offset - previous.implied_offset) <= _CLOCK_RESEED_RESIDUAL_SECONDS
         ):
-            self._seed(boot, raw_t, recv_time)
+            self._seed(boot, raw_t, received_at_monotonic)
             return
         self._outlier = _ClockOutlier(
             boot=boot,
             raw_t=raw_t,
-            recv_time=recv_time,
+            received_at_monotonic=received_at_monotonic,
             implied_offset=implied_offset,
         )
 
-    def _is_long_gap(self, recv_time: float) -> bool:
+    def _is_long_gap(self, received_at_monotonic: float) -> bool:
         """Return whether serial ordering is unsafe after a quiet interval."""
         return (
-            self._last_recv_time is not None
-            and recv_time - self._last_recv_time > _CLOCK_LONG_GAP_SECONDS
+            self._last_received_at_monotonic is not None
+            and received_at_monotonic - self._last_received_at_monotonic > _CLOCK_LONG_GAP_SECONDS
         )
 
-    def _seed(self, boot: int, raw_t: int, recv_time: float) -> None:
+    def _seed(self, boot: int, raw_t: int, received_at_monotonic: float) -> None:
         """Reset the correlation from one receive-time sample."""
         unwrapped = raw_t / _MILLISECONDS_PER_SECOND
         self._boot = boot
         self._raw_t = raw_t
         self._unwrapped_seconds = unwrapped
-        self._offset_seconds = recv_time - unwrapped
-        self._last_recv_time = recv_time
+        self._offset_seconds = received_at_monotonic - unwrapped
+        self._last_received_at_monotonic = received_at_monotonic
         self._outlier = None
 
     def _forward_delta(self, raw_t: int) -> int:
@@ -271,7 +284,7 @@ class BridgeClock:
         self._raw_t = None
         self._unwrapped_seconds = None
         self._offset_seconds = None
-        self._last_recv_time = None
+        self._last_received_at_monotonic = None
         self._outlier = None
 
 
@@ -896,6 +909,7 @@ class HeardEvent:
     chans: frozenset[int]
     remote_key: str
     heard_at: float
+    heard_at_monotonic: float
     bridge_id: str
 
 
@@ -906,24 +920,25 @@ class _HeldCapture:
     command_id: str
     signature: FrameSignature
     heard_at: float
+    heard_at_monotonic: float
     bridge_id: str
-    held_at: float
+    held_at_monotonic: float
 
 
 @dataclass(frozen=True, slots=True)
 class _DebounceStamp:
     """Retain event and receipt times for one recent signature."""
 
-    heard_at: float
-    seen_at: float
+    heard_at_monotonic: float
+    seen_at_monotonic: float
 
 
 @dataclass(frozen=True, slots=True)
 class _CommandedStartStamp:
     """Retain commanded start and receipt times for stale-press rejection."""
 
-    started_at: float
-    seen_at: float
+    started_at_monotonic: float
+    seen_at_monotonic: float
 
 
 _ExactEventKey = tuple[str, int, int, str]
@@ -939,7 +954,7 @@ class StateSyncConsumer:
         clock_resolver: Callable[[str], BridgeClock],
         dispatch: Callable[[HeardEvent], None],
         on_emission_proof: Callable[[str], None],
-        now: Callable[[], float],
+        monotonic_now: Callable[[], float],
         resolve_bases: BasesResolver | None = None,
     ) -> None:
         """Initialize the classifier with injected state and side effects."""
@@ -948,7 +963,7 @@ class StateSyncConsumer:
         self._resolve_bases = resolve_bases
         self._dispatch = dispatch
         self._on_emission_proof = on_emission_proof
-        self._now = now
+        self._monotonic_now = monotonic_now
         self._exact_events: dict[_ExactEventKey, float] = {}
         self._debounce: dict[FrameSignature, _DebounceStamp] = {}
         self._commanded_starts: dict[
@@ -957,7 +972,7 @@ class StateSyncConsumer:
         ] = {}
         self._holds: deque[_HeldCapture] = deque()
         self._closed = False
-        self._ledger.gc(self._now())
+        self._ledger.gc(self._monotonic_now())
 
     def handle_rx(
         self,
@@ -965,7 +980,9 @@ class StateSyncConsumer:
         boot: int,
         t: int,
         frame_hex: str,
-        recv_time: float,
+        received_at: float,
+        *,
+        received_at_monotonic: float | None = None,
     ) -> None:
         """Run exact deduplication, decoding, timing, and classification."""
         if self._closed or len(bridge_id) > _MAX_BRIDGE_ID_LENGTH:
@@ -973,23 +990,33 @@ class StateSyncConsumer:
         normalized_frame = self._normalize_frame(frame_hex)
         if normalized_frame is None:
             return
-        seen_at = self._now()
-        self._maintain(seen_at)
+        if received_at_monotonic is None:
+            received_at_monotonic = self._monotonic_now()
+        self._maintain(received_at_monotonic)
         exact_key = (bridge_id, boot, t & _UINT32_MASK, normalized_frame)
-        if self._remember_exact(exact_key, seen_at):
+        if self._remember_exact(exact_key, received_at_monotonic):
             return
         signature = frame_signature(normalized_frame, self._resolve_bases)
         if signature is None:
             return
         clock = self._clock_resolver(bridge_id)
-        heard_at = clock.to_ha_time(boot, t, recv_time)
-        clock.observe(boot, t, recv_time)
+        heard_at_monotonic = clock.to_monotonic_time(
+            boot,
+            t,
+            received_at_monotonic,
+        )
+        clock.observe(boot, t, received_at_monotonic)
+        # The event needs a wall companion only because a cover may persist it.
+        # Its age is a duration measured on the monotonic axis; no live decision
+        # ever compares the resulting wall stamp.
+        heard_at = received_at - (received_at_monotonic - heard_at_monotonic)
         self._classify(
             signature,
             heard_at,
+            heard_at_monotonic,
             bridge_id,
-            seen_at,
-            received_at=seen_at,
+            received_at_monotonic,
+            received_at_monotonic=received_at_monotonic,
             hold_pending=True,
         )
 
@@ -1002,7 +1029,7 @@ class StateSyncConsumer:
         """Re-run captures held for one command after its phase changes."""
         if self._closed:
             return
-        seen_at = self._now()
+        seen_at_monotonic = self._monotonic_now()
         selected: list[_HeldCapture] = []
         remaining: deque[_HeldCapture] = deque()
         for capture in self._holds:
@@ -1015,12 +1042,13 @@ class StateSyncConsumer:
             self._classify(
                 capture.signature,
                 capture.heard_at,
+                capture.heard_at_monotonic,
                 capture.bridge_id,
-                seen_at,
-                received_at=capture.held_at,
+                seen_at_monotonic,
+                received_at_monotonic=capture.held_at_monotonic,
                 hold_pending=True,
             )
-        self._maintain(seen_at)
+        self._maintain(seen_at_monotonic)
 
     def maintain(self) -> None:
         """Collect expired state without waiting for the next RF capture.
@@ -1035,26 +1063,29 @@ class StateSyncConsumer:
         """
         if self._closed:
             return
-        self._maintain(self._now())
+        self._maintain(self._monotonic_now())
 
     def record_commanded_start(
         self,
         remote_key: str,
         channels: frozenset[int],
-        started_at: float,
+        started_at_monotonic: float,
     ) -> None:
         """Record a commanded RF start that outranks older overlapping presses."""
         if self._closed:
             return
-        seen_at = self._now()
-        self._drop_expired_commanded_starts(seen_at)
+        seen_at_monotonic = self._monotonic_now()
+        self._drop_expired_commanded_starts(seen_at_monotonic)
         key = (remote_key, channels)
         previous = self._commanded_starts.pop(key, None)
         if previous is not None:
-            started_at = max(started_at, previous.started_at)
+            started_at_monotonic = max(
+                started_at_monotonic,
+                previous.started_at_monotonic,
+            )
         self._commanded_starts[key] = _CommandedStartStamp(
-            started_at=started_at,
-            seen_at=seen_at,
+            started_at_monotonic=started_at_monotonic,
+            seen_at_monotonic=seen_at_monotonic,
         )
         while len(self._commanded_starts) > _COMMANDED_START_CAP:
             del self._commanded_starts[next(iter(self._commanded_starts))]
@@ -1078,27 +1109,27 @@ class StateSyncConsumer:
             return None
         return normalized
 
-    def _remember_exact(self, key: _ExactEventKey, seen_at: float) -> bool:
+    def _remember_exact(self, key: _ExactEventKey, seen_at_monotonic: float) -> bool:
         """Record an exact event and report whether it was already recent."""
         previous = self._exact_events.get(key)
-        if previous is not None and seen_at - previous <= _EXACT_EVENT_TTL_SECONDS:
+        if previous is not None and seen_at_monotonic - previous <= _EXACT_EVENT_TTL_SECONDS:
             return True
         self._exact_events.pop(key, None)
-        self._exact_events[key] = seen_at
+        self._exact_events[key] = seen_at_monotonic
         while len(self._exact_events) > _EXACT_EVENT_CAP:
             del self._exact_events[next(iter(self._exact_events))]
         return False
 
-    def _maintain(self, seen_at: float) -> None:
+    def _maintain(self, seen_at_monotonic: float) -> None:
         """Collect expired cache state and resolve timed-out holds."""
-        self._ledger.gc(seen_at)
-        self._drop_expired_exact_events(seen_at)
-        self._drop_expired_debounce_stamps(seen_at)
-        self._drop_expired_commanded_starts(seen_at)
+        self._ledger.gc(seen_at_monotonic)
+        self._drop_expired_exact_events(seen_at_monotonic)
+        self._drop_expired_debounce_stamps(seen_at_monotonic)
+        self._drop_expired_commanded_starts(seen_at_monotonic)
         expired_holds: list[_HeldCapture] = []
         retained_holds: deque[_HeldCapture] = deque()
         for capture in self._holds:
-            if seen_at - capture.held_at > _HOLD_TTL_SECONDS:
+            if seen_at_monotonic - capture.held_at_monotonic > _HOLD_TTL_SECONDS:
                 expired_holds.append(capture)
             else:
                 retained_holds.append(capture)
@@ -1107,38 +1138,39 @@ class StateSyncConsumer:
             self._classify(
                 capture.signature,
                 capture.heard_at,
+                capture.heard_at_monotonic,
                 capture.bridge_id,
-                seen_at,
-                received_at=capture.held_at,
+                seen_at_monotonic,
+                received_at_monotonic=capture.held_at_monotonic,
                 hold_pending=False,
             )
 
-    def _drop_expired_exact_events(self, seen_at: float) -> None:
+    def _drop_expired_exact_events(self, seen_at_monotonic: float) -> None:
         """Discard exact-event keys past their replay horizon."""
         expired = [
             key
             for key, recorded_at in self._exact_events.items()
-            if seen_at - recorded_at > _EXACT_EVENT_TTL_SECONDS
+            if seen_at_monotonic - recorded_at > _EXACT_EVENT_TTL_SECONDS
         ]
         for key in expired:
             del self._exact_events[key]
 
-    def _drop_expired_debounce_stamps(self, seen_at: float) -> None:
+    def _drop_expired_debounce_stamps(self, seen_at_monotonic: float) -> None:
         """Discard debounce signatures past their retention horizon."""
         expired = [
             signature
             for signature, stamp in self._debounce.items()
-            if seen_at - stamp.seen_at > _DEBOUNCE_TTL_SECONDS
+            if (seen_at_monotonic - stamp.seen_at_monotonic > _DEBOUNCE_TTL_SECONDS)
         ]
         for signature in expired:
             del self._debounce[signature]
 
-    def _drop_expired_commanded_starts(self, seen_at: float) -> None:
+    def _drop_expired_commanded_starts(self, seen_at_monotonic: float) -> None:
         """Discard commanded-start stamps past their retention horizon."""
         expired = [
             key
             for key, stamp in self._commanded_starts.items()
-            if seen_at - stamp.seen_at > _COMMANDED_START_TTL_SECONDS
+            if (seen_at_monotonic - stamp.seen_at_monotonic > _COMMANDED_START_TTL_SECONDS)
         ]
         for key in expired:
             del self._commanded_starts[key]
@@ -1147,14 +1179,15 @@ class StateSyncConsumer:
         self,
         signature: FrameSignature,
         heard_at: float,
+        heard_at_monotonic: float,
         bridge_id: str,
-        seen_at: float,
+        seen_at_monotonic: float,
         *,
-        received_at: float,
+        received_at_monotonic: float,
         hold_pending: bool,
     ) -> None:
         """Apply ledger classification, holding, proof, and press dispatch."""
-        match = self._ledger.match(signature, heard_at)
+        match = self._ledger.match(signature, heard_at_monotonic)
         if match is not None:
             phase, command_id, command_bridge = match
             if phase == "confirmed":
@@ -1162,17 +1195,32 @@ class StateSyncConsumer:
                     self._on_emission_proof(command_id)
                 return
             if hold_pending:
-                self._hold(command_id, signature, heard_at, bridge_id, seen_at)
+                self._hold(
+                    command_id,
+                    signature,
+                    heard_at,
+                    heard_at_monotonic,
+                    bridge_id,
+                    seen_at_monotonic,
+                )
                 return
-        self._dispatch_press(signature, heard_at, bridge_id, seen_at, received_at)
+        self._dispatch_press(
+            signature,
+            heard_at,
+            heard_at_monotonic,
+            bridge_id,
+            seen_at_monotonic,
+            received_at_monotonic,
+        )
 
     def _hold(
         self,
         command_id: str,
         signature: FrameSignature,
         heard_at: float,
+        heard_at_monotonic: float,
         bridge_id: str,
-        seen_at: float,
+        seen_at_monotonic: float,
     ) -> None:
         """Append one pending capture while preserving a strict queue cap."""
         self._holds.append(
@@ -1180,8 +1228,9 @@ class StateSyncConsumer:
                 command_id=command_id,
                 signature=signature,
                 heard_at=heard_at,
+                heard_at_monotonic=heard_at_monotonic,
                 bridge_id=bridge_id,
-                held_at=seen_at,
+                held_at_monotonic=seen_at_monotonic,
             ),
         )
         if len(self._holds) <= _HOLD_CAP:
@@ -1204,15 +1253,16 @@ class StateSyncConsumer:
             _HOLD_CAP,
             evicted.signature[2],
             sorted(evicted.signature[1]),
-            seen_at - evicted.held_at,
+            seen_at_monotonic - evicted.held_at_monotonic,
             evicted.command_id,
         )
         self._classify(
             evicted.signature,
             evicted.heard_at,
+            evicted.heard_at_monotonic,
             evicted.bridge_id,
-            seen_at,
-            received_at=evicted.held_at,
+            seen_at_monotonic,
+            received_at_monotonic=evicted.held_at_monotonic,
             hold_pending=False,
         )
 
@@ -1220,8 +1270,8 @@ class StateSyncConsumer:
         self,
         remote_key: str,
         channels: frozenset[int],
-        heard_at: float,
-        received_at: float,
+        heard_at_monotonic: float,
+        received_at_monotonic: float,
     ) -> float | None:
         """Return an overlapping commanded start this press is stale news against.
 
@@ -1246,11 +1296,11 @@ class StateSyncConsumer:
         """
         return next(
             (
-                stamp.started_at
+                stamp.started_at_monotonic
                 for (recent_remote, recent_channels), stamp in self._commanded_starts.items()
                 if recent_remote == remote_key
                 and not recent_channels.isdisjoint(channels)
-                and heard_at < stamp.started_at <= received_at
+                and heard_at_monotonic < stamp.started_at_monotonic <= received_at_monotonic
             ),
             None,
         )
@@ -1259,24 +1309,25 @@ class StateSyncConsumer:
         self,
         signature: FrameSignature,
         heard_at: float,
+        heard_at_monotonic: float,
         bridge_id: str,
-        seen_at: float,
-        received_at: float,
+        seen_at_monotonic: float,
+        received_at_monotonic: float,
     ) -> None:
         """Debounce and dispatch the first copy of a physical press."""
         remote_key, channels, button = signature
         if any(
             recent_remote == remote_key
             and not recent_channels.isdisjoint(channels)
-            and stamp.heard_at > heard_at
+            and stamp.heard_at_monotonic > heard_at_monotonic
             for (recent_remote, recent_channels, _recent_button), stamp in self._debounce.items()
         ):
             return
         superseding_start = self._superseding_commanded_start(
             remote_key,
             channels,
-            heard_at,
-            received_at,
+            heard_at_monotonic,
+            received_at_monotonic,
         )
         if superseding_start is not None:
             _LOGGER.debug(
@@ -1284,13 +1335,16 @@ class StateSyncConsumer:
                 "our own start at %.3f was already on air %.3fs before it reached us",
                 button,
                 sorted(channels),
-                heard_at,
+                heard_at_monotonic,
                 superseding_start,
-                received_at - superseding_start,
+                received_at_monotonic - superseding_start,
             )
             return
         previous = self._debounce.get(signature)
-        if previous is not None and abs(heard_at - previous.heard_at) <= _DEBOUNCE_WINDOW_SECONDS:
+        if (
+            previous is not None
+            and abs(heard_at_monotonic - previous.heard_at_monotonic) <= _DEBOUNCE_WINDOW_SECONDS
+        ):
             return
         self._debounce.pop(signature, None)
         # A dispatched press ends every overlapping earlier signature's
@@ -1303,7 +1357,10 @@ class StateSyncConsumer:
             if key[0] == remote_key and not key[1].isdisjoint(channels)
         ]:
             del self._debounce[stale]
-        self._debounce[signature] = _DebounceStamp(heard_at=heard_at, seen_at=seen_at)
+        self._debounce[signature] = _DebounceStamp(
+            heard_at_monotonic=heard_at_monotonic,
+            seen_at_monotonic=seen_at_monotonic,
+        )
         while len(self._debounce) > _DEBOUNCE_CAP:
             del self._debounce[next(iter(self._debounce))]
         self._dispatch(
@@ -1312,6 +1369,7 @@ class StateSyncConsumer:
                 chans=channels,
                 remote_key=remote_key,
                 heard_at=heard_at,
+                heard_at_monotonic=heard_at_monotonic,
                 bridge_id=bridge_id,
             ),
         )

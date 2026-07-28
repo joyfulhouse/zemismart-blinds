@@ -439,15 +439,21 @@ def test_rx_handler_drops_retained_and_malformed_messages(
     ]
 
 
-def test_rx_handler_uses_hub_clock_for_confirmed_echo() -> None:
-    """HA's monotonic-domain MQTT timestamp cannot classify RF ledger time."""
+def test_rx_handler_uses_hub_monotonic_clock_for_confirmed_echo() -> None:
+    """The MQTT message timestamp cannot classify the hub's RF ledger time."""
 
     async def publish(_topic: str, _payload: str) -> None:
         return
 
     wall_time = 1_700_000_000.0
+    monotonic_time = 50_000.0
     mqtt_timestamp = 12_345.67
-    hub = ZemismartHub(BridgeRegistry(), publish, now=lambda: wall_time)
+    hub = ZemismartHub(
+        BridgeRegistry(),
+        publish,
+        now=lambda: wall_time,
+        monotonic_now=lambda: monotonic_time,
+    )
     runtime = DomainRuntime(hub=hub, unsubscribers=[])
     signature = frame_signature(TEST_CH12_UP_B0)
     assert signature is not None
@@ -459,7 +465,7 @@ def test_rx_handler_uses_hub_clock_for_confirmed_echo() -> None:
         button,
         [LedgerFrameSpec(signature, offset_ms=0, airtime_ms=500)],
     )
-    hub._ledger.confirm("command-1", wall_time)
+    hub._ledger.confirm("command-1", monotonic_time)
     events: list[HeardEvent] = []
     hub.register_rx_listener(remote_key, channels, events.append)
     payload = json.dumps({"frame": TEST_CH12_UP_B0, "t": 1, "boot": 1})
