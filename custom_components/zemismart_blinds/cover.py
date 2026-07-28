@@ -21,6 +21,7 @@ from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityPlatformState
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
@@ -229,7 +230,12 @@ async def async_setup_entry(
 
     runtime = entry.runtime_data
     covers: dict[str, CoverConfig] = {cover.cover_id: cover for cover in runtime.remote.covers}
-    coordinator = RemoteCoordinator(hass, covers)
+    coordinator = RemoteCoordinator(
+        hass,
+        covers,
+        entry.entry_id,
+        runtime.remote.remote.key,
+    )
     runtime.coordinator = coordinator
     entry.async_on_unload(coordinator.detach)
     entities: list[ZemismartCover | ZemismartAggregateCover] = []
@@ -427,6 +433,8 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._degraded = False
         self._intent_generation = 0
         self._restore_epoch = 0
+        self._restore_position_invalidated = False
+        self._restore_position_invalidation_generation: int | None = None
 
     async def async_set_member_position(self, target: int) -> None:
         """Run one aggregate-delegated position move under this entity's lock."""
@@ -539,6 +547,44 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # acquired — there is simply no reason to move it earlier.
         self._unsubscribe_mqtt_status = _subscribe_rf_reachability(self.hass, self)
 
+    @callback
+    def _async_write_ha_state(self) -> None:
+        """Write state, then retire a consumed tombstone only if it landed."""
+        super()._async_write_ha_state()
+        generation = self._restore_position_invalidation_generation
+        if (
+            self._platform_state is EntityPlatformState.ADDED
+            and self._restore_position_invalidated
+            and generation is not None
+            and self._coordinator is not None
+        ):
+            # HA suppresses writes while ADDING and performs its initial write
+            # only after async_added_to_hass returns. Reaching here without an
+            # exception while ADDED proves the invalidated unknown state has
+            # reached the state machine. A failed initial write leaves both the
+            # marker and this pending-clear flag intact for the replacement.
+            self._coordinator.clear_position_invalidation(
+                self._remote_entry_id,
+                self._cover_id,
+                generation,
+            )
+            self._restore_position_invalidated = False
+            self._restore_position_invalidation_generation = None
+
+    def _consume_position_invalidation(self) -> bool:
+        """Own the current marker until this entity's next state write lands."""
+        if self._coordinator is None:
+            return False
+        generation = self._coordinator.position_invalidation_generation(
+            self._remote_entry_id,
+            self._cover_id,
+        )
+        if generation is None:
+            return False
+        self._restore_position_invalidated = True
+        self._restore_position_invalidation_generation = generation
+        return True
+
     def _restored_state_describes_this_cover(self, state: State) -> bool:
         """Return whether a persisted state still describes THIS cover.
 
@@ -590,7 +636,21 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
 
     async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
         """Restore a stopped estimate, or resume or clock-complete motion."""
+        if self._consume_position_invalidation():
+            # A failed aggregate frame addressed this configured leaf while no
+            # durable entity instance could carry the uncertainty forward.
+            # Reject RestoreEntity before reading its cached pre-frame position.
+            # Clearing is deferred until the unknown state is written.
+            self._mark_unknown()
+            return
         state = await self.async_get_last_state()
+        if self._consume_position_invalidation():
+            # An old coordinator can finish an already-published command after
+            # this replacement coordinator has started restoring. Both share
+            # the hass.data partition keyed by remote entry, while their
+            # per-entity restore epochs are necessarily independent.
+            self._mark_unknown()
+            return
         if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
             return
         if not self._restored_state_describes_this_cover(state):
@@ -846,6 +906,10 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         if self._position in (0.0, 100.0):
             self._clear_unverified_anchor()
             if observed:
+                # A completed hard-limit travel is newer physical evidence than
+                # any unconsumed group-failure marker for this leaf. Own that
+                # marker generation until the anchored state write lands.
+                self._consume_position_invalidation()
                 # A completed travel to a hard limit is the ONLY thing that
                 # earns `anchored`, and it also settles any suspect doubt:
                 # whatever a heard STOP left ambiguous, the blind has now
@@ -1530,8 +1594,16 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # queue/transit delay into the physical stopping point. A superseded
         # STOP means a newer overlapping command owns the channels now —
         # abort instead of publishing an older intent over it.
-        if self._direction != 0 and not await self._async_stop():
-            return
+        if self._direction != 0:
+            target_was_reported_current = target == self.current_cover_position
+            if not await self._async_stop():
+                return
+            if target_was_reported_current:
+                # The service call was an apparent no-op against the value HA
+                # exposed at entry. STOP is the required physical action; do
+                # not turn elapsed travel before its acknowledgement into a
+                # surprise corrective move in the opposite direction.
+                return
         # Snapshot channel publish state: if any overlapping command
         # publishes between this measurement and our movement frame, the
         # hub resolves the movement as superseded instead of letting the
@@ -1870,6 +1942,10 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             # Each member's epoch is bumped for the same reason the leaf bumps
             # its own: a member whose restore is still pending would otherwise
             # overwrite this invalidation with its cached position.
+            self._coordinator.record_position_invalidations(
+                self._remote_entry_id,
+                self._config.channels,
+            )
             for member in self._failure_members(issued_members):
                 member.invalidate_for_cancelled_command()
             self.async_write_ha_state()
@@ -1882,6 +1958,10 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             # async_stop_cover never freezes it, leaving members integrating
             # through a STOP that may have fired, still reporting `anchored`.
             _LOGGER.warning("Command timed out for %s: %s", self._config.name, exc)
+            self._coordinator.record_position_invalidations(
+                self._remote_entry_id,
+                self._config.channels,
+            )
             for member in self._failure_members(issued_members):
                 member.invalidate_for_cancelled_command()
             self.async_write_ha_state()

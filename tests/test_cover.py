@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
-from homeassistant.components.cover import ATTR_CURRENT_POSITION, ATTR_POSITION
+from homeassistant.components.cover import ATTR_CURRENT_POSITION, ATTR_POSITION, CoverEntity
 from homeassistant.core import State
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity import EntityPlatformState
@@ -49,6 +49,7 @@ _LATE_LISTENER_DISARM_DEADLINE_SECONDS: Final = 0.2
 _TIMED_COMMAND_STOP_AFTER_MS: Final = 5_000
 _COMPLETED_COMMAND_ADVANCE_SECONDS: Final = 8.0
 _UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS: Final = 5.0
+_TEST_REMOTE_KEY: Final = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
 
 
 def cover_config(*, travel: float = 0.04) -> BlindConfig:
@@ -683,18 +684,34 @@ async def test_cancelled_leaf_transmit_marks_position_unknown(hass: HomeAssistan
 
 
 @pytest.mark.asyncio
-async def test_set_position_at_current_while_moving_sends_stop(hass: HomeAssistant) -> None:
+async def test_set_position_at_current_while_moving_sends_stop(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """An apparent no-op cannot silently freeze a motor that is still moving."""
     bodies: list[dict[str, Any]] = []
+    clocks = SteppableClocks()
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
         body: dict[str, Any] = json.loads(payload)
         bodies.append(body)
+        if len(bodies) == 2:
+            # Make the old post-STOP re-evaluation deterministically see a
+            # different estimate. The requested position was the value HA
+            # reported at service entry, so this must remain a STOP-only no-op.
+            clocks.advance(0.02)
         acknowledge(hub, topic.split("/")[1], body)
 
     config = cover_config(travel=1.0)
-    hub = ZemismartHub(online_registry(), publish)
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        now=clocks.wall_now,
+        monotonic_now=clocks.monotonic_now,
+    )
     entity = await attach_cover(hass, hub, config=config)
     entity._position = 50.0
     try:
@@ -712,6 +729,7 @@ async def test_set_position_at_current_while_moving_sends_stop(hass: HomeAssista
         )
     finally:
         await entity.async_will_remove_from_hass()
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -4689,8 +4707,8 @@ def aggregate_family(
         ),
         "sub-agg": CoverConfig(name="Both", channels=(1, 2), cover_id="sub-agg"),
     }
-    coordinator = RemoteCoordinator(hass, covers)
     remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    coordinator = RemoteCoordinator(hass, covers, "remote-entry", remote.key)
     leaf_one = BlindConfig(
         name="Channel 1",
         remote=remote,
@@ -4749,7 +4767,24 @@ async def attach_family(
         entity.platform = platform_stub()
         await entity.async_internal_added_to_hass()
         await entity.async_added_to_hass()
+        entity._platform_state = EntityPlatformState.ADDED
+        entity.async_write_ha_state()
     return leaf_one, leaf_two, aggregate
+
+
+async def attach_family_entity(
+    hass: HomeAssistant,
+    entity: ZemismartCover | cover_module.ZemismartAggregateCover,
+    entity_id: str,
+) -> None:
+    """Attach one preconstructed family entity with real HA lifecycle state."""
+    entity.hass = hass
+    entity.entity_id = entity_id
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+    await entity.async_added_to_hass()
+    entity._platform_state = EntityPlatformState.ADDED
+    entity.async_write_ha_state()
 
 
 async def detach_family(*entities: Any) -> None:
@@ -4968,8 +5003,8 @@ async def attach_weighted_family(
         ),
         "sub-agg": CoverConfig(name="All three", channels=(1, 2, 3), cover_id="sub-agg"),
     }
-    coordinator = RemoteCoordinator(hass, covers)
     remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    coordinator = RemoteCoordinator(hass, covers, "remote-entry", remote.key)
     wide_config = BlindConfig(
         name="Pair",
         remote=remote,
@@ -6265,6 +6300,8 @@ async def test_failed_add_releases_every_registration(hass: HomeAssistant) -> No
     coordinator = RemoteCoordinator(
         hass,
         {"sub-1": models_module.CoverConfig(name="Channel 1", channels=(1,), cover_id="sub-1")},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
     )
     entity = ExplodingCover("sub-1", "remote-entry", config, hub, coordinator)
     entity.hass = hass
@@ -6359,6 +6396,8 @@ async def test_coordinator_only_subscribes_to_its_own_leaf_entities(
             "sub-2": models_module.CoverConfig(name="Channel 2", channels=(2,), cover_id="sub-2"),
             "sub-agg": models_module.CoverConfig(name="Both", channels=(1, 2), cover_id="sub-agg"),
         },
+        "remote-entry",
+        _TEST_REMOTE_KEY,
     )
     seen: list[str] = []
 
@@ -6707,6 +6746,34 @@ async def test_aggregate_timeout_invalidates_every_member(hass: HomeAssistant) -
         for member in (leaf_one, leaf_two):
             assert member.current_cover_position is None
             assert member.position_confidence == "unknown"
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_timeout_records_position_tombstones(
+    hass: HomeAssistant,
+) -> None:
+    """A timeout persists topology invalidation, not only live-member state."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(
+        online_registry(),
+        publish,
+        ack_timeout=0.01,
+        started_timeout=0.01,
+    )
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    try:
+        with pytest.raises(HomeAssistantError):
+            await aggregate.async_open_cover()
+
+        coordinator = aggregate._coordinator
+        assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
         hub.close()
@@ -7409,4 +7476,876 @@ async def test_aggregate_cancellation_invalidates_a_member_that_left_mid_flight(
         assert leaf_one.current_cover_position is None
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_tombstones_a_configured_leaf_that_was_never_live(
+    hass: HomeAssistant,
+) -> None:
+    """A configured leaf absent from HA cannot later restore pre-frame certainty."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, leaf_one_config, leaf_two_config, aggregate_config = aggregate_family(hass, hub)
+    leaf_one = ZemismartCover("sub-1", "remote-entry", leaf_one_config, hub, coordinator)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg", "remote-entry", aggregate_config, hub, coordinator
+    )
+    late_leaf: ZemismartCover | None = None
+    await attach_family_entity(hass, leaf_one, "cover.channel_1")
+    await attach_family_entity(hass, aggregate, "cover.both")
+    try:
+        leaf_one._position = 40.0
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        # A platform reload rebuilds the coordinator; only the hass.data store
+        # spans that replacement.
+        replacement_coordinator, _, _, _ = aggregate_family(hass, hub)
+        restored = State(
+            "cover.channel_2",
+            "open",
+            {
+                ATTR_CURRENT_POSITION: 40,
+                "remote": leaf_two_config.remote_key,
+                "channels": [2],
+                "role": "leaf",
+            },
+        )
+        late_leaf = restored_cover_type(restored)(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            replacement_coordinator,
+        )
+        await attach_family_entity(hass, late_leaf, "cover.channel_2")
+
+        assert late_leaf.current_cover_position is None
+        assert late_leaf.position_confidence == "unknown"
+    finally:
+        if late_leaf is not None:
+            await late_leaf.async_will_remove_from_hass()
+        await detach_family(leaf_one, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_tombstone_recorded_during_restore_await_is_honoured(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old coordinator can tombstone a new coordinator's suspended restore."""
+    entered_restore = asyncio.Event()
+    release_restore = asyncio.Event()
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+
+    class SlowRestoreCover(ZemismartCover):
+        """Expose a distinct restore getter for this race."""
+
+    async def slow_last_state(_entity: SlowRestoreCover) -> State:
+        entered_restore.set()
+        await release_restore.wait()
+        return restored
+
+    monkeypatch.setattr(SlowRestoreCover, "async_get_last_state", slow_last_state)
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    old_coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    replacement_coordinator, _, _, _ = aggregate_family(hass, hub)
+    replacement = SlowRestoreCover(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        replacement_coordinator,
+    )
+    replacement.hass = hass
+    replacement.entity_id = "cover.channel_2"
+    replacement.platform = platform_stub()
+    await replacement.async_internal_added_to_hass()
+    adding = hass.async_create_task(replacement.async_added_to_hass())
+    try:
+        await entered_restore.wait()
+        old_coordinator.record_position_invalidations("remote-entry", (2,))
+        assert replacement_coordinator.has_position_invalidation(
+            "remote-entry",
+            "sub-2",
+        )
+
+        release_restore.set()
+        await adding
+
+        assert replacement.current_cover_position is None
+        assert replacement.position_confidence == "unknown"
+        assert replacement_coordinator.has_position_invalidation(
+            "remote-entry",
+            "sub-2",
+        )
+
+        replacement._platform_state = EntityPlatformState.ADDED
+        replacement.async_write_ha_state()
+
+        assert not replacement_coordinator.has_position_invalidation(
+            "remote-entry",
+            "sub-2",
+        )
+    finally:
+        release_restore.set()
+        with suppress(Exception):
+            await adding
+        await replacement.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_add_keeps_consumed_tombstone_for_retry(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after restore invalidation cannot expose stale state on retry."""
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    subscribe_calls = 0
+
+    def fail_first_subscription(
+        _hass: HomeAssistant,
+        _entity: Any,
+    ) -> Callable[[], None]:
+        nonlocal subscribe_calls
+        subscribe_calls += 1
+        if subscribe_calls == 1:
+            msg = "reachability subscription failed"
+            raise RuntimeError(msg)
+        return lambda: None
+
+    monkeypatch.setattr(
+        cover_module,
+        "_subscribe_rf_reachability",
+        fail_first_subscription,
+    )
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    coordinator.record_position_invalidations("remote-entry", (2,))
+    cover_type = restored_cover_type(restored)
+    failed = cover_type(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        coordinator,
+    )
+    failed.hass = hass
+    failed.entity_id = "cover.channel_2"
+    failed.platform = platform_stub()
+    await failed.async_internal_added_to_hass()
+    retry: ZemismartCover | None = None
+    try:
+        with pytest.raises(RuntimeError, match="reachability subscription failed"):
+            await failed.async_added_to_hass()
+        failed.add_to_platform_abort()
+
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+        retry = cover_type(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, retry, "cover.channel_2")
+
+        assert retry.current_cover_position is None
+        assert retry.position_confidence == "unknown"
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+    finally:
+        if retry is not None:
+            await retry.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_state_write_failure_keeps_consumed_tombstone_for_retry(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-add state write is the tombstone consumption boundary."""
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    coordinator.record_position_invalidations("remote-entry", (2,))
+    cover_type = restored_cover_type(restored)
+    failed = cover_type(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        coordinator,
+    )
+    failed.hass = hass
+    failed.entity_id = "cover.channel_2"
+    failed.platform = platform_stub()
+    await failed.async_internal_added_to_hass()
+    await failed.async_added_to_hass()
+
+    original_write = CoverEntity._async_write_ha_state
+    failed_writes = 0
+
+    def fail_first_post_add_write(entity: CoverEntity) -> None:
+        nonlocal failed_writes
+        if entity is failed and failed_writes == 0:
+            failed_writes += 1
+            msg = "initial state write failed"
+            raise RuntimeError(msg)
+        original_write(entity)
+
+    monkeypatch.setattr(CoverEntity, "_async_write_ha_state", fail_first_post_add_write)
+    retry: ZemismartCover | None = None
+    try:
+        failed._platform_state = EntityPlatformState.ADDED
+        with pytest.raises(RuntimeError, match="initial state write failed"):
+            failed.async_write_ha_state()
+        failed.add_to_platform_abort()
+
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+        retry = cover_type(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, retry, "cover.channel_2")
+
+        assert retry.current_cover_position is None
+        assert retry.position_confidence == "unknown"
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+    finally:
+        if retry is not None:
+            await retry.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_initial_state_write_clears_consumed_tombstone_once(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful unknown write clears once and cannot poison honest state."""
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    coordinator.record_position_invalidations("remote-entry", (2,))
+    clear_calls = 0
+    original_clear = coordinator.clear_position_invalidation
+
+    def count_clear(remote_entry_id: str, cover_id: str, generation: int) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        original_clear(remote_entry_id, cover_id, generation)
+
+    monkeypatch.setattr(coordinator, "clear_position_invalidation", count_clear)
+    cover_type = restored_cover_type(restored)
+    entity = cover_type(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        coordinator,
+    )
+    entity.hass = hass
+    entity.entity_id = "cover.channel_2"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+    replacement: ZemismartCover | None = None
+    try:
+        await entity.async_added_to_hass()
+
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+        assert clear_calls == 0
+
+        entity._platform_state = EntityPlatformState.ADDED
+        entity.async_write_ha_state()
+
+        written = hass.states.get("cover.channel_2")
+        assert written is not None
+        assert written.state == "unknown"
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+        assert clear_calls == 1
+
+        entity._position = 65.0
+        entity.async_write_ha_state()
+        persisted = hass.states.get("cover.channel_2")
+        assert persisted is not None
+        assert persisted.attributes[ATTR_CURRENT_POSITION] == 65
+        assert clear_calls == 1
+
+        await entity.async_will_remove_from_hass()
+        replacement = restored_cover_type(persisted)(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, replacement, "cover.channel_2")
+
+        assert replacement.current_cover_position == 65
+        assert replacement.position_confidence == "assumed"
+        assert clear_calls == 1
+    finally:
+        if replacement is not None:
+            await replacement.async_will_remove_from_hass()
+        else:
+            await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_coordinator_prunes_deleted_cover_tombstone(
+    hass: HomeAssistant,
+) -> None:
+    """Attaching a changed topology drops markers for deleted cover IDs."""
+    retained = models_module.CoverConfig(
+        name="Retained",
+        channels=(2,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-2",
+    )
+    deleted = models_module.CoverConfig(
+        name="Deleted",
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-1",
+    )
+    coordinator = RemoteCoordinator(
+        hass,
+        {"sub-1": deleted, "sub-2": retained},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    coordinator.record_position_invalidations("remote-entry", (1, 2))
+    assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+    assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+    replacement = RemoteCoordinator(
+        hass,
+        {"sub-2": retained},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+
+    assert not replacement.has_position_invalidation("remote-entry", "sub-1")
+    assert replacement.has_position_invalidation("remote-entry", "sub-2")
+
+
+@pytest.mark.asyncio
+async def test_stale_coordinator_cannot_reinsert_deleted_cover_tombstone(
+    hass: HomeAssistant,
+) -> None:
+    """A late old-topology failure is filtered by the current leaf IDs."""
+    deleted = models_module.CoverConfig(
+        name="Deleted",
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-1",
+    )
+    retained = models_module.CoverConfig(
+        name="Retained",
+        channels=(2,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-2",
+    )
+    stale = RemoteCoordinator(
+        hass,
+        {"sub-1": deleted, "sub-2": retained},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    stale.record_position_invalidations("remote-entry", (2,))
+    current = RemoteCoordinator(
+        hass,
+        {"sub-2": retained},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    assert current.has_position_invalidation("remote-entry", "sub-2")
+    assert not current.has_position_invalidation("remote-entry", "sub-1")
+
+    stale.record_position_invalidations("remote-entry", (1,))
+
+    assert current.has_position_invalidation("remote-entry", "sub-2")
+    assert not current.has_position_invalidation("remote-entry", "sub-1")
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_coordinator_prunes_leaf_to_aggregate_tombstone(
+    hass: HomeAssistant,
+) -> None:
+    """A stable ID that is now an aggregate cannot retain a leaf marker."""
+    former_leaf = models_module.CoverConfig(
+        name="Former leaf",
+        channels=(1, 2),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-outer",
+    )
+    stale = RemoteCoordinator(
+        hass,
+        {"sub-outer": former_leaf},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    stale.record_position_invalidations("remote-entry", (1, 2))
+    assert stale.has_position_invalidation("remote-entry", "sub-outer")
+
+    inner_leaf = models_module.CoverConfig(
+        name="New inner leaf",
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-inner",
+    )
+    current = RemoteCoordinator(
+        hass,
+        {"sub-outer": former_leaf, "sub-inner": inner_leaf},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+
+    assert current.roles["sub-outer"] is Role.AGGREGATE
+    assert not current.has_position_invalidation("remote-entry", "sub-outer")
+
+
+@pytest.mark.asyncio
+async def test_failure_tombstones_only_addressed_leaf_channels(
+    hass: HomeAssistant,
+) -> None:
+    """A configured leaf outside the failed frame's channels stays restorable."""
+    coordinator = RemoteCoordinator(
+        hass,
+        {
+            "sub-1": models_module.CoverConfig(
+                name="Addressed",
+                channels=(1,),
+                travel_up=1.0,
+                travel_down=1.0,
+                cover_id="sub-1",
+            ),
+            "sub-2": models_module.CoverConfig(
+                name="Unaddressed",
+                channels=(2,),
+                travel_up=1.0,
+                travel_down=1.0,
+                cover_id="sub-2",
+            ),
+        },
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+
+    coordinator.record_position_invalidations("remote-entry", (1,))
+
+    assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+    assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+
+@pytest.mark.asyncio
+async def test_stale_coordinator_cannot_tombstone_a_retained_remapped_cover(
+    hass: HomeAssistant,
+) -> None:
+    """A stale failed frame is filtered through the current channel mapping."""
+    channel_one = models_module.CoverConfig(
+        name="Retained",
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-retained",
+    )
+    stale = RemoteCoordinator(
+        hass,
+        {"sub-retained": channel_one},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    channel_two = replace(channel_one, channels=(2,))
+    current = RemoteCoordinator(
+        hass,
+        {"sub-retained": channel_two},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+
+    stale.record_position_invalidations("remote-entry", (1,))
+
+    assert not current.has_position_invalidation("remote-entry", "sub-retained")
+
+    current.record_position_invalidations("remote-entry", (2,))
+
+    assert current.has_position_invalidation("remote-entry", "sub-retained")
+
+
+@pytest.mark.asyncio
+async def test_stale_remote_cannot_tombstone_a_retargeted_cover(
+    hass: HomeAssistant,
+) -> None:
+    """A stale failed frame from the old RF remote cannot cross a reload."""
+    cover = models_module.CoverConfig(
+        name="Retained",
+        channels=(1,),
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id="sub-retained",
+    )
+    stale = RemoteCoordinator(
+        hass,
+        {"sub-retained": cover},
+        "remote-entry",
+        _TEST_REMOTE_KEY,
+    )
+    current = RemoteCoordinator(
+        hass,
+        {"sub-retained": cover},
+        "remote-entry",
+        "ffffff:ff",
+    )
+
+    stale.record_position_invalidations("remote-entry", (1,))
+
+    assert not current.has_position_invalidation("remote-entry", "sub-retained")
+
+    current.record_position_invalidations("remote-entry", (1,))
+
+    assert current.has_position_invalidation("remote-entry", "sub-retained")
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_tombstone_survives_real_member_removal(
+    hass: HomeAssistant,
+) -> None:
+    """A replacement cannot restore state cached before a real async_remove."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    for entity in (leaf_one, leaf_two, aggregate):
+        entity._platform_state = EntityPlatformState.ADDED
+        entity.async_write_ha_state()
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": leaf_two._config.remote_key,
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+    replacement: ZemismartCover | None = None
+    try:
+        leaf_one._position = 40.0
+        leaf_two._position = 40.0
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+
+        await leaf_two.async_remove(force_remove=True)
+        assert leaf_two not in aggregate._members()
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        replacement = restored_cover_type(restored)(
+            "sub-2",
+            "remote-entry",
+            leaf_two._config,
+            hub,
+            aggregate._coordinator,
+        )
+        await attach_family_entity(hass, replacement, "cover.channel_2")
+
+        assert replacement.current_cover_position is None
+        assert replacement.position_confidence == "unknown"
+    finally:
+        if replacement is not None:
+            await replacement.async_will_remove_from_hass()
+        await detach_family(leaf_one, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_cancellation_tombstones_a_join_then_leave_member(
+    hass: HomeAssistant,
+) -> None:
+    """A leaf present only within the await is covered by configured topology."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, leaf_one_config, leaf_two_config, aggregate_config = aggregate_family(hass, hub)
+    leaf_one = ZemismartCover("sub-1", "remote-entry", leaf_one_config, hub, coordinator)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg", "remote-entry", aggregate_config, hub, coordinator
+    )
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": leaf_two_config.remote_key,
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+    transient: ZemismartCover | None = None
+    replacement: ZemismartCover | None = None
+    await attach_family_entity(hass, leaf_one, "cover.channel_1")
+    await attach_family_entity(hass, aggregate, "cover.both")
+    try:
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+
+        transient = restored_cover_type(restored)(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, transient, "cover.channel_2")
+        assert transient in aggregate._members()
+        await transient.async_remove(force_remove=True)
+        assert transient not in aggregate._members()
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        replacement = restored_cover_type(restored)(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, replacement, "cover.channel_2")
+
+        assert replacement.current_cover_position is None
+        assert replacement.position_confidence == "unknown"
+    finally:
+        if replacement is not None:
+            await replacement.async_will_remove_from_hass()
+        await detach_family(leaf_one, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_genuine_anchor_clears_a_tombstone_only_after_its_state_write(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed hard-limit travel retires its marker at the write boundary."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub, travel=0.01)
+    try:
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        coordinator = aggregate._coordinator
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+        clear_calls = 0
+        original_clear = coordinator.clear_position_invalidation
+
+        def count_clear(remote_entry_id: str, cover_id: str, generation: int) -> None:
+            nonlocal clear_calls
+            clear_calls += 1
+            original_clear(remote_entry_id, cover_id, generation)
+
+        monkeypatch.setattr(coordinator, "clear_position_invalidation", count_clear)
+        original_write = CoverEntity._async_write_ha_state
+        failed_writes = 0
+
+        def fail_first_anchor_write(entity: CoverEntity) -> None:
+            nonlocal failed_writes
+            if (
+                entity is leaf_two
+                and leaf_two.position_confidence == "anchored"
+                and failed_writes == 0
+            ):
+                failed_writes += 1
+                msg = "anchor state write failed"
+                raise RuntimeError(msg)
+            original_write(entity)
+
+        monkeypatch.setattr(CoverEntity, "_async_write_ha_state", fail_first_anchor_write)
+
+        started = cover_module.MONOTONIC_CLOCK()
+        leaf_two._start_member_motion(
+            cover_module._MotionStart(
+                source="commanded",
+                started_at=cover_module.WALL_CLOCK(),
+                started_at_monotonic=started,
+                deadline=None,
+                deadline_monotonic=None,
+                bridge_id="bridge-a",
+                command_id="genuine-anchor",
+            ),
+            ack=None,
+            direction=1,
+            duration=0.0,
+            group_target=100.0,
+        )
+        motion_task = leaf_two._motion_task
+        assert motion_task is not None
+        with pytest.raises(RuntimeError, match="anchor state write failed"):
+            await motion_task
+
+        assert leaf_two.current_cover_position == 100
+        assert leaf_two.position_confidence == "anchored"
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+        assert leaf_two._restore_position_invalidated is True
+        assert clear_calls == 0
+
+        leaf_two.async_write_ha_state()
+
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+        assert leaf_two._restore_position_invalidated is False
+        assert clear_calls == 1
+
+        leaf_two.async_write_ha_state()
+
+        assert clear_calls == 1
+        assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_anchor_pending_clear_cannot_retire_a_newer_tombstone(
+    hass: HomeAssistant,
+) -> None:
+    """A pending clear owns only the marker generation that it consumed."""
+    restored = State(
+        "cover.channel_2",
+        "open",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
+            "channels": [2],
+            "role": "leaf",
+        },
+    )
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    coordinator.record_position_invalidations("remote-entry", (2,))
+    entity = restored_cover_type(restored)(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        coordinator,
+    )
+    entity.hass = hass
+    entity.entity_id = "cover.channel_2"
+    entity.platform = platform_stub()
+    await entity.async_internal_added_to_hass()
+    await entity.async_added_to_hass()
+    try:
+        assert entity._restore_position_invalidated is True
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+        entity._position = 100.0
+        entity._anchor_if_at_limit()
+        coordinator.record_position_invalidations("remote-entry", (2,))
+
+        entity._platform_state = EntityPlatformState.ADDED
+        entity._position = 90.0
+        entity.async_write_ha_state()
+
+        assert entity._restore_position_invalidated is False
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+    finally:
+        await entity.async_will_remove_from_hass()
         hub.close()

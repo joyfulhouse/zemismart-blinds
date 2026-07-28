@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_track_state_change_event
 
+from .const import DOMAIN
 from .models import CoverConfig, Role, derive_role, member_covers
 
 if TYPE_CHECKING:
@@ -18,6 +20,19 @@ if TYPE_CHECKING:
         EventStateChangedData,
         HomeAssistant,
     )
+
+
+_POSITION_INVALIDATIONS_DATA_KEY: Final = f"{DOMAIN}_position_invalidations"
+
+
+@dataclass(slots=True)
+class _PositionInvalidationState:
+    """Share current leaf topology and outstanding markers across reloads."""
+
+    remote_key: str
+    valid_leaf_channels: dict[str, frozenset[int]]
+    invalidated: dict[str, int] = field(default_factory=dict)
+    generation: int = 0
 
 
 class MemberCover(Protocol):
@@ -41,19 +56,28 @@ class AggregateCover(Protocol):
 class RemoteCoordinator:
     """Track one remote's cover topology and batch member→aggregate updates.
 
-    Purely in-process plumbing: no storage, no MQTT surface. Membership is
-    recomputed only on entry reload (the coordinator is rebuilt with the
-    platform), matching the spec's reload-driven topology.
+    Membership is recomputed only on entry reload (the coordinator is rebuilt
+    with the platform), matching the spec's reload-driven topology. Failed
+    group-frame invalidations live separately in ``hass.data`` so they survive
+    that rebuild and can be consumed by replacement leaf entities.
     """
 
-    def __init__(self, hass: HomeAssistant, covers: Mapping[str, CoverConfig]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        covers: Mapping[str, CoverConfig],
+        remote_entry_id: str,
+        remote_key: str,
+    ) -> None:
         """Derive roles and leaves-only membership from entry-data covers."""
         self._hass = hass
+        self._remote_key = remote_key
         self.covers: dict[str, CoverConfig] = dict(covers)
         family = list(self.covers.values())
         self.roles: dict[str, Role] = {
             cover_id: derive_role(cover, family) for cover_id, cover in self.covers.items()
         }
+        self._attach_position_invalidations(remote_entry_id)
         key_to_id = {cover.channel_key: cover_id for cover_id, cover in self.covers.items()}
         self.members: dict[str, tuple[str, ...]] = {
             cover_id: tuple(
@@ -160,6 +184,107 @@ class RemoteCoordinator:
             for member_id in self.members.get(aggregate_id, ())
             if member_id in self._leaf_entities
         )
+
+    def _position_invalidation_states(self) -> dict[str, _PositionInvalidationState]:
+        """Return shared marker and current-topology state by config entry."""
+        return cast(
+            "dict[str, _PositionInvalidationState]",
+            self._hass.data.setdefault(_POSITION_INVALIDATIONS_DATA_KEY, {}),
+        )
+
+    @callback
+    def record_position_invalidations(
+        self,
+        remote_entry_id: str,
+        addressed_channels: tuple[int, ...],
+    ) -> None:
+        """Tombstone every configured leaf intersecting a failed group frame."""
+        addressed = frozenset(addressed_channels)
+        state = self._position_invalidation_states().get(remote_entry_id)
+        if state is None or state.remote_key != self._remote_key:
+            return
+        invalidated_cover_ids = tuple(
+            cover_id
+            for cover_id, channels in state.valid_leaf_channels.items()
+            if not addressed.isdisjoint(channels)
+        )
+        if not invalidated_cover_ids:
+            return
+        state.generation += 1
+        for cover_id in invalidated_cover_ids:
+            state.invalidated[cover_id] = state.generation
+
+    @callback
+    def has_position_invalidation(self, remote_entry_id: str, cover_id: str) -> bool:
+        """Return whether a replacement leaf must ignore restored position."""
+        stored = cast(
+            "dict[str, _PositionInvalidationState] | None",
+            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
+        )
+        return (
+            stored is not None
+            and (state := stored.get(remote_entry_id)) is not None
+            and cover_id in state.invalidated
+        )
+
+    @callback
+    def position_invalidation_generation(
+        self,
+        remote_entry_id: str,
+        cover_id: str,
+    ) -> int | None:
+        """Return the current marker generation for one configured leaf."""
+        stored = cast(
+            "dict[str, _PositionInvalidationState] | None",
+            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
+        )
+        if stored is None or (state := stored.get(remote_entry_id)) is None:
+            return None
+        return state.invalidated.get(cover_id)
+
+    @callback
+    def _attach_position_invalidations(self, remote_entry_id: str) -> None:
+        """Publish current leaf identities and prune obsolete markers."""
+        valid_leaf_channels = {
+            cover_id: frozenset(self.covers[cover_id].channels)
+            for cover_id, role in self.roles.items()
+            if role is Role.LEAF
+        }
+        states = self._position_invalidation_states()
+        if (state := states.get(remote_entry_id)) is None:
+            states[remote_entry_id] = _PositionInvalidationState(
+                self._remote_key,
+                valid_leaf_channels,
+            )
+            return
+        if state.remote_key != self._remote_key:
+            state.invalidated.clear()
+        else:
+            state.invalidated = {
+                cover_id: generation
+                for cover_id, generation in state.invalidated.items()
+                if cover_id in valid_leaf_channels
+                and state.valid_leaf_channels.get(cover_id) == valid_leaf_channels[cover_id]
+            }
+        state.remote_key = self._remote_key
+        state.valid_leaf_channels = valid_leaf_channels
+
+    @callback
+    def clear_position_invalidation(
+        self,
+        remote_entry_id: str,
+        cover_id: str,
+        generation: int,
+    ) -> None:
+        """Clear only the marker generation consumed before a state write."""
+        stored = cast(
+            "dict[str, _PositionInvalidationState] | None",
+            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
+        )
+        if stored is None or (state := stored.get(remote_entry_id)) is None:
+            return
+        if state.invalidated.get(cover_id) == generation:
+            state.invalidated.pop(cover_id)
 
     @callback
     def member_changed(self, cover_id: str) -> None:
