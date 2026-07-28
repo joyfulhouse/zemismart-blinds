@@ -5343,6 +5343,40 @@ async def test_aggregate_takeover_state_expires_and_tracks_heard_stop(
         await detach_family(leaf_one, leaf_two, aggregate)
 
 
+def test_legacy_cover_clock_patch_reaches_aggregate(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate reads its clock through the legacy cover module."""
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    coordinator, _leaf_one, _leaf_two, config = aggregate_family(hass, hub)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg",
+        "remote-entry",
+        config,
+        hub,
+        coordinator,
+    )
+    aggregate._last_command_bridge = "bridge-a"
+    aggregate._last_command_id = "command-a"
+    aggregate._last_command_button = "UP"
+    aggregate._last_command_at_monotonic = 100.0
+    try:
+        unpatched = aggregate._takeover_state()
+        monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", lambda: 105.0)
+        patched = aggregate._takeover_state()
+
+        assert unpatched.command_id is None
+        assert patched.command_id == "command-a"
+        assert patched.disarm_deadline_monotonic == 115.0
+    finally:
+        hub.close()
+
+
 @pytest.mark.asyncio
 async def test_covers_go_unavailable_when_ha_loses_the_broker(
     hass: HomeAssistant,

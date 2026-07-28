@@ -16,7 +16,9 @@ from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.event import async_track_time_interval
 
 from .air import AirMode
+from .bridge_registry import BridgeRegistry
 from .codec import CommandBases, synthesize_bases
+from .config_models import RemoteConfig
 from .const import (
     ATTR_BRIDGE,
     ATTR_RAW,
@@ -41,13 +43,6 @@ from .const import (
     SERVICE_NEW_VIRTUAL_REMOTE,
     SERVICE_SEND_RAW,
 )
-from .models import (
-    BridgeRegistry,
-    DomainRuntime,
-    RemoteConfig,
-    RemoteRuntime,
-    ZemismartHub,
-)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -56,6 +51,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
     from homeassistant.helpers.typing import ConfigType
+
+    from .transport import DomainRuntime, RemoteRuntime
 
     type ZemismartConfigEntry = ConfigEntry[RemoteRuntime]
 
@@ -186,6 +183,8 @@ def _handle_maintenance(runtime: DomainRuntime, _now: datetime) -> None:
 def _create_domain_runtime(hass: HomeAssistant) -> DomainRuntime:
     """Construct the shared runtime synchronously before any setup await."""
     from homeassistant.components import mqtt
+
+    from .transport import DomainRuntime, ZemismartHub
 
     async def async_publish(topic: str, payload: str) -> None:
         await mqtt.async_publish(hass, topic, payload, qos=1, retain=False)
@@ -599,6 +598,8 @@ async def async_setup_entry(
 ) -> bool:
     """Set up one blind/group entry and the shared MQTT runtime."""
     from homeassistant.const import Platform
+
+    from .transport import RemoteRuntime
 
     if CONF_CHANNELS in entry.data:
         # Rev 4: legacy per-blind entries are kept only as migration

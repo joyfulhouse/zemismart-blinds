@@ -1,4 +1,9 @@
-"""Config and options flows for adding one Zemismart blind/group at a time."""
+"""Config and options flows for adding one Zemismart blind/group at a time.
+
+Schema builders and row validation live in ``config_flow_schema``; the MQTT
+Learn session lives in ``learn_session``. Helpers re-exported here exist for
+import compatibility — patch the module that owns the code under test.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +12,17 @@ import functools
 import json
 import logging
 import secrets
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable as Iterable
+from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass as dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import section
-from homeassistant.helpers import selector
+from homeassistant.data_entry_flow import section as section
+from homeassistant.helpers import selector as selector
 from homeassistant.util.ulid import ulid_now
 
 from .codec import (
@@ -27,6 +33,54 @@ from .codec import (
     derive_bases,
     derive_bases_from_base,
     infer_action_button,
+)
+from .config_flow_schema import (
+    _cover_display_values as _cover_display_values,
+)
+from .config_flow_schema import (
+    _cover_picker_schema as _cover_picker_schema,
+)
+from .config_flow_schema import (
+    _cover_removal_refusal as _cover_removal_refusal,
+)
+from .config_flow_schema import (
+    _cover_schema as _cover_schema,
+)
+from .config_flow_schema import (
+    _entry_cover_rows as _entry_cover_rows,
+)
+from .config_flow_schema import (
+    _find_cover_row as _find_cover_row,
+)
+from .config_flow_schema import (
+    _flatten_details as _flatten_details,
+)
+from .config_flow_schema import (
+    _float_value as _float_value,
+)
+from .config_flow_schema import (
+    _int_value as _int_value,
+)
+from .config_flow_schema import (
+    _learn_setup_schema as _learn_setup_schema,
+)
+from .config_flow_schema import (
+    _manual_schema as _manual_schema,
+)
+from .config_flow_schema import (
+    _reconfigure_edit_schema as _reconfigure_edit_schema,
+)
+from .config_flow_schema import (
+    _remote_settings_schema as _remote_settings_schema,
+)
+from .config_flow_schema import (
+    _row_cover_id as _row_cover_id,
+)
+from .config_flow_schema import (
+    _sibling_channel_sets as _sibling_channel_sets,
+)
+from .config_flow_schema import (
+    _validate_cover_input as _validate_cover_input,
 )
 from .const import (
     CONF_AREA_ID,
@@ -49,7 +103,6 @@ from .const import (
     CONF_TRAVEL_DOWN,
     CONF_TRAVEL_UP,
     DEFAULT_COALESCE_WINDOW_MS,
-    DEFAULT_REPEATS,
     DEFAULT_SNIFF_WINDOW_SECONDS,
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
@@ -61,6 +114,36 @@ from .const import (
     MQTT_ROOT,
     MQTT_RX_FIELD_FRAME,
 )
+from .const import (
+    DEFAULT_REPEATS as DEFAULT_REPEATS,
+)
+from .learn_session import (
+    _async_subscribe_ready as _async_subscribe_ready,
+)
+from .learn_session import (
+    _bridge_id as _bridge_id,
+)
+from .learn_session import (
+    _DiscoverySession as _DiscoverySession,
+)
+from .learn_session import (
+    _handle_flow_availability as _handle_flow_availability,
+)
+from .learn_session import (
+    _handle_flow_info as _handle_flow_info,
+)
+from .learn_session import (
+    _LearnCapture as _LearnCapture,
+)
+from .learn_session import (
+    _payload_text as _payload_text,
+)
+from .learn_session import (
+    _remote_identity_from_captures as _remote_identity_from_captures,
+)
+from .learn_session import (
+    _SniffAttempt as _SniffAttempt,
+)
 from .models import (
     BridgeRegistry,
     CoverConfig,
@@ -69,9 +152,11 @@ from .models import (
     RemoteIdentity,
     RemoteRuntime,
     laminar_conflict,
-    parse_channels,
     parse_hex,
     whole_number,
+)
+from .models import (
+    parse_channels as parse_channels,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +172,8 @@ if TYPE_CHECKING:
         Coroutine[Any, Any, None] | None,
     ]
 
+
+__all__ = ["ZemismartBlindsConfigFlow"]
 
 _LOGGER = logging.getLogger(__name__)
 # Exception tuples are bound to names rather than written inline. `ruff format`
@@ -113,69 +200,6 @@ _CAPTURE_OWNERS: dict[tuple[int, str], str] = {}
 # stored. Every terminal add replaces the sentinel with a fresh ULID; edits
 # preserve the selected row's existing cover_id.
 _PENDING_COVER_ID = "pending"
-
-
-def _float_value(value: object, fallback: float) -> float:
-    """Convert a persisted selector value to a display float."""
-    if isinstance(value, bool) or not isinstance(value, int | float | str):
-        return fallback
-    try:
-        return float(value)
-    except ValueError:
-        return fallback
-
-
-def _int_value(value: object, fallback: int) -> int:
-    """Convert a persisted selector value to a display integer."""
-    if isinstance(value, bool) or not isinstance(value, int | float | str):
-        return fallback
-    try:
-        return int(value)
-    except ValueError:
-        return fallback
-
-
-def _payload_text(payload: str | bytes | bytearray) -> str:
-    """Normalize an MQTT payload received with or without text decoding."""
-    return payload.decode() if isinstance(payload, bytes | bytearray) else payload
-
-
-def _bridge_id(topic: str, leaf: str) -> str | None:
-    """Extract a bridge id from an exact three-part MQTT topic."""
-    parts = topic.split("/")
-    if len(parts) != 3 or parts[0] != MQTT_ROOT or parts[2] != leaf:
-        return None
-    return parts[1] or None
-
-
-async def _async_subscribe_ready(
-    hass: HomeAssistant,
-    topic: str,
-    msg_callback: MessageCallback,
-) -> Unsubscriber:
-    """Subscribe and wait until the broker has acknowledged the topic."""
-    from homeassistant.components import mqtt
-
-    ready = asyncio.Event()
-    unsubscribe: Unsubscriber | None = None
-    stop_monitoring: Unsubscriber | None = None
-    completed = False
-    try:
-        unsubscribe = await mqtt.async_subscribe(
-            hass,
-            topic,
-            msg_callback,
-            qos=1,
-        )
-        stop_monitoring = mqtt.async_on_subscribe_done(hass, topic, 1, ready.set)
-        await ready.wait()
-        completed = True
-        return unsubscribe
-    finally:
-        if stop_monitoring is not None:
-            stop_monitoring()
-        if not completed and unsubscribe is not None:
-            unsubscribe()
 
 
 @callback
@@ -213,51 +237,6 @@ def _rekey_remote_device(hass: HomeAssistant, old_key: str, new_key: str) -> Non
         # _ensure_remote_device converge on the survivor at reload.
         return
     registry.async_update_device(device.id, new_identifiers={(DOMAIN, new_key)})
-
-
-@dataclass(slots=True)
-class _DiscoverySession:
-    """Retained bridge state collected by one bounded flow-local subscription."""
-
-    registry: BridgeRegistry
-
-
-@dataclass(frozen=True, slots=True)
-class _LearnCapture:
-    """One decoded action frame accepted by the current sniff attempt."""
-
-    frame: str
-    prefix: int
-    remote_id: int
-    channels: tuple[int, ...]
-    command: int
-    # The action the WIZARD asked the user to press. Authoritative: the button
-    # is known from the prompt, so it is never inferred from the opcode.
-    button: str
-    # What infer_action_button() made of the opcode byte, or None when the byte
-    # is outside the codec's table. Retained as a hint only -- it decides
-    # whether this frame resolves the attempt immediately or is held as the
-    # fallback, never whether the capture is valid (#26).
-    inferred_button: str | None
-    # The per-remote calibrated base recovered from this exact capture.
-    base: int
-
-
-@dataclass(slots=True)
-class _SniffAttempt:
-    """Mutable state for one prompted action's capture window."""
-
-    action: str
-    measured: dict[str, _LearnCapture]
-    future: asyncio.Future[_LearnCapture]
-    # A structurally valid capture whose opcode byte is not in the codec's
-    # action table. That table is a 10-sample empirical fit, not protocol, so
-    # an unrecognised opcode is not evidence of a bad capture -- it is held
-    # here and used if the window closes without a recognised match, instead
-    # of being dropped as it was until #26. A recognised frame for the
-    # prompted action still wins outright, which keeps the OEM TRAILER burst
-    # that follows UP/DOWN from being mistaken for the action itself.
-    unrecognized: _LearnCapture | None = None
 
 
 def _remote_identity_from_manual(user_input: Mapping[str, Any]) -> RemoteIdentity:
@@ -306,108 +285,6 @@ def _remote_identity_from_manual(user_input: Mapping[str, Any]) -> RemoteIdentit
         msg = "remote calibration is required"
         raise ValueError(msg)
     return identity
-
-
-def _remote_identity_from_captures(
-    captures: Mapping[str, _LearnCapture],
-) -> tuple[RemoteIdentity, tuple[str, ...]]:
-    """Build the calibrated identity from measured captures, deriving any gaps.
-
-    Every captured action contributes its OWN measured base. Only a button the
-    user could not capture falls back to ``derive_bases``, whose action opcode
-    table held for 10 of the 11 remotes surveyed in #26 -- for the eleventh it
-    produced an UP command the motor provably ignored while the measured one
-    worked. So derivation is now the exception, and the returned action names
-    exist so the confirmation step can tell the user which bases are guesses.
-
-    ``derive_bases`` raises when the reference's own opcode byte is outside
-    that table, which is exactly the remote this fallback cannot serve; the
-    caller surfaces that as a failed capture rather than storing a guess.
-    """
-    if not captures:
-        msg = "at least one captured action is required"
-        raise ValueError(msg)
-    reference = next(iter(captures.values()))
-    measured = {action: capture.base for action, capture in captures.items()}
-    derived_actions = tuple(action for action in _LEARN_ACTIONS if action not in measured)
-    if derived_actions:
-        # Try every measured capture, not just the first. `derive_bases` only
-        # works from a reference whose own opcode is inside the table, and
-        # insertion order is the order the WIZARD asked for buttons -- so a user
-        # whose UP is untabled but whose DOWN is not was refused the fallback
-        # they had explicitly chosen, purely because UP came first.
-        fallback = None
-        for candidate in captures.values():
-            try:
-                fallback = derive_bases(
-                    candidate.channels,
-                    candidate.button,
-                    candidate.command,
-                    candidate.remote_id,
-                )
-            except ValueError:
-                continue
-            reference = candidate
-            break
-        if fallback is None:
-            # No captured button can serve as a reference. Surfaced as a failed
-            # capture rather than stored as a guess.
-            msg = "no captured action can serve as a derivation reference"
-            raise ValueError(msg)
-        measured.update({action: fallback.base(action) for action in derived_actions})
-    identity = RemoteIdentity(
-        prefix=reference.prefix,
-        remote_id=reference.remote_id,
-        bases=CommandBases(
-            up=measured["UP"],
-            down=measured["DOWN"],
-            stop=measured["STOP"],
-        ),
-    )
-    return identity, derived_actions
-
-
-@callback
-def _handle_flow_availability(
-    session: _DiscoverySession,
-    message: ReceiveMessage,
-) -> None:
-    """Collect one retained availability beacon for bridge selection."""
-    bridge_id = _bridge_id(message.topic, "availability")
-    if bridge_id is None:
-        return
-    try:
-        payload = _payload_text(message.payload)
-    except UnicodeDecodeError:
-        return
-    session.registry.update_availability(bridge_id, payload)
-
-
-@callback
-def _handle_flow_info(
-    session: _DiscoverySession,
-    message: ReceiveMessage,
-) -> None:
-    """Collect retained area/default metadata for bridge selection."""
-    bridge_id = _bridge_id(message.topic, "info")
-    if bridge_id is None:
-        return
-    try:
-        text = _payload_text(message.payload)
-    except UnicodeDecodeError:
-        return
-    if not text.strip():
-        session.registry.update_info(bridge_id, {})
-        return
-    try:
-        decoded: object = json.loads(text)
-    except json.JSONDecodeError:
-        return
-    if isinstance(decoded, Mapping):
-        session.registry.update_info(
-            bridge_id,
-            {str(key): value for key, value in decoded.items()},
-        )
 
 
 def _is_own_emission(hass: HomeAssistant, frame: str) -> bool:
@@ -544,350 +421,6 @@ def _handle_sniff_message(
             attempt.action,
         )
         attempt.unrecognized = capture
-
-
-def _flatten_details(user_input: Mapping[str, Any]) -> dict[str, Any]:
-    """Flatten the UI-only collapsed section into the persisted field shape."""
-    advanced = user_input.get(_ADVANCED_SECTION)
-    if not isinstance(advanced, Mapping):
-        msg = "advanced settings are required"
-        raise ValueError(msg)
-    return {
-        **{key: value for key, value in user_input.items() if key != _ADVANCED_SECTION},
-        **advanced,
-    }
-
-
-def _manual_schema(suggested: Mapping[str, object] | None = None) -> vol.Schema:
-    """Build the Advanced manual identity/calibration form."""
-    values = suggested or {}
-    button = str(values.get(CONF_CALIBRATION_BUTTON, "UP"))
-    if button not in {"UP", "DOWN", "STOP"}:
-        button = "UP"
-    return vol.Schema(
-        {
-            vol.Required(
-                CONF_PREFIX,
-                default=str(values.get(CONF_PREFIX, "")),
-            ): selector.TextSelector(),
-            vol.Required(
-                CONF_REMOTE_ID,
-                default=str(values.get(CONF_REMOTE_ID, "")),
-            ): selector.TextSelector(),
-            vol.Required(CONF_CALIBRATION_BUTTON, default=button): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=["UP", "DOWN", "STOP"])
-            ),
-            vol.Optional(
-                CONF_CALIBRATION_BASE,
-                default=str(values.get(CONF_CALIBRATION_BASE, "")),
-            ): selector.TextSelector(),
-            vol.Optional(
-                CONF_CALIBRATION_FRAME,
-                default=str(values.get(CONF_CALIBRATION_FRAME, "")),
-            ): selector.TextSelector(),
-            vol.Optional(
-                CONF_BASE_TRAILER,
-                default=str(values.get(CONF_BASE_TRAILER, "")),
-            ): selector.TextSelector(),
-        }
-    )
-
-
-def _remote_settings_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
-    """Build the remote name/area/transport form."""
-    values = suggested or {}
-    return vol.Schema(
-        {
-            vol.Required(
-                CONF_NAME,
-                default=str(values.get(CONF_NAME, "")),
-            ): selector.TextSelector(),
-            vol.Required(
-                CONF_AREA_ID,
-                default=str(values.get(CONF_AREA_ID, "")),
-            ): selector.AreaSelector(),
-            vol.Required(_ADVANCED_SECTION): section(
-                vol.Schema(
-                    {
-                        vol.Required(
-                            CONF_REPEATS,
-                            default=_int_value(values.get(CONF_REPEATS), DEFAULT_REPEATS),
-                        ): selector.NumberSelector(
-                            selector.NumberSelectorConfig(
-                                min=1,
-                                max=20,
-                                step=1,
-                                mode=selector.NumberSelectorMode.BOX,
-                            )
-                        ),
-                        vol.Required(
-                            CONF_COALESCE_WINDOW_MS,
-                            default=_int_value(
-                                values.get(CONF_COALESCE_WINDOW_MS),
-                                DEFAULT_COALESCE_WINDOW_MS,
-                            ),
-                        ): selector.NumberSelector(
-                            selector.NumberSelectorConfig(
-                                min=0,
-                                max=2000,
-                                step=10,
-                                mode=selector.NumberSelectorMode.BOX,
-                                unit_of_measurement="ms",
-                            )
-                        ),
-                    }
-                ),
-                {"collapsed": True},
-            ),
-        }
-    )
-
-
-def _reconfigure_edit_schema(suggested: Mapping[str, object]) -> vol.Schema:
-    """Extend remote settings with editable command calibration bases."""
-    return _remote_settings_schema(suggested).extend(
-        {
-            vol.Required(
-                CONF_BASE_UP,
-                default=str(suggested.get(CONF_BASE_UP, "")),
-            ): selector.TextSelector(),
-            vol.Required(
-                CONF_BASE_DOWN,
-                default=str(suggested.get(CONF_BASE_DOWN, "")),
-            ): selector.TextSelector(),
-            vol.Required(
-                CONF_BASE_STOP,
-                default=str(suggested.get(CONF_BASE_STOP, "")),
-            ): selector.TextSelector(),
-            vol.Optional(
-                CONF_BASE_TRAILER,
-                default=str(suggested.get(CONF_BASE_TRAILER, "")),
-            ): selector.TextSelector(),
-        }
-    )
-
-
-def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
-    """Build one wizard cover form: name, channels, optional travel times."""
-    values = suggested or {}
-    travel_selector = selector.NumberSelector(
-        selector.NumberSelectorConfig(
-            min=0.1,
-            max=600,
-            step=0.1,
-            mode=selector.NumberSelectorMode.BOX,
-            unit_of_measurement="s",
-        )
-    )
-    fields: dict[vol.Marker, object] = {
-        vol.Required(CONF_NAME, default=str(values.get(CONF_NAME, ""))): selector.TextSelector(),
-        vol.Required(
-            CONF_CHANNELS,
-            default=str(values.get(CONF_CHANNELS, "")),
-        ): selector.TextSelector(),
-        # Travel fields carry NO defaults, ever: a default harvested from a
-        # previous (failed) submission would silently backfill an omitted
-        # field on the next attempt and defeat the travel_required check.
-        vol.Optional(CONF_TRAVEL_UP): travel_selector,
-        vol.Optional(CONF_TRAVEL_DOWN): travel_selector,
-    }
-    return vol.Schema(fields)
-
-
-def _cover_display_values(
-    cover_id: str,
-    data: Mapping[str, object],
-    title: str,
-) -> dict[str, object]:
-    """Convert stored cover data to values suitable for form suggestions."""
-    try:
-        cover = CoverConfig.from_stored(cover_id, data)
-    except _COERCION_ERRORS:
-        suggested: dict[str, object] = {CONF_NAME: title}
-        if (raw_channels := data.get(CONF_CHANNELS)) is not None:
-            if isinstance(raw_channels, str):
-                channels_text = raw_channels
-            elif isinstance(raw_channels, Iterable):
-                channels_text = ",".join(str(channel) for channel in raw_channels)
-            else:
-                channels_text = str(raw_channels)
-            suggested[CONF_CHANNELS] = channels_text
-        return suggested
-
-    suggested = {
-        CONF_NAME: cover.name,
-        CONF_CHANNELS: ",".join(str(channel) for channel in cover.channels),
-    }
-    for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
-        if (stored := data.get(key)) not in (None, ""):
-            suggested[key] = stored
-    return suggested
-
-
-def _validate_cover_input(
-    user_input: Mapping[str, Any],
-    existing: list[tuple[int, ...]],
-) -> tuple[CoverConfig | None, dict[str, str]]:
-    """Validate one wizard cover form against the covers collected so far."""
-    try:
-        channels = parse_channels(user_input.get(CONF_CHANNELS, ""))
-    except ValueError:
-        return None, {CONF_CHANNELS: "invalid_config"}
-    conflict = laminar_conflict(channels, existing)
-    if conflict is not None:
-        return None, {CONF_CHANNELS: conflict}
-    born_aggregate = any(
-        frozenset(sibling_channels) < frozenset(channels) for sibling_channels in existing
-    )
-    raw_up = user_input.get(CONF_TRAVEL_UP)
-    raw_down = user_input.get(CONF_TRAVEL_DOWN)
-    if not born_aggregate and (raw_up is None or raw_down is None):
-        return None, {"base": "travel_required"}
-    try:
-        cover = CoverConfig(
-            name=str(user_input.get(CONF_NAME, "")),
-            channels=channels,
-            travel_up=float(raw_up) if raw_up is not None else None,
-            travel_down=float(raw_down) if raw_down is not None else None,
-            cover_id=_PENDING_COVER_ID,
-        )
-    except _COERCION_ERRORS:
-        return None, {"base": "invalid_config"}
-    return cover, {}
-
-
-def _learn_setup_schema(
-    registry: BridgeRegistry,
-    suggested: Mapping[str, object] | None,
-) -> vol.Schema:
-    """Build name/area/bridge fields from one discovery snapshot."""
-    values = suggested or {}
-    area_id = str(values.get(CONF_AREA_ID, ""))
-    online = [bridge for bridge in registry.bridges if bridge.online]
-    requested_bridge = str(values.get(CONF_BRIDGE, _AUTOMATIC_BRIDGE))
-    bridge_ids = {bridge.bridge_id for bridge in online}
-    if requested_bridge != _AUTOMATIC_BRIDGE and requested_bridge not in bridge_ids:
-        requested_bridge = _AUTOMATIC_BRIDGE
-    options: list[selector.SelectOptionDict] = [{"value": _AUTOMATIC_BRIDGE, "label": "Automatic"}]
-    for bridge in online:
-        label = bridge.bridge_id
-        if bridge.area_id:
-            label = f"{label} — {bridge.area_id}"
-        options.append({"value": bridge.bridge_id, "label": label})
-    return vol.Schema(
-        {
-            vol.Required(
-                CONF_NAME,
-                default=str(values.get(CONF_NAME, "")),
-            ): selector.TextSelector(),
-            vol.Required(CONF_AREA_ID, default=area_id): selector.AreaSelector(),
-            vol.Required(CONF_BRIDGE, default=requested_bridge): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=options,
-                    translation_key="bridge",
-                )
-            ),
-        }
-    )
-
-
-def _sibling_channel_sets(
-    entry: config_entries.ConfigEntry,
-    *,
-    exclude_cover_id: str | None = None,
-) -> list[tuple[int, ...]]:
-    """Load every sibling channel set, failing closed on unreadable channels."""
-    channel_sets: list[tuple[int, ...]] = []
-    for row in _entry_cover_rows(entry):
-        cover_id = _row_cover_id(row)
-        if exclude_cover_id is not None and cover_id == exclude_cover_id:
-            continue
-        try:
-            channels = CoverConfig.from_stored(cover_id, row).channels
-        except _COERCION_ERRORS:
-            try:
-                channels = parse_channels(row.get(CONF_CHANNELS, ""))
-            except _COERCION_ERRORS as err:
-                msg = f"invalid sibling cover channels: {cover_id}"
-                raise ValueError(msg) from err
-        channel_sets.append(channels)
-    return channel_sets
-
-
-def _entry_cover_rows(
-    entry: config_entries.ConfigEntry,
-) -> list[dict[str, object]]:
-    """Copy stored cover rows without dropping unknown keys."""
-    raw_rows = entry.data.get(CONF_COVERS)
-    if not isinstance(raw_rows, list | tuple):
-        msg = "covers must be a list"
-        raise ValueError(msg)
-    rows: list[dict[str, object]] = []
-    for index, raw_row in enumerate(raw_rows):
-        if not isinstance(raw_row, Mapping) or not all(isinstance(key, str) for key in raw_row):
-            msg = f"invalid cover row {index}"
-            raise ValueError(msg)
-        rows.append({str(key): value for key, value in raw_row.items()})
-    return rows
-
-
-def _row_cover_id(row: Mapping[str, object]) -> str:
-    """Return one non-empty stored cover identity."""
-    cover_id = row.get(CONF_COVER_ID)
-    if not isinstance(cover_id, str) or not cover_id.strip():
-        msg = "invalid cover_id"
-        raise ValueError(msg)
-    return cover_id
-
-
-def _find_cover_row(
-    rows: list[dict[str, object]],
-    cover_id: str,
-) -> tuple[int, dict[str, object]]:
-    """Find one stored row by stable identity."""
-    for index, row in enumerate(rows):
-        if _row_cover_id(row) == cover_id:
-            return index, row
-    msg = f"unknown cover_id: {cover_id}"
-    raise ValueError(msg)
-
-
-def _cover_picker_schema(rows: list[dict[str, object]]) -> vol.Schema:
-    """Build an identity-keyed picker with unambiguous duplicate names."""
-    names = [str(row.get(CONF_NAME, "")).strip() for row in rows]
-    duplicate_names = {name for name in names if names.count(name) > 1}
-    options: list[selector.SelectOptionDict] = []
-    for row, name in zip(rows, names, strict=True):
-        cover_id = _row_cover_id(row)
-        label = name or cover_id
-        if name in duplicate_names:
-            label = f"{label} — {cover_id}"
-        options.append({"value": cover_id, "label": label})
-    return vol.Schema(
-        {
-            vol.Required(CONF_COVER_ID): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=options)
-            )
-        }
-    )
-
-
-def _cover_removal_refusal(
-    entry: config_entries.ConfigEntry,
-    cover_id: str,
-) -> str | None:
-    """Return why a stored cover cannot safely be removed."""
-    rows = _entry_cover_rows(entry)
-    if len(rows) <= 1:
-        return "last_cover"
-    _index, selected_row = _find_cover_row(rows, cover_id)
-    selected = CoverConfig.from_stored(cover_id, selected_row)
-    siblings = _sibling_channel_sets(entry, exclude_cover_id=cover_id)
-    selected_channels = frozenset(selected.channels)
-    is_leaf = not any(frozenset(channels) < selected_channels for channels in siblings)
-    if is_leaf and any(selected_channels < frozenset(channels) for channels in siblings):
-        return "aggregate_dependency"
-    return None
 
 
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):

@@ -7,6 +7,7 @@ from typing import Final
 
 import pytest
 
+from custom_components.zemismart_blinds import command_ledger as command_ledger_module
 from custom_components.zemismart_blinds import state_sync as state_sync_module
 from custom_components.zemismart_blinds.codec import CommandBases, encode_b0, make_payload
 from custom_components.zemismart_blinds.state_sync import (
@@ -68,6 +69,18 @@ def _required_signature(
     signature = frame_signature(_frame(channels, button))
     assert signature is not None
     return signature
+
+
+def test_legacy_repeat_airtime_patch_reaches_command_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The split ledger reads repeat airtime through the legacy module."""
+    unpatched = command_ledger_module._round_robin_stretch_seconds(3.0, 2)
+
+    monkeypatch.setattr(state_sync_module, "_LEDGER_REPEAT_AIRTIME_MS", 500)
+
+    assert command_ledger_module._round_robin_stretch_seconds(3.0, 2) == 2.5
+    assert command_ledger_module._round_robin_stretch_seconds(3.0, 2) != unpatched
 
 
 def test_frame_signature_decodes_single_movement() -> None:

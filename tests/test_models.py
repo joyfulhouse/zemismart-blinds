@@ -4769,6 +4769,18 @@ def test_ledger_airtime_tracks_repeats_and_clamps(repeats: object, expected_ms: 
     assert models_module._ledger_airtime_ms(repeats) == expected_ms
 
 
+def test_legacy_models_timing_patch_reaches_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy timing patches change the transport's runtime calculation."""
+    unpatched = models_module._ledger_airtime_ms(3)
+
+    monkeypatch.setattr(models_module, "_LEDGER_REPEAT_AIRTIME_MS", 7_000)
+
+    assert models_module._ledger_airtime_ms(3) == 21_000
+    assert models_module._ledger_airtime_ms(3) != unpatched
+
+
 def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
     """A high-repeats command's tail echo stays recognized as our own emission."""
     registry = _online_registry()
