@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 
 
 _POSITION_INVALIDATIONS_DATA_KEY: Final = f"{DOMAIN}_position_invalidations"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -31,6 +33,7 @@ class _PositionInvalidationState:
 
     remote_key: str
     valid_leaf_channels: dict[str, frozenset[int]]
+    coordinator: RemoteCoordinator | None = None
     invalidated: dict[str, int] = field(default_factory=dict)
     generation: int = 0
 
@@ -43,6 +46,10 @@ class MemberCover(Protocol):
     @callback
     def async_write_ha_state(self) -> None:
         """Schedule one HA state write."""
+
+    @callback
+    def invalidate_for_cancelled_command(self) -> None:
+        """Discard position after a command with an unknowable outcome."""
 
 
 class AggregateCover(Protocol):
@@ -72,6 +79,7 @@ class RemoteCoordinator:
         """Derive roles and leaves-only membership from entry-data covers."""
         self._hass = hass
         self._remote_key = remote_key
+        self._remote_entry_id = remote_entry_id
         self.covers: dict[str, CoverConfig] = dict(covers)
         family = list(self.covers.values())
         self.roles: dict[str, Role] = {
@@ -114,6 +122,9 @@ class RemoteCoordinator:
     @callback
     def detach(self) -> None:
         """Stop listening when the owning entry unloads."""
+        state = self._position_invalidation_state(self._remote_entry_id)
+        if state is not None and state.coordinator is self:
+            state.coordinator = None
         if self._unsub_state_changed is not None:
             self._unsub_state_changed()
             self._unsub_state_changed = None
@@ -192,40 +203,64 @@ class RemoteCoordinator:
             self._hass.data.setdefault(_POSITION_INVALIDATIONS_DATA_KEY, {}),
         )
 
+    def _position_invalidation_state(
+        self,
+        remote_entry_id: str,
+    ) -> _PositionInvalidationState | None:
+        """Return shared marker state for one config entry, if attached."""
+        stored = cast(
+            "dict[str, _PositionInvalidationState] | None",
+            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
+        )
+        return stored.get(remote_entry_id) if stored is not None else None
+
     @callback
     def record_position_invalidations(
         self,
         remote_entry_id: str,
         addressed_channels: tuple[int, ...],
-    ) -> None:
-        """Tombstone every configured leaf intersecting a failed group frame."""
+    ) -> tuple[MemberCover, ...]:
+        """Tombstone affected leaves and invalidate those attached right now."""
         addressed = frozenset(addressed_channels)
         state = self._position_invalidation_states().get(remote_entry_id)
         if state is None or state.remote_key != self._remote_key:
-            return
+            return ()
         invalidated_cover_ids = tuple(
             cover_id
             for cover_id, channels in state.valid_leaf_channels.items()
             if not addressed.isdisjoint(channels)
         )
         if not invalidated_cover_ids:
-            return
+            return ()
         state.generation += 1
         for cover_id in invalidated_cover_ids:
             state.invalidated[cover_id] = state.generation
+        current = state.coordinator
+        if current is None:
+            return ()
+        live_entities = tuple(
+            entity
+            for cover_id in invalidated_cover_ids
+            if (entity := current._leaf_entities.get(cover_id)) is not None
+        )
+        for entity in live_entities:
+            try:
+                entity.invalidate_for_cancelled_command()
+            except Exception:
+                # Every marker was recorded before live dispatch. A failed
+                # state write therefore leaves this entity's marker intact for
+                # restore while later entities and aggregate fallback continue.
+                _LOGGER.exception(
+                    "Failed to invalidate position for %s",
+                    entity.entity_id,
+                )
+        return live_entities
 
     @callback
     def has_position_invalidation(self, remote_entry_id: str, cover_id: str) -> bool:
         """Return whether a replacement leaf must ignore restored position."""
-        stored = cast(
-            "dict[str, _PositionInvalidationState] | None",
-            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
-        )
-        return (
-            stored is not None
-            and (state := stored.get(remote_entry_id)) is not None
-            and cover_id in state.invalidated
-        )
+        state = self._position_invalidation_state(remote_entry_id)
+        return state is not None and cover_id in state.invalidated
 
     @callback
     def position_invalidation_generation(
@@ -234,13 +269,8 @@ class RemoteCoordinator:
         cover_id: str,
     ) -> int | None:
         """Return the current marker generation for one configured leaf."""
-        stored = cast(
-            "dict[str, _PositionInvalidationState] | None",
-            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
-        )
-        if stored is None or (state := stored.get(remote_entry_id)) is None:
-            return None
-        return state.invalidated.get(cover_id)
+        state = self._position_invalidation_state(remote_entry_id)
+        return state.invalidated.get(cover_id) if state is not None else None
 
     @callback
     def _attach_position_invalidations(self, remote_entry_id: str) -> None:
@@ -255,6 +285,7 @@ class RemoteCoordinator:
             states[remote_entry_id] = _PositionInvalidationState(
                 self._remote_key,
                 valid_leaf_channels,
+                coordinator=self,
             )
             return
         if state.remote_key != self._remote_key:
@@ -268,6 +299,7 @@ class RemoteCoordinator:
             }
         state.remote_key = self._remote_key
         state.valid_leaf_channels = valid_leaf_channels
+        state.coordinator = self
 
     @callback
     def clear_position_invalidation(
@@ -277,11 +309,8 @@ class RemoteCoordinator:
         generation: int,
     ) -> None:
         """Clear only the marker generation consumed before a state write."""
-        stored = cast(
-            "dict[str, _PositionInvalidationState] | None",
-            self._hass.data.get(_POSITION_INVALIDATIONS_DATA_KEY),
-        )
-        if stored is None or (state := stored.get(remote_entry_id)) is None:
+        state = self._position_invalidation_state(remote_entry_id)
+        if state is None:
             return
         if state.invalidated.get(cover_id) == generation:
             state.invalidated.pop(cover_id)

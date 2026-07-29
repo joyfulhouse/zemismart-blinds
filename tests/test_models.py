@@ -518,8 +518,7 @@ async def test_wall_step_does_not_reclassify_confirmed_echo_as_physical_press(
     wall `started_at`) passed. A realistic unix-epoch wall clock against a small
     uptime-style monotonic clock makes any confusion between them structural.
     """
-    wall = {"now": 1_700_000_000.0}
-    monotonic = {"now": 200.0}
+    clocks = SteppableClocks()
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
     hub: ZemismartHub
@@ -533,8 +532,7 @@ async def test_wall_step_does_not_reclassify_confirmed_echo_as_physical_press(
     hub = ZemismartHub(
         _online_registry(),
         publish,
-        now=lambda: wall["now"],
-        monotonic_now=lambda: monotonic["now"],
+        **clocks.as_kwargs(),
     )
     unsubscribe = hub.register_rx_listener(
         config.remote.key,
@@ -544,8 +542,8 @@ async def test_wall_step_does_not_reclassify_confirmed_echo_as_physical_press(
     )
     try:
         await hub.async_transmit(config, "UP")
-        wall["now"] += wall_step
-        monotonic["now"] += 0.1
+        clocks.wall += wall_step
+        clocks.monotonic += 0.1
 
         hub.handle_rx(
             "bridge-b",
@@ -890,8 +888,7 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
         publish,
         ack_timeout=0.001,
         command_id_factory=lambda: "command-1",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     ack = asyncio.run(
         hub.async_transmit(
@@ -1418,8 +1415,7 @@ def test_handle_rx_maintains_independent_bridge_clocks() -> None:
     hub = ZemismartHub(
         BridgeRegistry(),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     frame = encode_b0(
         make_payload(
@@ -1569,8 +1565,7 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
         registry,
         publish,
         command_id_factory=lambda: "ledger-confirmed",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     events: list[HeardEvent] = []
     config = blind_config()
@@ -2744,8 +2739,7 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
     clocks = SteppableClocks()
     hub, published = acking_hub(
         command_id_factory=lambda: "displaced-confirmed",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2809,8 +2803,7 @@ async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
         registry,
         publish,
         command_id_factory=lambda: "displaced-disarmed",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2886,8 +2879,7 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
         registry,
         publish,
         command_id_factory=lambda: "displaced-race",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     config = blind_config()
     hub.register_rx_listener(config.remote.key, frozenset(config.channels), events.append)
@@ -2955,8 +2947,7 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
     hub = ZemismartHub(
         registry,
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     seed_frame = encode_b0(
         make_payload(
@@ -3256,8 +3247,7 @@ async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
     hub = ZemismartHub(
         registry,
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     ack = await hub.async_transmit(blind_config(), "UP")
 
@@ -3290,8 +3280,7 @@ async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
     hub = ZemismartHub(
         registry,
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     seed_frame = encode_b0(
         make_payload(
@@ -3381,8 +3370,7 @@ async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
     hub = ZemismartHub(
         registry,
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     seed_frame = encode_b0(
         make_payload(
@@ -4800,8 +4788,7 @@ def test_own_late_repeat_is_not_mistaken_for_a_physical_press() -> None:
         registry,
         publish,
         command_id_factory=lambda: "command-repeats",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=None))
     action_raw = published[0][1]["raw"]
@@ -4846,8 +4833,7 @@ def test_timed_move_envelope_stops_at_the_preempting_stop_deadline() -> None:
         registry,
         publish,
         command_id_factory=lambda: "command-timed",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     asyncio.run(hub.async_transmit(config, "DOWN", stop_after_ms=1_000))
     action_raw = published[0]["raw"]
@@ -4889,8 +4875,7 @@ def test_pending_command_is_not_proof_of_emission() -> None:
         ack_timeout=0.05,
         started_timeout=0.05,
         command_id_factory=lambda: "command-pending",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     with suppress(CommandStartedTimeoutError, CommandAckTimeoutError):
         asyncio.run(hub.async_transmit(blind_config(), "UP", stop_after_ms=None))
@@ -5320,8 +5305,7 @@ async def test_air_started_anchor_uses_monotonic_receipt_minus_age_only() -> Non
     """Wall steps and bridge-clock projection cannot move the RF calendar."""
     registry = _two_area_registry()
     registry.update_info("bridge-a", {"area": "living_room", "boot": _STATE_SYNC_BOOT})
-    wall = {"now": 5_000.0}
-    monotonic = {"now": 900.250}
+    clocks = SteppableClocks(wall=5_000.0, monotonic=900.250)
     hub: ZemismartHub
 
     async def publish(_topic: str, payload: str) -> None:
@@ -5341,8 +5325,7 @@ async def test_air_started_anchor_uses_monotonic_receipt_minus_age_only() -> Non
     hub = ZemismartHub(
         registry,
         publish,
-        now=lambda: wall["now"],
-        monotonic_now=lambda: monotonic["now"],
+        **clocks.as_kwargs(),
     )
     seed = encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1,), "UP", bases=TEST_ACTION_BASES))
     hub.handle_rx(
@@ -5351,10 +5334,10 @@ async def test_air_started_anchor_uses_monotonic_receipt_minus_age_only() -> Non
     )
     await hub.async_transmit(action_only_config(), "DOWN")
 
-    wall["now"] = -10_000.0
-    assert hub._air.drain_until("bridge-a", now=monotonic["now"]) == pytest.approx(901.927)
-    wall["now"] = 50_000.0
-    assert hub._air.drain_until("bridge-a", now=monotonic["now"]) == pytest.approx(901.927)
+    clocks.wall = -10_000.0
+    assert hub._air.drain_until("bridge-a", now=clocks.monotonic) == pytest.approx(901.927)
+    clocks.wall = 50_000.0
+    assert hub._air.drain_until("bridge-a", now=clocks.monotonic) == pytest.approx(901.927)
 
 
 @pytest.mark.asyncio

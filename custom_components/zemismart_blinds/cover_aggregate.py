@@ -14,7 +14,7 @@ from .const import DOMAIN, ENDPOINT_OPEN
 from .models import BlindConfig, Button, CommandAck, TakeoverCoverState, ZemismartHub
 
 if TYPE_CHECKING:
-    from .coordinator import RemoteCoordinator
+    from .coordinator import MemberCover, RemoteCoordinator
     from .state_sync import HeardEvent
 
 from .cover import (
@@ -120,6 +120,27 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             seen.setdefault(id(member), member)
         return tuple(seen.values())
 
+    @callback
+    def _invalidate_failure_members(
+        self,
+        issued_members: tuple[ZemismartCover, ...],
+        invalidated_members: tuple[MemberCover, ...],
+    ) -> None:
+        """Isolate fallback invalidations for members outside live dispatch."""
+        for member in self._failure_members(issued_members):
+            if member in invalidated_members:
+                continue
+            try:
+                member.invalidate_for_cancelled_command()
+            except Exception:
+                # The coordinator recorded every topology marker first. A
+                # failed write keeps this member's marker available to restore
+                # while fallback continues through the remaining members.
+                _LOGGER.exception(
+                    "Failed to invalidate position for %s",
+                    member.entity_id,
+                )
+
     def _members_cover_every_channel(self) -> bool:
         """Return whether the live members account for ALL of our channels.
 
@@ -218,7 +239,7 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         claiming an estimate that no longer existed, and an automation gating on
         `position_confidence != 'unknown'` would act on nothing.
 
-        A suspect member still marks the whole group suspect.
+        Once the group has a position, a suspect member still marks it suspect.
         """
         members = list(self._members())
         if not self._members_cover_every_channel():
@@ -229,11 +250,16 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             # `position_confidence != 'unknown'` would act on a position that
             # does not exist.
             return CONFIDENCE_UNKNOWN
+        if self.current_cover_position is None:
+            # Confidence qualifies an estimate. If any member withholds its
+            # position, the group has no estimate for a sibling's doubt to
+            # qualify, so `unknown` is the only honest label.
+            return CONFIDENCE_UNKNOWN
         confidences = [member.position_confidence for member in members]
         if not confidences:
             return CONFIDENCE_UNKNOWN
-        # Suspect first: a member frozen by an uncorroborated heard STOP is a
-        # stronger statement about the group than a sibling merely being blank.
+        # A group position exists, so a member frozen by an uncorroborated heard
+        # STOP conservatively makes that derived estimate suspect.
         if CONFIDENCE_SUSPECT in confidences:
             return CONFIDENCE_SUSPECT
         if CONFIDENCE_UNKNOWN in confidences:
@@ -332,12 +358,11 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             # Each member's epoch is bumped for the same reason the leaf bumps
             # its own: a member whose restore is still pending would otherwise
             # overwrite this invalidation with its cached position.
-            self._coordinator.record_position_invalidations(
+            invalidated_members = self._coordinator.record_position_invalidations(
                 self._remote_entry_id,
                 self._config.channels,
             )
-            for member in self._failure_members(issued_members):
-                member.invalidate_for_cancelled_command()
+            self._invalidate_failure_members(issued_members, invalidated_members)
             self.async_write_ha_state()
             raise
         except _COMMAND_TIMEOUT_FAILURES as exc:
@@ -348,12 +373,11 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
             # async_stop_cover never freezes it, leaving members integrating
             # through a STOP that may have fired, still reporting `anchored`.
             _LOGGER.warning("Command timed out for %s: %s", self._config.name, exc)
-            self._coordinator.record_position_invalidations(
+            invalidated_members = self._coordinator.record_position_invalidations(
                 self._remote_entry_id,
                 self._config.channels,
             )
-            for member in self._failure_members(issued_members):
-                member.invalidate_for_cancelled_command()
+            self._invalidate_failure_members(issued_members, invalidated_members)
             self.async_write_ha_state()
             raise HomeAssistantError(
                 translation_domain=DOMAIN,

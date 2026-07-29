@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import traceback
 from contextlib import suppress
 from dataclasses import replace
@@ -50,6 +52,31 @@ _TIMED_COMMAND_STOP_AFTER_MS: Final = 5_000
 _COMPLETED_COMMAND_ADVANCE_SECONDS: Final = 8.0
 _UNTIMED_ACTION_WINDOW_ADVANCE_SECONDS: Final = 5.0
 _TEST_REMOTE_KEY: Final = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+
+
+@pytest.mark.parametrize(
+    "first_module",
+    ["cover_aggregate", "cover"],
+)
+def test_cover_modules_import_in_either_order(first_module: str) -> None:
+    """Either public cover module can be the integration's first import."""
+    second_module = "cover" if first_module == "cover_aggregate" else "cover_aggregate"
+    package = "custom_components.zemismart_blinds"
+    script = (
+        f"from {package} import {first_module}; "
+        f"from {package} import {second_module}; "
+        f"assert cover.ZemismartAggregateCover is "
+        f"cover_aggregate.ZemismartAggregateCover"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def cover_config(*, travel: float = 0.04) -> BlindConfig:
@@ -171,6 +198,15 @@ def dispatch_heard_press(
     )
 
 
+def patch_cover_clocks(
+    monkeypatch: pytest.MonkeyPatch,
+    clocks: SteppableClocks,
+) -> None:
+    """Keep cover and transport code on the same separated clock pair."""
+    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
+    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+
+
 @pytest.mark.parametrize("wall_step", [-3_600.0, 3_600.0], ids=["backward", "forward"])
 @pytest.mark.asyncio
 async def test_wall_step_does_not_change_live_partial_move_deadline(
@@ -183,23 +219,15 @@ async def test_wall_step_does_not_change_live_partial_move_deadline(
     # one is invisible because the two values coincide. A realistic unix-epoch
     # wall clock against a small uptime-style monotonic clock makes any
     # confusion between the two axes structural rather than a coincidence.
-    wall = {"now": 1_700_000_000.0}
-    monotonic = {"now": 200.0}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
-    monkeypatch.setattr(
-        cover_module,
-        "MONOTONIC_CLOCK",
-        lambda: monotonic["now"],
-        raising=False,
-    )
+    clocks = SteppableClocks()
+    patch_cover_clocks(monkeypatch, clocks)
     monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 10_000.0)
     real_sleep = asyncio.sleep
 
     async def elapse(seconds: float) -> None:
         if seconds > 0:
             assert entity.position_confidence != "anchored"
-        wall["now"] += seconds
-        monotonic["now"] += seconds
+        clocks.advance(seconds)
         await real_sleep(0)
 
     hub: ZemismartHub
@@ -210,8 +238,7 @@ async def test_wall_step_does_not_change_live_partial_move_deadline(
     hub = ZemismartHub(
         online_registry(),
         publish,
-        now=lambda: wall["now"],
-        monotonic_now=lambda: monotonic["now"],
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(hass, hub, config=cover_config(travel=1.0))
     entity._position = 50.0
@@ -219,15 +246,15 @@ async def test_wall_step_does_not_change_live_partial_move_deadline(
         await entity.async_set_cover_position(**{ATTR_POSITION: 80})
         expected_elapsed = entity._motion_duration
         entity._cancel_motion_task()
-        wall["now"] += wall_step
+        clocks.step_wall(wall_step)
         monkeypatch.setattr(asyncio, "sleep", elapse)
         token = object()
         entity._motion_token = token
-        started_at_monotonic = monotonic["now"]
+        started_at_monotonic = clocks.monotonic
 
         await entity._async_track_motion(token)
 
-        assert monotonic["now"] - started_at_monotonic == pytest.approx(expected_elapsed)
+        assert clocks.monotonic - started_at_monotonic == pytest.approx(expected_elapsed)
         assert entity.current_cover_position == 80
         assert not entity.is_opening
     finally:
@@ -247,15 +274,8 @@ async def test_wall_step_does_not_false_anchor_live_full_travel(
     # one is invisible because the two values coincide. A realistic unix-epoch
     # wall clock against a small uptime-style monotonic clock makes any
     # confusion between the two axes structural rather than a coincidence.
-    wall = {"now": 1_700_000_000.0}
-    monotonic = {"now": 200.0}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
-    monkeypatch.setattr(
-        cover_module,
-        "MONOTONIC_CLOCK",
-        lambda: monotonic["now"],
-        raising=False,
-    )
+    clocks = SteppableClocks()
+    patch_cover_clocks(monkeypatch, clocks)
     monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 10_000.0)
     monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.1)
     real_sleep = asyncio.sleep
@@ -263,8 +283,7 @@ async def test_wall_step_does_not_false_anchor_live_full_travel(
     async def elapse(seconds: float) -> None:
         if seconds > 0:
             assert entity.position_confidence != "anchored"
-        wall["now"] += seconds
-        monotonic["now"] += seconds
+        clocks.advance(seconds)
         await real_sleep(0)
 
     hub: ZemismartHub
@@ -275,8 +294,7 @@ async def test_wall_step_does_not_false_anchor_live_full_travel(
     hub = ZemismartHub(
         online_registry(),
         publish,
-        now=lambda: wall["now"],
-        monotonic_now=lambda: monotonic["now"],
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(hass, hub, config=cover_config(travel=0.2))
     entity._position = 50.0
@@ -284,15 +302,15 @@ async def test_wall_step_does_not_false_anchor_live_full_travel(
         await entity.async_open_cover()
         expected_elapsed = entity._motion_duration
         entity._cancel_motion_task()
-        wall["now"] += wall_step
+        clocks.step_wall(wall_step)
         monkeypatch.setattr(asyncio, "sleep", elapse)
         token = object()
         entity._motion_token = token
-        started_at_monotonic = monotonic["now"]
+        started_at_monotonic = clocks.monotonic
 
         await entity._async_track_motion(token)
 
-        elapsed = monotonic["now"] - started_at_monotonic
+        elapsed = clocks.monotonic - started_at_monotonic
         assert elapsed == pytest.approx(expected_elapsed)
         assert entity.current_cover_position == 100
         assert entity.position_confidence == "anchored"
@@ -312,15 +330,11 @@ async def test_wall_step_restore_projects_remaining_duration_once(
     config = cover_config(travel=10.0)
     persisted_started = 1_000.0
     persisted_deadline = 1_010.0
-    wall = {"now": 1_004.0 + wall_step}
-    monotonic = {"now": 50.0}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
-    monkeypatch.setattr(
-        cover_module,
-        "MONOTONIC_CLOCK",
-        lambda: monotonic["now"],
-        raising=False,
+    clocks = SteppableClocks(
+        wall=1_004.0 + wall_step,
+        monotonic=50.0,
     )
+    patch_cover_clocks(monkeypatch, clocks)
     restored_state = State(
         "cover.living_room_left",
         "opening",
@@ -349,8 +363,8 @@ async def test_wall_step_restore_projects_remaining_duration_once(
         cover_type=restored_cover_type(restored_state),
     )
     try:
-        remaining = persisted_deadline - wall["now"]
-        assert entity._motion_deadline_monotonic == pytest.approx(monotonic["now"] + remaining)
+        remaining = persisted_deadline - clocks.wall
+        assert entity._motion_deadline_monotonic == pytest.approx(clocks.monotonic + remaining)
         assert entity.extra_state_attributes["motion_started"] == persisted_started
         assert entity.extra_state_attributes["motion_deadline"] == persisted_deadline
     finally:
@@ -364,15 +378,8 @@ async def test_restore_completion_is_suspect_but_in_flight_restore_is_assumed(
 ) -> None:
     """Only a restore completion inferred from wall time is suspect."""
     config = cover_config(travel=10.0)
-    wall = {"now": 1_700_000_000.0}
-    monotonic = {"now": 200.0}
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", lambda: wall["now"])
-    monkeypatch.setattr(
-        cover_module,
-        "MONOTONIC_CLOCK",
-        lambda: monotonic["now"],
-        raising=False,
-    )
+    clocks = SteppableClocks()
+    patch_cover_clocks(monkeypatch, clocks)
 
     def moving_state(*, deadline: float, command_id: str) -> State:
         return State(
@@ -384,7 +391,7 @@ async def test_restore_completion_is_suspect_but_in_flight_restore_is_assumed(
                 "channels": list(config.channels),
                 "motion_direction": 1,
                 "motion_target": 80,
-                "motion_started": wall["now"] - 4.0,
+                "motion_started": clocks.wall - 4.0,
                 "motion_deadline": deadline,
                 "motion_start_position": 20,
                 "motion_bridge": "bridge-a",
@@ -403,7 +410,7 @@ async def test_restore_completion_is_suspect_but_in_flight_restore_is_assumed(
         config=config,
         cover_type=restored_cover_type(
             moving_state(
-                deadline=wall["now"] + 6.0,
+                deadline=clocks.wall + 6.0,
                 command_id="in-flight-restore",
             )
         ),
@@ -422,7 +429,7 @@ async def test_restore_completion_is_suspect_but_in_flight_restore_is_assumed(
         config=config,
         cover_type=restored_cover_type(
             moving_state(
-                deadline=wall["now"] - 1.0,
+                deadline=clocks.wall - 1.0,
                 command_id="completed-restore",
             )
         ),
@@ -691,8 +698,7 @@ async def test_set_position_at_current_while_moving_sends_stop(
     """An apparent no-op cannot silently freeze a motor that is still moving."""
     bodies: list[dict[str, Any]] = []
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -709,8 +715,7 @@ async def test_set_position_at_current_while_moving_sends_stop(
     hub = ZemismartHub(
         online_registry(),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(hass, hub, config=config)
     entity._position = 50.0
@@ -2178,8 +2183,7 @@ async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
     """A command retained only for echoes cannot threaten idle members."""
     published: list[tuple[str, dict[str, Any]]] = []
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -2192,8 +2196,7 @@ async def test_completed_timed_command_is_not_disarmed_on_physical_takeover(
         online_registry(),
         publish,
         command_id_factory=lambda: "completed-timed-group",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     pressed = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
     unpressed = await attach_cover(
@@ -2240,8 +2243,7 @@ async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeo
     """Cover-owned takeover ignores a command whose RF window has ended."""
     published: list[tuple[str, dict[str, Any]]] = []
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -2254,8 +2256,7 @@ async def test_completed_untimed_cover_command_is_not_disarmed_on_physical_takeo
         online_registry(),
         publish,
         command_id_factory=lambda: "untimed-member-up",
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(hass, hub, config=member_config(channel=1, travel=5.0))
     entity._position = 50.0
@@ -4512,14 +4513,13 @@ async def test_expired_relative_restore_preserves_existing_anchor_dependency(
 
 
 @pytest.mark.asyncio
-async def test_restarted_absolute_motion_settles_unverified_anchor(
+async def test_restarted_absolute_motion_keeps_unverified_anchor_revocable(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A restarted full travel retains its hard-limit anchoring semantics."""
+    """A restarted full travel keeps its unwitnessed origin revocable."""
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     monkeypatch.setattr(cover_module, "FULL_TRAVEL_MARGIN_SECONDS", 0.01)
     monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.001)
     registry = online_registry("bridge-b")
@@ -4531,8 +4531,7 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
     hub = ZemismartHub(
         registry,
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     original = await attach_cover(hass, hub, config=cover_config(travel=0.2))
     original._position = 80.0
@@ -4554,8 +4553,7 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
     restored_hub = ZemismartHub(
         restored_registry,
         quiet_publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     restored = await attach_cover(
         hass,
@@ -4573,13 +4571,131 @@ async def test_restarted_absolute_motion_settles_unverified_anchor(
 
         assert restored.current_cover_position == 100
         assert restored.extra_state_attributes["motion_absolute_anchor"] is False
-        assert restored.extra_state_attributes["unverified_anchor_bridge"] is None
+        assert restored.extra_state_attributes["unverified_anchor_bridge"] == "bridge-a"
+        assert restored.position_confidence == "suspect"
 
         restored_registry.update_availability("bridge-a", "offline")
         restored_hub.notify_bridge_change()
-        assert restored.current_cover_position == 100
+        assert restored.current_cover_position is None
+        assert restored.position_confidence == "unknown"
     finally:
         await restored.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_recovered_travel_completion_keeps_suspect_and_earns_no_anchor(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart gap cannot be promoted to an observed hard-limit travel."""
+    clocks = SteppableClocks()
+    patch_cover_clocks(monkeypatch, clocks)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.001)
+    config = cover_config(travel=10.0)
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": config.role.value,
+            "motion_direction": 1,
+            "motion_target": 100,
+            "motion_started": clocks.wall - 5.0,
+            "motion_deadline": clocks.wall + 5.0,
+            "motion_start_position": 0,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "recovered-open",
+            "motion_timed": False,
+            "motion_absolute_anchor": True,
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish, **clocks.as_kwargs())
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert entity.is_opening
+
+        clocks.advance(5.0)
+        await asyncio.sleep(0.02)
+
+        assert entity.current_cover_position == 100
+        assert entity._position_anchored is False
+        assert entity._suspect is True
+        assert entity.position_confidence == "suspect"
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_recovered_absolute_completion_applies_deferred_offline_evidence(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovered endpoint cannot settle an origin invalidated while moving."""
+    clocks = SteppableClocks()
+    patch_cover_clocks(monkeypatch, clocks)
+    monkeypatch.setattr(cover_module, "POSITION_UPDATE_INTERVAL_SECONDS", 0.001)
+    config = cover_config(travel=10.0)
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 40,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": config.role.value,
+            "motion_direction": 1,
+            "motion_target": 100,
+            "motion_started": clocks.wall - 5.0,
+            "motion_deadline": clocks.wall + 5.0,
+            "motion_start_position": 0,
+            "motion_bridge": "bridge-b",
+            "motion_command_id": "recovered-open",
+            "motion_timed": False,
+            "motion_absolute_anchor": True,
+            "unverified_anchor_bridge": "bridge-a",
+        },
+    )
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    registry = online_registry("bridge-b")
+    hub = ZemismartHub(registry, quiet_publish, **clocks.as_kwargs())
+    entity = await attach_cover(
+        hass,
+        hub,
+        config=config,
+        cover_type=restored_cover_type(restored_state),
+    )
+    try:
+        assert entity.is_opening
+
+        registry.update_availability("bridge-a", "offline")
+        hub.notify_bridge_change()
+        assert entity.is_opening
+        assert entity.extra_state_attributes["unverified_anchor_offline"] is True
+
+        clocks.advance(5.0)
+        await asyncio.sleep(0.02)
+
+        assert entity.current_cover_position is None
+        assert entity.position_confidence == "unknown"
+        assert entity.extra_state_attributes["unverified_anchor_bridge"] is None
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
 
 
 @pytest.mark.asyncio
@@ -4622,15 +4738,66 @@ async def test_expired_timed_restore_has_coherent_unverified_anchor_state(
         assert attributes["motion_target"] is None
         assert attributes["motion_absolute_anchor"] is False
         assert attributes["unverified_anchor_bridge"] == "bridge-a"
+        assert entity.position_confidence == "suspect"
     finally:
         await entity.async_will_remove_from_hass()
 
 
 @pytest.mark.asyncio
-async def test_expired_absolute_restore_settles_unverified_anchor(
+async def test_expired_restore_does_not_persist_suspect_without_position(
     hass: HomeAssistant,
 ) -> None:
-    """A full travel completed during downtime replaces the old anchor."""
+    """Late offline reconciliation discards both estimate and its doubt."""
+    config = cover_config()
+    now = cover_module.WALL_CLOCK()
+    restored_state = State(
+        "cover.living_room_left",
+        "opening",
+        {
+            ATTR_CURRENT_POSITION: 50,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "motion_direction": 1,
+            "motion_target": 80,
+            "motion_started": now - 2.0,
+            "motion_deadline": now - 1.0,
+            "motion_start_position": 50,
+            "motion_bridge": "bridge-a",
+            "motion_command_id": "timed-command",
+            "motion_timed": True,
+        },
+    )
+    registry = BridgeRegistry()
+
+    class LateOfflineRestoredCover(ZemismartCover):
+        async def async_get_last_state(self) -> State:
+            return restored_state
+
+        def _bridge_seen_online(self, bridge_id: str) -> bool:
+            registry.update_availability(bridge_id, "offline")
+            return False
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    entity = await attach_cover(
+        hass,
+        ZemismartHub(registry, quiet_publish),
+        cover_type=LateOfflineRestoredCover,
+    )
+    try:
+        assert entity.current_cover_position is None
+        assert entity.position_confidence == "unknown"
+        assert entity.extra_state_attributes["position_suspect"] is False
+    finally:
+        await entity.async_will_remove_from_hass()
+
+
+@pytest.mark.asyncio
+async def test_expired_absolute_restore_keeps_unverified_anchor_revocable(
+    hass: HomeAssistant,
+) -> None:
+    """A full travel completed during downtime stays suspect and revocable."""
     config = cover_config()
     now = cover_module.WALL_CLOCK()
     restored_state = State(
@@ -4668,11 +4835,13 @@ async def test_expired_absolute_restore_settles_unverified_anchor(
         assert entity.current_cover_position == 100
         assert attributes["motion_direction"] == 0
         assert attributes["motion_absolute_anchor"] is False
-        assert attributes["unverified_anchor_bridge"] is None
+        assert attributes["unverified_anchor_bridge"] == "bridge-a"
+        assert entity.position_confidence == "suspect"
 
         registry.update_availability("bridge-a", "offline")
         hub.notify_bridge_change()
-        assert entity.current_cover_position == 100
+        assert entity.current_cover_position is None
+        assert entity.position_confidence == "unknown"
     finally:
         await entity.async_will_remove_from_hass()
 
@@ -4791,6 +4960,54 @@ async def detach_family(*entities: Any) -> None:
     """Tear the family down in reverse order."""
     for entity in reversed(entities):
         await entity.async_will_remove_from_hass()
+
+
+def restored_leaf_state(
+    config: BlindConfig,
+    *,
+    entity_id: str = "cover.channel_2",
+    position: int = 40,
+) -> State:
+    """Return restorable state tied to one leaf's current hardware identity."""
+    return State(
+        entity_id,
+        "open",
+        {
+            ATTR_CURRENT_POSITION: position,
+            "remote": config.remote_key,
+            "channels": list(config.channels),
+            "role": Role.LEAF.value,
+        },
+    )
+
+
+def topology_cover(
+    name: str,
+    cover_id: str,
+    channels: tuple[int, ...],
+) -> models_module.CoverConfig:
+    """Return one calibrated leaf for tombstone topology tests."""
+    return models_module.CoverConfig(
+        name=name,
+        channels=channels,
+        travel_up=1.0,
+        travel_down=1.0,
+        cover_id=cover_id,
+    )
+
+
+def tombstone_coordinator(
+    hass: HomeAssistant,
+    *covers: models_module.CoverConfig,
+    remote_key: str = _TEST_REMOTE_KEY,
+) -> RemoteCoordinator:
+    """Attach current tombstone topology for one remote entry."""
+    return RemoteCoordinator(
+        hass,
+        {cover.cover_id: cover for cover in covers},
+        "remote-entry",
+        remote_key,
+    )
 
 
 @pytest.mark.asyncio
@@ -5532,8 +5749,7 @@ async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
     the phantom frame is direct proof the callback never ran.
     """
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -5544,8 +5760,7 @@ async def test_round_robin_burst_does_not_re_anchor_a_fully_covered_cover(
     hub = ZemismartHub(
         online_registry(_ROUND_ROBIN_BRIDGE_ID),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(
         hass,
@@ -5603,8 +5818,7 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
     contributing leaf command addresses.
     """
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -5615,8 +5829,7 @@ async def test_round_robin_burst_does_not_mark_a_partially_covered_cover_unknown
     hub = ZemismartHub(
         online_registry(_ROUND_ROBIN_BRIDGE_ID),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     group = await attach_cover(
         hass,
@@ -5796,8 +6009,7 @@ async def _commanded_untimed_full_close(
     hub = ZemismartHub(
         online_registry(),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(hass, hub, config=cover_config(travel=10.0))
     entity._position = 100.0
@@ -5815,8 +6027,7 @@ async def test_heard_stop_early_in_untimed_full_travel_marks_suspect(
 ) -> None:
     """A heard STOP early in an untimed full close leaves the estimate suspect."""
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
         started = entity._motion_started_monotonic
@@ -5847,8 +6058,7 @@ async def test_heard_stop_late_in_untimed_full_travel_marks_suspect(
     to its limit while the model froze near it.
     """
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
         started = entity._motion_started_monotonic
@@ -6039,8 +6249,7 @@ async def test_suspect_cleared_by_a_completed_endpoint_travel(
 ) -> None:
     """A completed hard-limit travel (a reanchor) settles the suspect doubt."""
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     entity, hub = await _commanded_untimed_full_close(hass, clocks)
     try:
         started = entity._motion_started_monotonic
@@ -6065,19 +6274,14 @@ async def test_suspect_cleared_by_a_completed_endpoint_travel(
 
 
 @pytest.mark.asyncio
-async def test_aggregate_confidence_is_the_worst_of_its_members(
+async def test_aggregate_confidence_requires_a_position_before_member_ordering(
     hass: HomeAssistant,
 ) -> None:
-    """Aggregate confidence takes the worst member value: suspect > unknown > assumed > anchored.
+    """Confidence qualifies an estimate before ordering member confidence.
 
-    One rule throughout: no position means `unknown`, so any member without one
-    makes the GROUP unknown. It used to cap at `assumed` instead, which was
-    right while the group position was the mean of the members that HAD one --
-    but once a single unknown member began withholding the whole position (#32),
-    `assumed` was claiming an estimate that no longer existed.
-
-    `suspect` still outranks unknown: a blind frozen by a STOP nobody could
-    corroborate says more about the group than a sibling merely being blank.
+    No aggregate position leaves nothing for `suspect` to qualify, so `unknown`
+    is the only honest label. Once every member contributes a position, the
+    conservative member order still applies and `suspect` outranks `assumed`.
     """
 
     async def quiet_publish(_topic: str, _payload: str) -> None:
@@ -6095,31 +6299,31 @@ async def test_aggregate_confidence_is_the_worst_of_its_members(
         leaf_two._position_anchored, leaf_two._position = False, 50.0
         assert aggregate.position_confidence == "assumed"
 
-        # Suspect outranks assumed even when BOTH are present at once: leaf_one
-        # is assumed, leaf_two suspect, and suspect must win (order matters).
+        # With a group position, suspect outranks assumed: leaf_one is assumed,
+        # leaf_two suspect, and suspect must win (order matters).
         leaf_one._position_anchored, leaf_one._position = False, 20.0
         leaf_two._suspect = True
+        assert aggregate.current_cover_position == 35
         assert aggregate.position_confidence == "suspect"
 
-        # An unknown member makes the GROUP unknown, not merely assumed. It used
-        # to cap at assumed, which was right while the position was the mean of
-        # the members that had one -- but #32 made a single unknown member
-        # withhold the whole position, so `assumed` began claiming an estimate
-        # that no longer existed.
+        # An unknown member withholds the GROUP position. Even though its
+        # sibling has a surviving suspect estimate, there is no aggregate
+        # estimate for that doubt to qualify, so the group is unknown.
         leaf_one._position, leaf_one._position_anchored = 0.0, True
+        leaf_one._suspect = True
         leaf_two._position, leaf_two._suspect = None, False
         assert leaf_two.position_confidence == "unknown"
         assert aggregate.current_cover_position is None
         assert aggregate.position_confidence == "unknown"
 
-        # Suspect still outranks it: a member frozen by an uncorroborated heard
-        # STOP says more about the group than a sibling merely being blank.
-        leaf_one._suspect = True
+        # Restore the missing estimate and suspect surfaces again: it is now
+        # qualifying the aggregate's derived position rather than nothing.
+        leaf_two._position = 50.0
+        assert aggregate.current_cover_position == 25
         assert aggregate.position_confidence == "suspect"
-        leaf_one._suspect = False
 
         # No member has a position -> still unknown.
-        leaf_one._position = None
+        leaf_one._position, leaf_two._position = None, None
         assert aggregate.position_confidence == "unknown"
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
@@ -6135,8 +6339,7 @@ async def test_heard_stop_through_handle_rx_marks_suspect(
     delivered through the production RX path while a commanded untimed full
     close runs, leaves the estimate suspect."""
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
     hub: ZemismartHub
 
     async def publish(topic: str, payload: str) -> None:
@@ -6147,8 +6350,7 @@ async def test_heard_stop_through_handle_rx_marks_suspect(
     hub = ZemismartHub(
         online_registry(),
         publish,
-        now=clocks.wall_now,
-        monotonic_now=clocks.monotonic_now,
+        **clocks.as_kwargs(),
     )
     entity = await attach_cover(
         hass,
@@ -6550,8 +6752,7 @@ async def test_intermediate_progress_writes_are_throttled(
     attributes per 30 s travel, per cover).
     """
     clocks = SteppableClocks()
-    monkeypatch.setattr(cover_module, "WALL_CLOCK", clocks.wall_now)
-    monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", clocks.monotonic_now)
+    patch_cover_clocks(monkeypatch, clocks)
 
     real_sleep = asyncio.sleep
 
@@ -6789,7 +6990,7 @@ async def test_aggregate_timeout_invalidates_every_member(hass: HomeAssistant) -
 async def test_aggregate_timeout_records_position_tombstones(
     hass: HomeAssistant,
 ) -> None:
-    """A timeout persists topology invalidation, not only live-member state."""
+    """A timeout persists a marker for an addressed leaf that is not live."""
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -6802,11 +7003,12 @@ async def test_aggregate_timeout_records_position_tombstones(
     )
     leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
     try:
+        aggregate._coordinator.unregister_leaf("sub-2")
         with pytest.raises(HomeAssistantError):
             await aggregate.async_open_cover()
 
         coordinator = aggregate._coordinator
-        assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-1")
         assert coordinator.has_position_invalidation("remote-entry", "sub-2")
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
@@ -7543,16 +7745,7 @@ async def test_aggregate_cancellation_tombstones_a_configured_leaf_that_was_neve
         # A platform reload rebuilds the coordinator; only the hass.data store
         # spans that replacement.
         replacement_coordinator, _, _, _ = aggregate_family(hass, hub)
-        restored = State(
-            "cover.channel_2",
-            "open",
-            {
-                ATTR_CURRENT_POSITION: 40,
-                "remote": leaf_two_config.remote_key,
-                "channels": [2],
-                "role": "leaf",
-            },
-        )
+        restored = restored_leaf_state(leaf_two_config)
         late_leaf = restored_cover_type(restored)(
             "sub-2",
             "remote-entry",
@@ -7579,16 +7772,6 @@ async def test_tombstone_recorded_during_restore_await_is_honoured(
     """An old coordinator can tombstone a new coordinator's suspended restore."""
     entered_restore = asyncio.Event()
     release_restore = asyncio.Event()
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
 
     class SlowRestoreCover(ZemismartCover):
         """Expose a distinct restore getter for this race."""
@@ -7606,6 +7789,7 @@ async def test_tombstone_recorded_during_restore_await_is_honoured(
     hub = ZemismartHub(online_registry(), publish)
     old_coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
     replacement_coordinator, _, _, _ = aggregate_family(hass, hub)
+    restored = restored_leaf_state(leaf_two_config)
     replacement = SlowRestoreCover(
         "sub-2",
         "remote-entry",
@@ -7652,21 +7836,266 @@ async def test_tombstone_recorded_during_restore_await_is_honoured(
 
 
 @pytest.mark.asyncio
+async def test_late_stale_coordinator_tombstone_invalidates_live_replacement(
+    hass: HomeAssistant,
+) -> None:
+    """A late failure reaches the replacement that already finished restore."""
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    stale_coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    current_coordinator, _, _, _ = aggregate_family(hass, hub)
+    restored = restored_leaf_state(leaf_two_config)
+    replacement = restored_cover_type(restored)(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        current_coordinator,
+    )
+    await attach_family_entity(hass, replacement, "cover.channel_2")
+    try:
+        assert replacement.current_cover_position == 40
+        assert replacement.position_confidence == "assumed"
+
+        stale_coordinator.record_position_invalidations("remote-entry", (2,))
+
+        written = hass.states.get("cover.channel_2")
+        assert replacement.current_cover_position is None
+        assert replacement.position_confidence == "unknown"
+        assert written is not None
+        assert written.state == "unknown"
+        assert not current_coordinator.has_position_invalidation(
+            "remote-entry",
+            "sub-2",
+        )
+    finally:
+        await replacement.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_live_invalidation_write_retires_marker_before_later_restore(
+    hass: HomeAssistant,
+) -> None:
+    """A successful live unknown write cannot poison newer earned history."""
+
+    async def quiet_publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), quiet_publish)
+    coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
+    restored = restored_leaf_state(leaf_two_config)
+    entity = restored_cover_type(restored)(
+        "sub-2",
+        "remote-entry",
+        leaf_two_config,
+        hub,
+        coordinator,
+    )
+    await attach_family_entity(hass, entity, "cover.channel_2")
+    replacement: ZemismartCover | None = None
+    try:
+        coordinator.unregister_leaf("sub-2")
+        coordinator.record_position_invalidations("remote-entry", (2,))
+        assert coordinator.has_position_invalidation("remote-entry", "sub-2")
+        coordinator.register_leaf("sub-2", entity)
+
+        entity.invalidate_for_cancelled_command()
+
+        written_unknown = hass.states.get("cover.channel_2")
+        assert written_unknown is not None
+        assert written_unknown.state == "unknown"
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+
+        entity._position = 65.0
+        entity.async_write_ha_state()
+        persisted = hass.states.get("cover.channel_2")
+        assert persisted is not None
+        assert persisted.attributes[ATTR_CURRENT_POSITION] == 65
+
+        await entity.async_will_remove_from_hass()
+        replacement = restored_cover_type(persisted)(
+            "sub-2",
+            "remote-entry",
+            leaf_two_config,
+            hub,
+            coordinator,
+        )
+        await attach_family_entity(hass, replacement, "cover.channel_2")
+
+        assert replacement.current_cover_position == 65
+        assert replacement.position_confidence == "assumed"
+    finally:
+        if replacement is not None:
+            await replacement.async_will_remove_from_hass()
+        else:
+            await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_failure_invalidates_each_current_member_once(
+    hass: HomeAssistant,
+) -> None:
+    """Shared dispatch and issued-member fallback must not double-invalidate."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaf_one, leaf_two, aggregate = await attach_family(hass, hub)
+    epochs = {
+        leaf_one: leaf_one._restore_epoch,
+        leaf_two: leaf_two._restore_epoch,
+    }
+    try:
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert leaf_one._restore_epoch == epochs[leaf_one] + 1
+        assert leaf_two._restore_epoch == epochs[leaf_two] + 1
+        assert leaf_one.current_cover_position is None
+        assert leaf_two.current_cover_position is None
+    finally:
+        await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_aggregate_failure_isolates_member_write_and_runs_fallback(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failed live write cannot block later dispatch or issued-member fallback."""
+    published = asyncio.Event()
+
+    async def publish(_topic: str, _payload: str) -> None:
+        published.set()
+
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    channels = (1, 2, 3, 4)
+    covers = {
+        cover_id: models_module.CoverConfig(
+            name=f"Channel {channel}",
+            channels=(channel,),
+            travel_up=1.0,
+            travel_down=1.0,
+            cover_id=cover_id,
+        )
+        for channel, cover_id in zip(
+            channels,
+            ("sub-1", "sub-2", "sub-3", "sub-4"),
+            strict=True,
+        )
+    }
+    covers["sub-agg"] = models_module.CoverConfig(
+        name="All four",
+        channels=channels,
+        cover_id="sub-agg",
+    )
+    coordinator = RemoteCoordinator(hass, covers, "remote-entry", remote.key)
+
+    def leaf_config(channel: int) -> BlindConfig:
+        return BlindConfig(
+            name=f"Channel {channel}",
+            remote=remote,
+            channels=(channel,),
+            travel_up=1.0,
+            travel_down=1.0,
+            area_id="living_room",
+            repeats=2,
+        )
+
+    hub = ZemismartHub(online_registry(), publish)
+    leaves = tuple(
+        ZemismartCover(
+            f"sub-{channel}",
+            "remote-entry",
+            leaf_config(channel),
+            hub,
+            coordinator,
+        )
+        for channel in channels
+    )
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg",
+        "remote-entry",
+        BlindConfig(
+            name="All four",
+            remote=remote,
+            channels=channels,
+            travel_up=None,
+            travel_down=None,
+            area_id="living_room",
+            repeats=2,
+            role=Role.AGGREGATE,
+        ),
+        hub,
+        coordinator,
+    )
+    for entity, entity_id in (
+        (leaves[0], "cover.channel_1"),
+        (leaves[1], "cover.channel_2"),
+        (leaves[2], "cover.channel_3"),
+        (leaves[3], "cover.channel_4"),
+        (aggregate, "cover.all_four"),
+    ):
+        await attach_family_entity(hass, entity, entity_id)
+
+    original_write = CoverEntity._async_write_ha_state
+    attempted_leaf_writes: list[str] = []
+    failed_cover_ids: set[str] = set()
+    raising_leaves = (leaves[0], leaves[2])
+
+    def fail_first_leaf_write(entity: CoverEntity) -> None:
+        if entity in leaves:
+            attempted_leaf_writes.append(entity._cover_id)
+        if entity in raising_leaves and entity._cover_id not in failed_cover_ids:
+            failed_cover_ids.add(entity._cover_id)
+            msg = "member invalidation write failed"
+            raise RuntimeError(msg)
+        original_write(entity)
+
+    monkeypatch.setattr(CoverEntity, "_async_write_ha_state", fail_first_leaf_write)
+    for leaf in leaves:
+        leaf._position = 40.0
+        leaf._position_anchored = True
+
+    try:
+        moving = hass.async_create_task(aggregate.async_open_cover())
+        await published.wait()
+        coordinator.unregister_leaf("sub-3")
+        coordinator.unregister_leaf("sub-4")
+
+        moving.cancel()
+        with suppress(asyncio.CancelledError):
+            await moving
+
+        assert failed_cover_ids == {"sub-1", "sub-3"}
+        assert attempted_leaf_writes == ["sub-1", "sub-2", "sub-3", "sub-4"]
+        assert all(leaf.current_cover_position is None for leaf in leaves)
+        assert coordinator.has_position_invalidation("remote-entry", "sub-1")
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+        assert coordinator.has_position_invalidation("remote-entry", "sub-3")
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-4")
+    finally:
+        await detach_family(*leaves, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_add_keeps_consumed_tombstone_for_retry(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failure after restore invalidation cannot expose stale state on retry."""
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -7692,6 +8121,7 @@ async def test_failed_add_keeps_consumed_tombstone_for_retry(
     hub = ZemismartHub(online_registry(), publish)
     coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
     coordinator.record_position_invalidations("remote-entry", (2,))
+    restored = restored_leaf_state(leaf_two_config)
     cover_type = restored_cover_type(restored)
     failed = cover_type(
         "sub-2",
@@ -7736,16 +8166,6 @@ async def test_initial_state_write_failure_keeps_consumed_tombstone_for_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The post-add state write is the tombstone consumption boundary."""
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -7753,6 +8173,7 @@ async def test_initial_state_write_failure_keeps_consumed_tombstone_for_retry(
     hub = ZemismartHub(online_registry(), publish)
     coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
     coordinator.record_position_invalidations("remote-entry", (2,))
+    restored = restored_leaf_state(leaf_two_config)
     cover_type = restored_cover_type(restored)
     failed = cover_type(
         "sub-2",
@@ -7812,16 +8233,6 @@ async def test_successful_initial_state_write_clears_consumed_tombstone_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A successful unknown write clears once and cannot poison honest state."""
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -7829,6 +8240,7 @@ async def test_successful_initial_state_write_clears_consumed_tombstone_once(
     hub = ZemismartHub(online_registry(), publish)
     coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
     coordinator.record_position_invalidations("remote-entry", (2,))
+    restored = restored_leaf_state(leaf_two_config)
     clear_calls = 0
     original_clear = coordinator.clear_position_invalidation
 
@@ -7899,36 +8311,14 @@ async def test_rebuilt_coordinator_prunes_deleted_cover_tombstone(
     hass: HomeAssistant,
 ) -> None:
     """Attaching a changed topology drops markers for deleted cover IDs."""
-    retained = models_module.CoverConfig(
-        name="Retained",
-        channels=(2,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-2",
-    )
-    deleted = models_module.CoverConfig(
-        name="Deleted",
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-1",
-    )
-    coordinator = RemoteCoordinator(
-        hass,
-        {"sub-1": deleted, "sub-2": retained},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    retained = topology_cover("Retained", "sub-2", (2,))
+    deleted = topology_cover("Deleted", "sub-1", (1,))
+    coordinator = tombstone_coordinator(hass, deleted, retained)
     coordinator.record_position_invalidations("remote-entry", (1, 2))
     assert coordinator.has_position_invalidation("remote-entry", "sub-1")
     assert coordinator.has_position_invalidation("remote-entry", "sub-2")
 
-    replacement = RemoteCoordinator(
-        hass,
-        {"sub-2": retained},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    replacement = tombstone_coordinator(hass, retained)
 
     assert not replacement.has_position_invalidation("remote-entry", "sub-1")
     assert replacement.has_position_invalidation("remote-entry", "sub-2")
@@ -7939,33 +8329,11 @@ async def test_stale_coordinator_cannot_reinsert_deleted_cover_tombstone(
     hass: HomeAssistant,
 ) -> None:
     """A late old-topology failure is filtered by the current leaf IDs."""
-    deleted = models_module.CoverConfig(
-        name="Deleted",
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-1",
-    )
-    retained = models_module.CoverConfig(
-        name="Retained",
-        channels=(2,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-2",
-    )
-    stale = RemoteCoordinator(
-        hass,
-        {"sub-1": deleted, "sub-2": retained},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    deleted = topology_cover("Deleted", "sub-1", (1,))
+    retained = topology_cover("Retained", "sub-2", (2,))
+    stale = tombstone_coordinator(hass, deleted, retained)
     stale.record_position_invalidations("remote-entry", (2,))
-    current = RemoteCoordinator(
-        hass,
-        {"sub-2": retained},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    current = tombstone_coordinator(hass, retained)
     assert current.has_position_invalidation("remote-entry", "sub-2")
     assert not current.has_position_invalidation("remote-entry", "sub-1")
 
@@ -7980,35 +8348,13 @@ async def test_rebuilt_coordinator_prunes_leaf_to_aggregate_tombstone(
     hass: HomeAssistant,
 ) -> None:
     """A stable ID that is now an aggregate cannot retain a leaf marker."""
-    former_leaf = models_module.CoverConfig(
-        name="Former leaf",
-        channels=(1, 2),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-outer",
-    )
-    stale = RemoteCoordinator(
-        hass,
-        {"sub-outer": former_leaf},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    former_leaf = topology_cover("Former leaf", "sub-outer", (1, 2))
+    stale = tombstone_coordinator(hass, former_leaf)
     stale.record_position_invalidations("remote-entry", (1, 2))
     assert stale.has_position_invalidation("remote-entry", "sub-outer")
 
-    inner_leaf = models_module.CoverConfig(
-        name="New inner leaf",
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-inner",
-    )
-    current = RemoteCoordinator(
-        hass,
-        {"sub-outer": former_leaf, "sub-inner": inner_leaf},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    inner_leaf = topology_cover("New inner leaf", "sub-inner", (1,))
+    current = tombstone_coordinator(hass, former_leaf, inner_leaf)
 
     assert current.roles["sub-outer"] is Role.AGGREGATE
     assert not current.has_position_invalidation("remote-entry", "sub-outer")
@@ -8019,26 +8365,10 @@ async def test_failure_tombstones_only_addressed_leaf_channels(
     hass: HomeAssistant,
 ) -> None:
     """A configured leaf outside the failed frame's channels stays restorable."""
-    coordinator = RemoteCoordinator(
+    coordinator = tombstone_coordinator(
         hass,
-        {
-            "sub-1": models_module.CoverConfig(
-                name="Addressed",
-                channels=(1,),
-                travel_up=1.0,
-                travel_down=1.0,
-                cover_id="sub-1",
-            ),
-            "sub-2": models_module.CoverConfig(
-                name="Unaddressed",
-                channels=(2,),
-                travel_up=1.0,
-                travel_down=1.0,
-                cover_id="sub-2",
-            ),
-        },
-        "remote-entry",
-        _TEST_REMOTE_KEY,
+        topology_cover("Addressed", "sub-1", (1,)),
+        topology_cover("Unaddressed", "sub-2", (2,)),
     )
 
     coordinator.record_position_invalidations("remote-entry", (1,))
@@ -8052,26 +8382,10 @@ async def test_stale_coordinator_cannot_tombstone_a_retained_remapped_cover(
     hass: HomeAssistant,
 ) -> None:
     """A stale failed frame is filtered through the current channel mapping."""
-    channel_one = models_module.CoverConfig(
-        name="Retained",
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-retained",
-    )
-    stale = RemoteCoordinator(
-        hass,
-        {"sub-retained": channel_one},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    channel_one = topology_cover("Retained", "sub-retained", (1,))
+    stale = tombstone_coordinator(hass, channel_one)
     channel_two = replace(channel_one, channels=(2,))
-    current = RemoteCoordinator(
-        hass,
-        {"sub-retained": channel_two},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
+    current = tombstone_coordinator(hass, channel_two)
 
     stale.record_position_invalidations("remote-entry", (1,))
 
@@ -8087,25 +8401,9 @@ async def test_stale_remote_cannot_tombstone_a_retargeted_cover(
     hass: HomeAssistant,
 ) -> None:
     """A stale failed frame from the old RF remote cannot cross a reload."""
-    cover = models_module.CoverConfig(
-        name="Retained",
-        channels=(1,),
-        travel_up=1.0,
-        travel_down=1.0,
-        cover_id="sub-retained",
-    )
-    stale = RemoteCoordinator(
-        hass,
-        {"sub-retained": cover},
-        "remote-entry",
-        _TEST_REMOTE_KEY,
-    )
-    current = RemoteCoordinator(
-        hass,
-        {"sub-retained": cover},
-        "remote-entry",
-        "ffffff:ff",
-    )
+    cover = topology_cover("Retained", "sub-retained", (1,))
+    stale = tombstone_coordinator(hass, cover)
+    current = tombstone_coordinator(hass, cover, remote_key="ffffff:ff")
 
     stale.record_position_invalidations("remote-entry", (1,))
 
@@ -8131,16 +8429,7 @@ async def test_aggregate_cancellation_tombstone_survives_real_member_removal(
     for entity in (leaf_one, leaf_two, aggregate):
         entity._platform_state = EntityPlatformState.ADDED
         entity.async_write_ha_state()
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": leaf_two._config.remote_key,
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
+    restored = restored_leaf_state(leaf_two._config)
     replacement: ZemismartCover | None = None
     try:
         leaf_one._position = 40.0
@@ -8189,16 +8478,7 @@ async def test_aggregate_cancellation_tombstones_a_join_then_leave_member(
     aggregate = cover_module.ZemismartAggregateCover(
         "sub-agg", "remote-entry", aggregate_config, hub, coordinator
     )
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": leaf_two_config.remote_key,
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
+    restored = restored_leaf_state(leaf_two_config)
     transient: ZemismartCover | None = None
     replacement: ZemismartCover | None = None
     await attach_family_entity(hass, leaf_one, "cover.channel_1")
@@ -8263,6 +8543,12 @@ async def test_genuine_anchor_clears_a_tombstone_only_after_its_state_write(
             await moving
 
         coordinator = aggregate._coordinator
+        assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
+        coordinator.unregister_leaf("sub-1")
+        coordinator.unregister_leaf("sub-2")
+        coordinator.record_position_invalidations("remote-entry", (1, 2))
+        coordinator.register_leaf("sub-1", leaf_one)
+        coordinator.register_leaf("sub-2", leaf_two)
         assert coordinator.has_position_invalidation("remote-entry", "sub-2")
         clear_calls = 0
         original_clear = coordinator.clear_position_invalidation
@@ -8314,13 +8600,13 @@ async def test_genuine_anchor_clears_a_tombstone_only_after_its_state_write(
         assert leaf_two.current_cover_position == 100
         assert leaf_two.position_confidence == "anchored"
         assert coordinator.has_position_invalidation("remote-entry", "sub-2")
-        assert leaf_two._restore_position_invalidated is True
+        assert leaf_two._restore_position_invalidation_generation is not None
         assert clear_calls == 0
 
         leaf_two.async_write_ha_state()
 
         assert not coordinator.has_position_invalidation("remote-entry", "sub-2")
-        assert leaf_two._restore_position_invalidated is False
+        assert leaf_two._restore_position_invalidation_generation is None
         assert clear_calls == 1
 
         leaf_two.async_write_ha_state()
@@ -8337,16 +8623,6 @@ async def test_anchor_pending_clear_cannot_retire_a_newer_tombstone(
     hass: HomeAssistant,
 ) -> None:
     """A pending clear owns only the marker generation that it consumed."""
-    restored = State(
-        "cover.channel_2",
-        "open",
-        {
-            ATTR_CURRENT_POSITION: 40,
-            "remote": f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-            "channels": [2],
-            "role": "leaf",
-        },
-    )
 
     async def publish(_topic: str, _payload: str) -> None:
         return
@@ -8354,6 +8630,7 @@ async def test_anchor_pending_clear_cannot_retire_a_newer_tombstone(
     hub = ZemismartHub(online_registry(), publish)
     coordinator, _, leaf_two_config, _ = aggregate_family(hass, hub)
     coordinator.record_position_invalidations("remote-entry", (2,))
+    restored = restored_leaf_state(leaf_two_config)
     entity = restored_cover_type(restored)(
         "sub-2",
         "remote-entry",
@@ -8367,18 +8644,19 @@ async def test_anchor_pending_clear_cannot_retire_a_newer_tombstone(
     await entity.async_internal_added_to_hass()
     await entity.async_added_to_hass()
     try:
-        assert entity._restore_position_invalidated is True
+        assert entity._restore_position_invalidation_generation is not None
         assert coordinator.has_position_invalidation("remote-entry", "sub-2")
 
         entity._position = 100.0
         entity._anchor_if_at_limit()
+        coordinator.unregister_leaf("sub-2")
         coordinator.record_position_invalidations("remote-entry", (2,))
 
         entity._platform_state = EntityPlatformState.ADDED
         entity._position = 90.0
         entity.async_write_ha_state()
 
-        assert entity._restore_position_invalidated is False
+        assert entity._restore_position_invalidation_generation is None
         assert coordinator.has_position_invalidation("remote-entry", "sub-2")
     finally:
         await entity.async_will_remove_from_hass()

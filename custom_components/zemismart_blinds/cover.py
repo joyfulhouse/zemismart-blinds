@@ -13,7 +13,6 @@ import logging
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
-from importlib import import_module
 from typing import TYPE_CHECKING, Any, Final
 from typing import cast as cast
 
@@ -234,6 +233,8 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Create one entity per stored cover row of this remote."""
+    from .cover_aggregate import ZemismartAggregateCover
+
     # reanchor is an EXPLICIT recovery action (operator or automation): it drives
     # a full travel to a hard endpoint through the normal command path so the
     # existing outcome-based anchor logic re-verifies against the motor's own
@@ -438,6 +439,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._motion_command_id: str | None = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
+        self._motion_recovered = False
         # position_confidence signals. `_position_anchored` is set only when a
         # travel actually COMPLETES against a hard limit; `_suspect` records an
         # untimed full travel cut short by an uncorroborated heard STOP and is
@@ -454,7 +456,6 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._degraded = False
         self._intent_generation = 0
         self._restore_epoch = 0
-        self._restore_position_invalidated = False
         self._restore_position_invalidation_generation: int | None = None
 
     async def async_set_member_position(self, target: int) -> None:
@@ -575,7 +576,6 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         generation = self._restore_position_invalidation_generation
         if (
             self._platform_state is EntityPlatformState.ADDED
-            and self._restore_position_invalidated
             and generation is not None
             and self._coordinator is not None
         ):
@@ -583,13 +583,12 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # only after async_added_to_hass returns. Reaching here without an
             # exception while ADDED proves the invalidated unknown state has
             # reached the state machine. A failed initial write leaves both the
-            # marker and this pending-clear flag intact for the replacement.
+            # marker and its pending generation intact for the replacement.
             self._coordinator.clear_position_invalidation(
                 self._remote_entry_id,
                 self._cover_id,
                 generation,
             )
-            self._restore_position_invalidated = False
             self._restore_position_invalidation_generation = None
 
     def _consume_position_invalidation(self) -> bool:
@@ -602,7 +601,6 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         )
         if generation is None:
             return False
-        self._restore_position_invalidated = True
         self._restore_position_invalidation_generation = generation
         return True
 
@@ -655,15 +653,18 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         # (a heard STOP froze it).
         self._suspect = state.attributes.get(_ATTR_POSITION_SUSPECT) is True
 
-    async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
-        """Restore a stopped estimate, or resume or clock-complete motion."""
+    async def _async_restorable_state(
+        self,
+        restore_guard: tuple[int, int],
+    ) -> State | None:
+        """Load state only while no newer intent or tombstone supersedes it."""
         if self._consume_position_invalidation():
             # A failed aggregate frame addressed this configured leaf while no
             # durable entity instance could carry the uncertainty forward.
             # Reject RestoreEntity before reading its cached pre-frame position.
             # Clearing is deferred until the unknown state is written.
             self._mark_unknown()
-            return
+            return None
         state = await self.async_get_last_state()
         if self._consume_position_invalidation():
             # An old coordinator can finish an already-published command after
@@ -671,10 +672,17 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # the hass.data partition keyed by remote entry, while their
             # per-entity restore epochs are necessarily independent.
             self._mark_unknown()
-            return
+            return None
         if state is None or restore_guard != (self._intent_generation, self._restore_epoch):
-            return
+            return None
         if not self._restored_state_describes_this_cover(state):
+            return None
+        return state
+
+    async def _async_restore_state(self, restore_guard: tuple[int, int]) -> None:
+        """Restore a stopped estimate, or resume or clock-complete motion."""
+        state = await self._async_restorable_state(restore_guard)
+        if state is None:
             return
         restored = _number(state.attributes.get(ATTR_CURRENT_POSITION))
         if restored is not None and 0 <= restored <= 100:
@@ -763,7 +771,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
             # downtime, so this branch cannot honestly retain assumed
             # confidence. Apply the doubt last so it explicitly outranks the
             # existing anchor and unverified-anchor bookkeeping above.
-            self._suspect = True
+            self._suspect = self._position is not None
             return
         # Prefer the persisted motion origin: interpolating from the original
         # start keeps the transient estimate accurate across the restart gap
@@ -800,6 +808,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._motion_command_id = command_id
         self._motion_timed = timed
         self._sync_position(monotonic_now)
+        self._motion_recovered = True
         self._create_motion_task("recovered travel")
 
     @callback
@@ -924,30 +933,29 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         the travel and the limit switch it ended against, not about evidence
         from the hardware.
         """
-        if self._position in (0.0, 100.0):
+        if self._position in (0.0, 100.0) and observed:
             self._clear_unverified_anchor()
-            if observed:
-                # A completed hard-limit travel is newer physical evidence than
-                # any unconsumed group-failure marker for this leaf. Own that
-                # marker generation until the anchored state write lands.
-                self._consume_position_invalidation()
-                # A completed travel to a hard limit is the ONLY thing that
-                # earns `anchored`, and it also settles any suspect doubt:
-                # whatever a heard STOP left ambiguous, the blind has now
-                # physically reached and rests against its limit switch.
-                #
-                # OBSERVED means RX was live for the whole travel, so a real
-                # STOP press would have been heard and turned into suspect or
-                # an interruption. A completion that happened during HA's own
-                # downtime carries no such witness -- any press in that gap,
-                # real or phantom, was invisible -- so it keeps the position
-                # but earns no anchored and settles no doubt. (Residual even
-                # when observed: a listener is deaf ~one slot after each
-                # capture, so a press CAN be missed. That risk is identical
-                # for commanded and heard travels, which is why both earn
-                # anchored rather than only our own.)
-                self._position_anchored = True
-                self._suspect = False
+            # A completed hard-limit travel is newer physical evidence than
+            # any unconsumed group-failure marker for this leaf. Own that
+            # marker generation until the anchored state write lands.
+            self._consume_position_invalidation()
+            # A completed travel to a hard limit is the ONLY thing that
+            # earns `anchored`, and it also settles any suspect doubt:
+            # whatever a heard STOP left ambiguous, the blind has now
+            # physically reached and rests against its limit switch.
+            #
+            # OBSERVED means RX was live for the whole travel, so a real
+            # STOP press would have been heard and turned into suspect or
+            # an interruption. A completion that happened during HA's own
+            # downtime carries no such witness -- any press in that gap,
+            # real or phantom, was invisible -- so it keeps the position
+            # but earns no anchored and settles no doubt. (Residual even
+            # when observed: a listener is deaf ~one slot after each
+            # capture, so a press CAN be missed. That risk is identical
+            # for commanded and heard travels, which is why both earn
+            # anchored rather than only our own.)
+            self._position_anchored = True
+            self._suspect = False
 
     def _bridge_seen_online(self, bridge_id: str) -> bool:
         """Return whether this bridge has explicitly announced itself online."""
@@ -1062,6 +1070,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._motion_command_id = None
         self._motion_timed = False
         self._motion_absolute_anchor = False
+        self._motion_recovered = False
 
     def _interrupt_motion(self, at_monotonic: float) -> None:
         """Freeze prior tracking only after the replacing command starts."""
@@ -1128,6 +1137,7 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         `_async_transmit` already applies to an ack timeout.
         """
         self._restore_epoch += 1
+        self._consume_position_invalidation()
         self._mark_unknown()
         self.async_write_ha_state()
 
@@ -1407,10 +1417,20 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self._position = self._motion_target
         # Ran its whole configured duration plus margin. If that landed on a
         # limit the estimate now has a genuine physical reference behind it.
-        self._anchor_if_at_limit()
+        self._anchor_if_at_limit(observed=not self._motion_recovered)
+        if self._motion_recovered:
+            # RX after restore proves only that no newer press arrived. It
+            # cannot witness the reload gap, so completing the recovered timer
+            # keeps the endpoint estimate but makes its confidence suspect.
+            self._suspect = True
         self._motion_token = None
         self._motion_task = None
         self._clear_motion()
+        # Clearing motion ends the absolute-travel exemption. A recovered
+        # completion earned no anchor, so deferred offline evidence must now
+        # revoke its questioned origin. An observed endpoint already cleared
+        # that bookkeeping in _anchor_if_at_limit(), making this a no-op.
+        self._reconcile_unverified_anchor()
         self.async_write_ha_state()
 
     async def _async_transmit(
@@ -1671,7 +1691,10 @@ class ZemismartCover(_ZemismartCoverEntity, RestoreEntity):
         self.async_write_ha_state()
 
 
-if not TYPE_CHECKING:
-    ZemismartAggregateCover = import_module(
-        f"{__package__}.cover_aggregate"
-    ).ZemismartAggregateCover
+def __getattr__(name: str) -> object:
+    """Resolve the aggregate class without creating an import-order cycle."""
+    if name == "ZemismartAggregateCover":
+        from .cover_aggregate import ZemismartAggregateCover
+
+        return ZemismartAggregateCover
+    raise AttributeError(name)
