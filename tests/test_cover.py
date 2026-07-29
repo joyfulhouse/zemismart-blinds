@@ -5584,11 +5584,19 @@ def test_legacy_cover_clock_patch_reaches_aggregate(
     aggregate._last_command_button = "UP"
     aggregate._last_command_at_monotonic = 100.0
     try:
-        unpatched = aggregate._takeover_state()
+        # Both readings run under an explicit patch: the first sits far past
+        # the command stamp (expired), the second right next to it (armed).
+        # An aggregate holding a by-value clock import would ignore the
+        # second patch and keep returning the real-clock answer, so the seam
+        # is still what decides the outcome — without assuming anything
+        # about the host's actual monotonic value (a freshly booted CI
+        # runner sits near zero, which broke the unpatched baseline).
+        monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", lambda: 1_000_000.0)
+        expired = aggregate._takeover_state()
         monkeypatch.setattr(cover_module, "MONOTONIC_CLOCK", lambda: 105.0)
         patched = aggregate._takeover_state()
 
-        assert unpatched.command_id is None
+        assert expired.command_id is None
         assert patched.command_id == "command-a"
         assert patched.disarm_deadline_monotonic == 115.0
     finally:
