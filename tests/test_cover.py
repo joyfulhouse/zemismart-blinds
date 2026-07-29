@@ -22,6 +22,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from custom_components.zemismart_blinds import cover as cover_module
 from custom_components.zemismart_blinds import models as models_module
 from custom_components.zemismart_blinds.codec import encode_b0, make_payload
+from custom_components.zemismart_blinds.const import POSITION_UPDATE_INTERVAL_SECONDS
 from custom_components.zemismart_blinds.coordinator import RemoteCoordinator
 from custom_components.zemismart_blinds.cover import ZemismartCover
 from custom_components.zemismart_blinds.models import (
@@ -6757,7 +6758,14 @@ async def test_intermediate_progress_writes_are_throttled(
     real_sleep = asyncio.sleep
 
     async def fake_sleep(seconds: float) -> None:
-        clocks.advance(seconds)
+        # Patching the GLOBAL asyncio.sleep means every sleeper in the
+        # process comes through here — HA internals included. Only the travel
+        # loop's own pacing sleeps (min(interval, remaining), always in
+        # (0, POSITION_UPDATE_INTERVAL_SECONDS]) may advance the shared fake
+        # clock; letting unrelated sleepers advance it made the throttle
+        # window count depend on runner scheduling and flake on slow CI.
+        if 0 < seconds <= POSITION_UPDATE_INTERVAL_SECONDS:
+            clocks.advance(seconds)
         await real_sleep(0)
 
     # cover.py calls asyncio.sleep through the module, so patching it here is
