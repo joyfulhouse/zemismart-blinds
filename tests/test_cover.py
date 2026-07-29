@@ -6813,6 +6813,11 @@ async def test_intermediate_progress_writes_are_throttled(
         task = entity._motion_task
         assert task is not None
         await task
+        # The write counter is a bus listener: state-changed events are
+        # dispatched via the event loop, not synchronously from
+        # async_write_ha_state, so on a slow runner the tail of the events
+        # is still queued when the task completes. Drain before counting.
+        await hass.async_block_till_done()
 
         # 10 s of travel at the 0.25 s integration interval.
         assert len(ticks) == 40
