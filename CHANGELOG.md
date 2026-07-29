@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-07-28
 
 ### Breaking
 
@@ -48,6 +48,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#33) Results were gathered and discarded, so anything other than the expected member errors
   produced no traceback and a *successful* service call while part of the group had not moved.
   Such errors now fail the service call with their original traceback intact.
+
+- **Live timing no longer runs on the wall clock.** (#29) Motion deadlines, ledger echo windows,
+  bridge-clock projection and takeover disarm deadlines all compared `time.time()` values, so a
+  single NTP correction or manual clock change could leave a cover "moving" for hours, falsely
+  anchor a fractionally-moved blind, or reclassify the integration's own echo as a physical
+  press. Every live decision now runs on `time.monotonic()`; wall time survives only in the
+  persisted attributes, projected once onto the monotonic axis at restore.
+
+- **A travel that "completed" only because wall time elapsed while Home Assistant was down now
+  restores as `suspect`.** (#45) Restore cannot distinguish a clock step from genuine downtime,
+  so the committed target position no longer carries `assumed` confidence; a genuine observed
+  anchor still clears the doubt. The same rule now applies to a travel *resumed* across a
+  restart: its unobserved gap means completion earns `suspect`, never `anchored`, and offline
+  evidence that arrived during the gap still revokes a questioned endpoint afterwards.
+
+- **A group frame that fails after publication now invalidates every configured leaf it
+  addressed — not just the entities that happened to be alive.** (#44) Disabled leaves, leaves
+  replaced mid-flight, and leaves that only load later are covered by per-cover markers that
+  survive entity replacement and reload, are consumed before a stale position can restore, and
+  are retired only once the corrective state write actually lands. One member's failed write no
+  longer shields its siblings.
+
+- **`cover.set_position` targeting the currently displayed position of a moving cover is now
+  STOP-only.** Travel elapsed during the STOP round-trip previously turned an apparent no-op
+  into a surprise corrective move in the opposite direction.
+
+- **A group no longer claims `suspect` while it has no position at all.** Confidence qualifies
+  an existing estimate; with an unknown member the group reports `unknown`, and a suspect
+  member's doubt resurfaces the moment a group position is derivable again. Each leaf still
+  reports its own confidence directly.
+
+- **Learn, bounds and hygiene hardening.** (#26 #27 #30 #34–#38 #40–#43) Untabled remotes
+  enrol from measured captures; truncated OEM trailers are learnable; RX validates the exact
+  command value; outstanding command work is capped and pruned; entity listeners no longer leak
+  on a failed restore; motion writes stop flooding the recorder; user-facing errors are
+  translated; diagnostics exposes triage counters with dump-local labels; state-change fan-out
+  is filtered per remote; config-entry migration rejects unknown versions; held RF captures
+  get a wired TTL flush.
+
+### Changed
+
+- **The four oversized modules were split along their existing seams.** (#39) `models.py` →
+  `config_models` / `bridge_registry` / `transport`; `state_sync.py` → `bridge_clock` /
+  `command_ledger` / `state_sync`; `cover.py` → `cover` / `cover_aggregate`; `config_flow.py` →
+  `config_flow` / `config_flow_schema` / `learn_session`. A pure move — every definition
+  byte-identical, legacy modules keep their full import surface — with one payoff worth naming:
+  importing the config models no longer drags in the MQTT transport stack.
 
 ## [0.6.0] - 2026-07-26
 

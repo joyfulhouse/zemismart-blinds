@@ -413,3 +413,28 @@ synthetic state-poking test.
 - #29 (wall clock -> monotonic), then #39 (module split), each serialized with its own review loop.
 - Release: CHANGELOG incl. the #31 breaking note, manifest bump, catalogue parity.
 - #44: aggregate failure invalidation keyed on live entities rather than configured topology.
+
+---
+
+# Finale — v0.7.0 (2026-07-28)
+
+All 20 open issues (#26–#45) closed. Fast-follows #29, #45, #44, #39 each ran its own
+Codex review loop to SHIP (4, 1, 4 and 3 rounds respectively), then a DRY pass and a
+four-model adversarial panel (Codex `gpt-5.6-sol`, Claude Fable, grok-4.5, Gemini 3.1 Pro)
+over the combined delta ran four rounds to a unanimous SHIP: 6 + 3 + 2 + 0 findings, the
+later rounds all cross-change compositions (recovered-travel confidence, tombstone/live
+entity synchronization, aggregate confidence-without-position).
+
+Panel scoring this cycle: Codex 3 real findings (1 declined as the adjudicated #44
+option-(a) residual), grok-4.5 4 real (1 initially declined, later accepted on new
+evidence), Claude Fable 1 real + the most rigorous verifications, Gemini 3.1 Pro 1 real
+(its FIRST in this project — corroborating Fable's independently, with a runtime trace).
+
+Adjudications recorded: full-HA-restart tombstone loss for absent leaves stays the
+documented #44 option-(a) residual; legacy-shim private constants are import-compatible
+but NOT live patch seams (canonical modules are, per shim docstrings); `_UINT32_*` are
+math constants, not tunables. Non-blocking leftovers: an unreachable ranking arm in the
+aggregate confidence property after the unknown early-return; empty per-entry topology
+records survive entry deletion (process-lifetime memory only).
+
+Released as v0.7.0 (manifest bump + CHANGELOG). main NOT pushed — awaiting maintainer.
