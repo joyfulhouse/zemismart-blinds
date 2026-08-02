@@ -249,6 +249,12 @@ important.
   (continuous idle-listen `/rx`, boot id, enriched `/status`, `/cmd disarm`), physical remote
   presses are mirrored into each cover. Without it the integration is transmit-only, and RF
   reception is limited to the Learn wizard.
+- **`/tx` commands carry the bridge's `boot` id.** Since 0.8.0 the integration stamps every `/tx`
+  publish with the `boot` value from the bridge's own retained `/info`, and refuses to publish to
+  a bridge it has no boot evidence for. Firmware ≤ 1.3.0 ignores the field; firmware v1.4.0 is the
+  first to enforce it, rejecting a mismatched or missing `boot` with `reason: boot_mismatch`. This
+  integration release is meant to deploy **before** a firmware upgrade to v1.4.0 — see the
+  [firmware README][bridge-repo] for the wire contract.
 - **Physical takeover of a restored or clamped timed move.** After a Home Assistant restart, or
   once a group member hits its own limit before the group's frame ends, HA may no longer model the
   bridge's still-armed stop. A remote press reversing such a move isn't guaranteed to disarm it.

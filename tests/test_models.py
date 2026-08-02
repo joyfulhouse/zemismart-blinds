@@ -573,6 +573,7 @@ def acking_hub(**hub_kwargs: Any) -> tuple[ZemismartHub, list[dict[str, Any]]]:
     need to observe the unacknowledged window build their own publisher.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     hub: ZemismartHub
@@ -868,7 +869,7 @@ def test_bridge_selection_never_returns_offline_bridge() -> None:
 def test_timed_position_command_contains_bridge_side_stop() -> None:
     """Partial TX carries correlation, target, trailer, and bridge-owned STOP data."""
     registry = BridgeRegistry()
-    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, Mapping[str, Any]]] = []
     clocks = SteppableClocks()
@@ -921,6 +922,7 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
                 "stop_raw": encode_b0(
                     make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "STOP", bases=TEST_BASES)
                 ),
+                "boot": 7,
             },
         )
     ]
@@ -929,7 +931,7 @@ def test_timed_position_command_contains_bridge_side_stop() -> None:
 def test_stop_command_has_no_delayed_stop() -> None:
     """Immediate STOP is standalone: no delayed STOP and no OEM TRAILER."""
     registry = BridgeRegistry()
-    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     registry.update_availability("bridge-a", "online")
     payloads: list[dict[str, Any]] = []
 
@@ -943,12 +945,13 @@ def test_stop_command_has_no_delayed_stop() -> None:
     hub = ZemismartHub(registry, publish, command_id_factory=lambda: "stop-1")
     asyncio.run(hub.async_transmit(blind_config(), "STOP"))
 
-    assert payloads[0].keys() == {"command_id", "target", "raw", "repeats"}
+    assert payloads[0].keys() == {"command_id", "target", "raw", "repeats", "boot"}
 
 
 def test_matching_rejection_is_raised() -> None:
     """A correlated firmware rejection is an explicit failed command."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     hub: ZemismartHub
 
@@ -970,9 +973,60 @@ def test_matching_rejection_is_raised() -> None:
     assert hub.air_shadow_stats()["pending_starts"] == 0
 
 
+@pytest.mark.asyncio
+async def test_boot_less_rejection_releases_its_air_reservation() -> None:
+    """A rejected boot-less publish must not leave a phantom air-calendar hold.
+
+    `_commit_and_enqueue` provisions the air calendar BEFORE
+    `_finalize_and_publish` gets to the boot check, so a leaked pending
+    entry for the rejected (bridge_id, command_id) would make
+    `AirCalendar.decide()` treat it as a live occupant blocking every OTHER
+    bridge's own command until it expires. `_async_execute`'s `finally`
+    already releases that identical key on every exception path -- this
+    test pins the observable invariant (no leaked entry, a healthy
+    differently-routed bridge publishes promptly) regardless of which layer
+    is responsible for it, so a future refactor that moved cleanup off that
+    shared `finally` would be caught here. Two bridges are required because
+    arbitration only engages at `MIN_BRIDGES_FOR_ARBITRATION` (2) online.
+    """
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})  # no boot
+    registry.update_availability("bridge-a", "online")
+    registry.update_info("bridge-b", {"area": "office", "boot": 7})
+    registry.update_availability("bridge-b", "online")
+    published: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+
+    with pytest.raises(CommandRejectedError, match="no boot evidence"):
+        await hub.async_transmit(action_only_config(), "DOWN")
+
+    # The rejected command's provisional air-calendar entry must be gone,
+    # not merely never-started: a leaked entry is invisible to every other
+    # assertion because it belongs to a DIFFERENT bridge than the one under
+    # test next.
+    assert hub.air_shadow_stats()["pending_starts"] == 0
+
+    # A healthy, differently-routed command must publish promptly. A leaked
+    # reservation would make this wait out the ack+started timeout instead
+    # of failing fast, so a tight timeout is itself part of the assertion.
+    result = await asyncio.wait_for(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(3,)), "UP"),
+        timeout=1.0,
+    )
+    assert isinstance(result, CommandAck)
+    assert published == ["rf433/bridge-b/tx"]
+
+
 def test_unmatched_and_malformed_statuses_cannot_acknowledge_a_command() -> None:
     """Wrong bridge/ID and malformed status JSON all end in an honest timeout."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     hub: ZemismartHub
 
@@ -1015,6 +1069,7 @@ def test_handle_status_drops_unhashable_status_value() -> None:
 def test_started_timeout_after_acceptance_is_reported_as_ambiguous() -> None:
     """Admission without first RF dispatch cannot start or preserve a position estimate."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     hub: ZemismartHub
 
@@ -1039,6 +1094,7 @@ def test_started_timeout_after_acceptance_is_reported_as_ambiguous() -> None:
 def test_started_status_feeds_bridge_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     """A correlated started status seeds clock conversion from its t/boot pair."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     observed: list[tuple[int, int, float]] = []
     hub: ZemismartHub
@@ -1080,6 +1136,7 @@ async def test_rf_start_records_commanded_start_for_press_staleness(
 ) -> None:
     """Every correlated start records its remote channels and projected time."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     recorded: list[tuple[str, frozenset[int], float]] = []
     hub: ZemismartHub
@@ -1130,6 +1187,7 @@ async def test_raw_command_stamps_start_only_for_movement_frames(
 ) -> None:
     """Only a movement raw frame may outrank an older physical press."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     events: list[HeardEvent] = []
     hub: ZemismartHub
@@ -1179,6 +1237,7 @@ async def test_raw_command_stamps_start_only_for_movement_frames(
 async def test_started_stamp_rejects_older_press_in_same_callback_batch() -> None:
     """A started callback stamps before a following older broker capture."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     events: list[HeardEvent] = []
     hub: ZemismartHub
@@ -1552,6 +1611,7 @@ def test_identical_identity_press_is_mirrored_accepted_residual_risk() -> None:
 async def test_pending_command_holds_peer_echo_until_started_confirmation() -> None:
     """A peer capture before STARTED is held, then classified as our echo."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -1619,6 +1679,7 @@ async def test_pending_command_holds_peer_echo_until_started_confirmation() -> N
 async def test_heard_stop_disarms_published_unstarted_command() -> None:
     """A physical STOP outranks an admitted command before its RF start."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, dict[str, Any]]] = []
     tx_enqueued = asyncio.Event()
@@ -1677,6 +1738,7 @@ async def test_heard_stop_disarms_published_unstarted_command() -> None:
 async def test_heard_press_disarms_confirmed_stop_command() -> None:
     """A physical press aborts remaining RF work after STOP was confirmed."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, dict[str, Any]]] = []
     disarm_enqueued = asyncio.Event()
@@ -1729,6 +1791,7 @@ async def test_heard_press_disarms_confirmed_stop_command() -> None:
 async def test_heard_press_does_not_disarm_displaced_confirmed_command() -> None:
     """Takeover leaves a displaced command's STOP drain entry untouched."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[tuple[str, dict[str, Any]]] = []
     hub: ZemismartHub
@@ -1777,6 +1840,7 @@ async def test_unconfirmed_command_retires_ledger_and_releases_peer_hold(
 ) -> None:
     """A command that never starts releases a held peer capture as a press."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -2033,6 +2097,7 @@ async def test_later_cover_owned_press_widens_live_ledger_disarm(
         _TAKEOVER_GENERIC_DEADLINE_SECONDS,
     )
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     remote_key = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
     state = TakeoverCoverState(None, None, None, None, False)
@@ -2196,6 +2261,7 @@ async def test_close_cancels_disarm_task_and_waiter_before_publish() -> None:
 def test_publish_failure_is_propagated() -> None:
     """Broker publish failure does not manufacture an acknowledgement."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
 
     async def publish(_topic: str, _payload: str) -> None:
@@ -2212,6 +2278,7 @@ def test_publish_failure_is_propagated() -> None:
 async def test_global_queue_serializes_different_targets_until_rf_start() -> None:
     """Admission alone cannot release the next command before actual RF dispatch."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     first_published = asyncio.Event()
@@ -2245,7 +2312,7 @@ async def test_global_queue_serializes_different_targets_until_rf_start() -> Non
 async def test_worker_resolves_bridge_when_queued_command_is_popped() -> None:
     """A queued command uses an online bridge selected immediately before publish."""
     registry = BridgeRegistry()
-    registry.update_info("old", {"area": "living_room"})
+    registry.update_info("old", {"area": "living_room", "boot": 7})
     registry.update_availability("old", "online")
     published: list[tuple[str, dict[str, Any]]] = []
     publish_events = [asyncio.Event(), asyncio.Event()]
@@ -2262,7 +2329,7 @@ async def test_worker_resolves_bridge_when_queued_command_is_popped() -> None:
     await asyncio.sleep(0)
 
     registry.update_availability("old", "offline")
-    registry.update_info("new", {"area": "living_room"})
+    registry.update_info("new", {"area": "living_room", "boot": 7})
     registry.update_availability("new", "online")
     first_body = published[0][1]
     accept_and_start(hub, "old", first_body)
@@ -2283,6 +2350,7 @@ async def test_stop_fast_lane_bypasses_unrelated_inflight_command() -> None:
     acknowledgement, and the queued overlapping movement resolves superseded.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(3)]
@@ -2328,6 +2396,7 @@ async def test_stop_fast_lane_bypasses_unrelated_inflight_command() -> None:
 async def test_stop_overlapping_inflight_command_stays_ordered() -> None:
     """A STOP for the in-flight command's own channels queues behind it."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(2)]
@@ -2516,6 +2585,7 @@ async def test_simultaneous_movements_on_different_remotes_publish_one_frame_eac
 async def test_stop_during_window_is_immediate_and_supersedes_queued_movement() -> None:
     """STOP interrupts the coalescing wait without publishing the superseded movement."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     stop_published = asyncio.Event()
@@ -2571,6 +2641,7 @@ async def test_zero_window_disables_coalescing() -> None:
 async def test_command_after_window_closes_starts_a_new_batch() -> None:
     """A sibling enqueued after the first deadline cannot join the prior union frame."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     first_published = asyncio.Event()
@@ -2601,6 +2672,7 @@ async def test_command_after_window_closes_starts_a_new_batch() -> None:
 async def test_explicit_group_movement_is_not_delayed_or_coalesced() -> None:
     """An explicit group remains its existing immediate single-frame command."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published = asyncio.Event()
     hub: ZemismartHub
@@ -2653,6 +2725,7 @@ async def test_displaced_status_resolves_pending_command_as_superseded() -> None
     full started timeout and wrongly invalidate the cover's position.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_event = asyncio.Event()
@@ -2680,6 +2753,7 @@ async def test_displaced_status_resolves_pending_command_as_superseded() -> None
 async def test_execute_drains_started_exception_after_prestart_disarm() -> None:
     """Admission displacement cannot orphan a later started exception."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     captured_pending: list[Any] = []
     hub: ZemismartHub
@@ -2787,6 +2861,7 @@ async def test_displaced_status_rewindows_confirmed_stop_echoes() -> None:
 async def test_disarm_ack_keeps_displaced_stop_drain_suppressed() -> None:
     """A disarm ack preserves echo suppression for a displaced flushed STOP."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
@@ -2858,6 +2933,7 @@ async def test_started_then_displaced_broker_batch_still_rewindows_stops() -> No
     not resurrect the original-deadline windows over the drain re-window.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
@@ -2926,6 +3002,7 @@ async def test_started_projection_clamped_to_delivery_is_rejected() -> None:
     must reject it and keep the recv - age baseline anchor.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     clocks = SteppableClocks()
     hub: ZemismartHub
@@ -3018,6 +3095,7 @@ async def test_second_overlapping_fast_lane_stop_queues_behind_first() -> None:
     bridge.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(2)]
@@ -3056,6 +3134,7 @@ async def test_overlapping_fast_stop_chains_behind_fast_stop_not_inflight() -> N
     channel 2 moving.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(3)]
@@ -3131,7 +3210,7 @@ async def test_followup_commands_stick_to_the_motion_bridge() -> None:
     reports offline.
     """
     registry = BridgeRegistry()
-    registry.update_info("bridge-b", {"area": "somewhere_else"})
+    registry.update_info("bridge-b", {"area": "somewhere_else", "boot": 7})
     registry.update_availability("bridge-b", "online")
     topics: list[str] = []
     hub: ZemismartHub
@@ -3142,7 +3221,7 @@ async def test_followup_commands_stick_to_the_motion_bridge() -> None:
 
     hub = ZemismartHub(registry, publish)
     await hub.async_transmit(blind_config(), "UP", stop_after_ms=5000)
-    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     registry.update_availability("bridge-a", "online")
     await hub.async_transmit(blind_config(), "STOP")
 
@@ -3162,6 +3241,7 @@ async def test_displaced_raw_command_raises_a_command_error() -> None:
     AssertionError.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published_event = asyncio.Event()
     ids = iter(("raw-1",))
@@ -3200,9 +3280,9 @@ async def test_affinity_is_partitioned_by_area() -> None:
     consecutive commands in different areas each use their own area's bridge.
     """
     registry = BridgeRegistry()
-    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     registry.update_availability("bridge-a", "online")
-    registry.update_info("bridge-b", {"area": "bedroom"})
+    registry.update_info("bridge-b", {"area": "bedroom", "boot": 7})
     registry.update_availability("bridge-b", "online")
     topics: list[str] = []
     monotonic = {"now": 100.0}
@@ -3230,6 +3310,7 @@ async def test_affinity_is_partitioned_by_area() -> None:
 async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
     """A started status carrying age_ms back-dates the model's start time."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     hub: ZemismartHub
@@ -3259,6 +3340,7 @@ async def test_replayed_started_age_anchors_the_original_rf_start() -> None:
 async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
     """A seeded bridge clock removes network delay from STARTED handoff time."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     clocks = SteppableClocks()
     hub: ZemismartHub
@@ -3307,6 +3389,7 @@ async def test_started_status_projects_bridge_handoff_before_delivery() -> None:
 async def test_started_status_without_seed_falls_back_to_delivery_age() -> None:
     """An unseeded bridge uses receive time minus the reported bridge age."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     hub: ZemismartHub
 
@@ -3349,6 +3432,7 @@ async def test_replayed_started_with_large_age_keeps_age_anchor() -> None:
     instead of anchoring the model at delivery time.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     clocks = SteppableClocks()
     hub: ZemismartHub
@@ -3403,6 +3487,7 @@ async def test_stop_queues_behind_an_overlapping_queued_raw_frame() -> None:
     bridge and re-drive the just-stopped motor.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(3)]
@@ -3476,6 +3561,7 @@ async def test_stop_publishes_while_overlapping_movement_awaits_ack() -> None:
     up to the 30-second started timeout while the blind keeps moving.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     publish_events = [asyncio.Event() for _ in range(2)]
@@ -3515,6 +3601,7 @@ async def test_movement_publishes_after_an_earlier_unpublished_fast_stop() -> No
     is never stranded behind an earlier command's broker ack.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     all_enqueued = asyncio.Event()
@@ -3561,6 +3648,7 @@ async def test_cancelled_chained_stop_is_never_transmitted() -> None:
     anyway and unexpectedly halt the second channel.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     release_first = asyncio.Event()
@@ -4028,6 +4116,7 @@ async def test_ledger_registers_the_final_under_lock_coalesced_frame(
 ) -> None:
     """A cancelled contributor cannot leave a stale union echo envelope."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
@@ -4106,6 +4195,7 @@ async def test_started_stamp_uses_final_under_lock_coalesced_channels(
 ) -> None:
     """A cancelled contributor cannot leave a stale commanded-start channel."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     events: list[HeardEvent] = []
@@ -4224,6 +4314,7 @@ async def test_closed_hub_rejects_new_commands() -> None:
 async def test_publish_transport_error_pops_pending() -> None:
     """An immediate publish failure never leaks its pending-status entry."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
 
     async def publish(_topic: str, _payload: str) -> None:
@@ -4292,6 +4383,7 @@ async def test_air_calendar_commit_exception_publishes_fail_open(
 async def test_close_cancels_background_publish_tasks() -> None:
     """close() cancels a still-pending background publish (no orphan)."""
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     release = asyncio.Event()
     enqueued = asyncio.Event()
@@ -4326,6 +4418,7 @@ async def test_close_cancels_callers_still_awaiting_their_commands() -> None:
     asserting, so it never observed who did the cancelling.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     release = asyncio.Event()
     enqueued = asyncio.Event()
@@ -4509,7 +4602,7 @@ async def test_drain_owner_supersedes_only_that_entrys_queued_commands() -> None
         await release.wait()
 
     hub = ZemismartHub(BridgeRegistry(), publisher)
-    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     hub.registry.update_availability("bridge-a", "online")
     config = BlindConfig(
         name="Blind",
@@ -4640,7 +4733,7 @@ async def test_drain_owner_covers_fast_lane_stops_behind_barriers() -> None:
         await release.wait()
 
     hub = ZemismartHub(BridgeRegistry(), publisher)
-    hub.registry.update_info("bridge-a", {"area": "living_room"})
+    hub.registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     hub.registry.update_availability("bridge-a", "online")
     config = BlindConfig(
         name="Blind",
@@ -4727,9 +4820,9 @@ def test_ledger_disarm_deadline_extends_to_window_end() -> None:
 
 
 def _online_registry(bridge_id: str = "bridge-a") -> BridgeRegistry:
-    """Return one same-area online bridge."""
+    """Return one same-area online bridge with contract-v3 boot evidence."""
     registry = BridgeRegistry()
-    registry.update_info(bridge_id, {"area": "living_room"})
+    registry.update_info(bridge_id, {"area": "living_room", "boot": 7})
     registry.update_availability(bridge_id, "online")
     return registry
 
@@ -4888,7 +4981,7 @@ def _two_area_registry() -> BridgeRegistry:
     """Return two online bridges in DIFFERENT areas so routing really differs."""
     registry = BridgeRegistry()
     for bridge_id, area in (("bridge-a", "living_room"), ("bridge-b", "office")):
-        registry.update_info(bridge_id, {"area": area})
+        registry.update_info(bridge_id, {"area": area, "boot": 7})
         registry.update_availability(bridge_id, "online")
     return registry
 
@@ -5266,7 +5359,7 @@ async def test_disarm_ack_removes_future_air_reservation_without_shortening_drai
 async def test_online_count_drop_wakes_air_waiter_and_publishes_off() -> None:
     """Dropping to one online bridge releases every hold without deleting state."""
     registry = _two_area_registry()
-    registry.update_info("bridge-c", {"area": "garage"})
+    registry.update_info("bridge-c", {"area": "garage", "boot": 7})
     registry.update_availability("bridge-c", "online")
     monotonic = {"now": 800.0}
     published: list[str] = []
@@ -5972,6 +6065,7 @@ async def test_untabled_remotes_command_is_registered_in_the_ledger() -> None:
     `test_untabled_timed_command_registers_its_armed_stop`.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -6096,6 +6190,7 @@ async def test_untabled_timed_command_registers_its_armed_stop() -> None:
     press, and a relearn finds nothing to disarm.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -6163,6 +6258,7 @@ async def test_untabled_own_emission_is_recognised_by_the_learn_guard() -> None:
     state the guard treats as proof of emission.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -6224,6 +6320,7 @@ async def test_untabled_command_records_its_commanded_start() -> None:
     green.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     enqueued = asyncio.Event()
 
@@ -6275,6 +6372,7 @@ async def test_raw_frame_for_a_loaded_untabled_remote_is_ledgered() -> None:
     sitting outside #26/#30 while every other surface was fixed.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     published: list[dict[str, Any]] = []
     enqueued = asyncio.Event()
@@ -6368,6 +6466,7 @@ async def test_raw_resolves_bases_registered_before_any_listener() -> None:
     the gap has no window at all.
     """
     registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"boot": 7})
     registry.update_availability("bridge-a", "online")
     enqueued = asyncio.Event()
     published: list[dict[str, Any]] = []

@@ -94,9 +94,9 @@ def cover_config(*, travel: float = 0.04) -> BlindConfig:
 
 
 def online_registry(bridge_id: str = "bridge-a") -> BridgeRegistry:
-    """Return one same-area online bridge."""
+    """Return one same-area online bridge with contract-v3 boot evidence."""
     registry = BridgeRegistry()
-    registry.update_info(bridge_id, {"area": "living_room"})
+    registry.update_info(bridge_id, {"area": "living_room", "boot": 7})
     registry.update_availability(bridge_id, "online")
     return registry
 
@@ -729,7 +729,7 @@ async def test_set_position_at_current_while_moving_sends_stop(
         await entity.async_set_cover_position(**{ATTR_POSITION: current})
 
         assert not entity.is_opening
-        assert bodies[-1].keys() == {"command_id", "target", "raw", "repeats"}
+        assert bodies[-1].keys() == {"command_id", "target", "raw", "repeats", "boot"}
         assert bodies[-1]["raw"] == encode_b0(
             make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "STOP", bases=TEST_ACTION_BASES)
         )
@@ -3949,7 +3949,7 @@ async def test_partial_move_keeps_the_unverified_anchor_revocable(
     try:
         assert restored.current_cover_position == 80
         # A second bridge comes online and serves a PARTIAL move.
-        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_info("bridge-b", {"area": "living_room", "boot": 7})
         empty_registry.update_availability("bridge-b", "online")
         restored_hub.notify_bridge_change()
         await restored.async_set_cover_position(**{ATTR_POSITION: 60})
@@ -4097,7 +4097,7 @@ async def test_full_travel_interrupted_before_completion_keeps_anchor_revocable(
         # The anchor bridge is bridge-a (served the original move). A
         # DIFFERENT bridge comes online to serve the OPEN, so bridge-a stays
         # undiscovered — its later offline report is what tests the fix.
-        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_info("bridge-b", {"area": "living_room", "boot": 7})
         empty_registry.update_availability("bridge-b", "online")
         restored_hub.notify_bridge_change()
         assert restored.current_cover_position == 80  # bridge-b online != anchor confirmed
@@ -4223,7 +4223,7 @@ async def test_offline_anchor_does_not_cancel_a_running_motion(
     )
     try:
         assert restored.current_cover_position == 80
-        empty_registry.update_info("bridge-b", {"area": "living_room"})
+        empty_registry.update_info("bridge-b", {"area": "living_room", "boot": 7})
         empty_registry.update_availability("bridge-b", "online")
         restored_hub.notify_bridge_change()
 
@@ -7276,6 +7276,59 @@ async def test_bridge_rejection_is_translated_at_both_boundaries(
         assert aggregate_failure.value.translation_key == "command_rejected"
     finally:
         await detach_family(leaf_one, leaf_two, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_published_tx_body_carries_bridge_boot(hass: HomeAssistant) -> None:
+    """Contract v3: every /tx body is stamped with the routed bridge's boot."""
+    published: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(payload)
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    entity = await attach_cover(hass, hub)
+    try:
+        await entity.async_open_cover()
+        assert published
+        body = json.loads(published[-1])
+        assert body["boot"] == 7
+    finally:
+        await entity.async_will_remove_from_hass()
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_without_boot_evidence_is_never_published_to(
+    hass: HomeAssistant,
+) -> None:
+    """An availability-only bridge (retained /info lost) must not receive /tx.
+
+    Wrapped in `HomeAssistantError` by `_async_transmit` the same way every
+    other `CommandRejectedError` is (see `test_bridge_rejection_is_translated_
+    at_both_boundaries` above) -- the non-negotiable assertions are that the
+    call raises and that nothing reaches the publisher.
+    """
+    published: list[str] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(payload)
+
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})  # no boot
+    registry.update_availability("bridge-a", "online")
+    hub = ZemismartHub(registry, publish)
+    entity = await attach_cover(hass, hub)
+    try:
+        with pytest.raises(HomeAssistantError) as failure:
+            await entity.async_open_cover()
+        assert failure.value.translation_key == "command_rejected"
+        assert published == []
+    finally:
+        await entity.async_will_remove_from_hass()
         hub.close()
 
 
