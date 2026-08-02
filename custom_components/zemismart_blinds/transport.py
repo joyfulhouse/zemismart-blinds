@@ -2287,6 +2287,15 @@ class ZemismartHub:
         pending = self._pending.get((bridge_id, command_id))
         if pending is not None:
             pending.channels = command.channels
+        boot = self._air_bridge_boot(bridge_id)
+        if boot is None:
+            # Contract v3: without a strict boot snapshot from retained /info
+            # the bridge cannot check session binding; a v1.4.0 bridge would
+            # reject the command as boot_mismatch anyway, and an older bridge
+            # this registry has no /info evidence for should not be driven.
+            msg = f"bridge {bridge_id} has no boot evidence; refusing contract v3 publish"
+            raise CommandRejectedError(msg)
+        body["boot"] = boot
         payload = json.dumps(body, separators=(",", ":"))
         self._register_command_ledger(command, bridge_id, command_id)
         await self._publisher(topic, payload)

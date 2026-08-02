@@ -2422,7 +2422,7 @@ async def test_learn_ignores_our_own_transmission_echo(
     )
 
     registry = BridgeRegistry()
-    registry.update_info("bridge-a", {"area": "living_room"})
+    registry.update_info("bridge-a", {"area": "living_room", "boot": 7})
     registry.update_availability("bridge-a", "online")
 
     async def publish(topic: str, payload: str) -> None:

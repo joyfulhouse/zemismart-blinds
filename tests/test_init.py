@@ -734,7 +734,11 @@ async def test_retained_discovery_order_and_status_ack_filtering(
     runtime: DomainRuntime = hass.data[DOMAIN]
 
     callbacks[MQTT_INFO_TOPIC](
-        message("rf433/bridge-a/info", '{"area":"living_room","default":true}', retain=True)
+        message(
+            "rf433/bridge-a/info",
+            '{"area":"living_room","default":true,"boot":7}',
+            retain=True,
+        )
     )
     callbacks[MQTT_AVAILABILITY_TOPIC](
         message("rf433/bridge-a/availability", "online", retain=True)
