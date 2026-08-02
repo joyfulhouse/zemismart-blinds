@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-02
+
+### Added
+
+- **`/tx` commands are stamped with the bridge's boot id.** (firmware
+  [#8](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/8)/[#9](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/9)/[#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))
+  The integration reads `boot` from each bridge's retained `/info` snapshot and includes it on
+  every `/tx` publish. A bridge it has no boot evidence for is refused — `CommandRejectedError`,
+  air reservation released — rather than sent a command the bridge cannot validate.
+
+  This is the controller half of firmware contract v3, which requires a bridge running
+  esphome-rf433-mqtt-bridge v1.4.0 to reject a retained or replayed `/tx` structurally instead of
+  merely by convention. **Deploy this integration release first: firmware ≤ 1.3.0 ignores the
+  stamped `boot` field, and firmware v1.4.0 is the first release that enforces it.**
+
 ## [0.7.0] - 2026-07-28
 
 ### Breaking
