@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`/tx` commands are stamped with the bridge's boot id.** (firmware
-  [#8](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/8)/[#9](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/9)/[#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))
+  [#10](https://github.com/joyfulhouse/esphome-rf433-mqtt-bridge/issues/10))
   The integration reads `boot` from each bridge's retained `/info` snapshot and includes it on
   every `/tx` publish. A bridge it has no boot evidence for is refused — `CommandRejectedError`,
   air reservation released — rather than sent a command the bridge cannot validate.
