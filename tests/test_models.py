@@ -973,6 +973,56 @@ def test_matching_rejection_is_raised() -> None:
     assert hub.air_shadow_stats()["pending_starts"] == 0
 
 
+@pytest.mark.asyncio
+async def test_boot_less_rejection_releases_its_air_reservation() -> None:
+    """A rejected boot-less publish must not leave a phantom air-calendar hold.
+
+    `_commit_and_enqueue` provisions the air calendar BEFORE
+    `_finalize_and_publish` gets to the boot check, so a leaked pending
+    entry for the rejected (bridge_id, command_id) would make
+    `AirCalendar.decide()` treat it as a live occupant blocking every OTHER
+    bridge's own command until it expires. `_async_execute`'s `finally`
+    already releases that identical key on every exception path -- this
+    test pins the observable invariant (no leaked entry, a healthy
+    differently-routed bridge publishes promptly) regardless of which layer
+    is responsible for it, so a future refactor that moved cleanup off that
+    shared `finally` would be caught here. Two bridges are required because
+    arbitration only engages at `MIN_BRIDGES_FOR_ARBITRATION` (2) online.
+    """
+    registry = BridgeRegistry()
+    registry.update_info("bridge-a", {"area": "living_room"})  # no boot
+    registry.update_availability("bridge-a", "online")
+    registry.update_info("bridge-b", {"area": "office", "boot": 7})
+    registry.update_availability("bridge-b", "online")
+    published: list[str] = []
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        published.append(topic)
+        accept_and_start(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(registry, publish)
+
+    with pytest.raises(CommandRejectedError, match="no boot evidence"):
+        await hub.async_transmit(action_only_config(), "DOWN")
+
+    # The rejected command's provisional air-calendar entry must be gone,
+    # not merely never-started: a leaked entry is invisible to every other
+    # assertion because it belongs to a DIFFERENT bridge than the one under
+    # test next.
+    assert hub.air_shadow_stats()["pending_starts"] == 0
+
+    # A healthy, differently-routed command must publish promptly. A leaked
+    # reservation would make this wait out the ack+started timeout instead
+    # of failing fast, so a tight timeout is itself part of the assertion.
+    result = await asyncio.wait_for(
+        hub.async_transmit(replace(action_only_config(area_id="office"), channels=(3,)), "UP"),
+        timeout=1.0,
+    )
+    assert isinstance(result, CommandAck)
+    assert published == ["rf433/bridge-b/tx"]
+
+
 def test_unmatched_and_malformed_statuses_cannot_acknowledge_a_command() -> None:
     """Wrong bridge/ID and malformed status JSON all end in an honest timeout."""
     registry = BridgeRegistry()
