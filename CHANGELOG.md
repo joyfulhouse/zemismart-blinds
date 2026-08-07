@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Travel times can be measured with the remote instead of typed.** Leaving a cover's travel
+  fields blank now starts a guided measurement: pick a bridge, run the shade once in each
+  direction with its physical remote, and press STOP on arrival. The pressed button is identified
+  exactly by comparing the frame's derived base against the entry's calibrated bases (not the
+  empirical opcode table #26 disproved), the interval is taken on the bridge's own millisecond
+  clock so broker jitter cancels, and the result is rounded up and shown for confirmation before
+  saving. Available from the initial wizard, *Add cover*, and *Edit cover*. Virtual remotes are
+  excluded — nothing physical transmits a synthesized identity — and keep the `travel_required`
+  error.
+
+### Changed
+
+- **Editing a cover now opens a small menu** (*Edit name, channels and travel times* /
+  *Measure travel times with the remote*) between the cover picker and the edit form.
+- **The edit form no longer silently restores stored travel values when a field is cleared.**
+  The form arrives pre-filled, so clearing a travel field is now a deliberate request to
+  re-measure rather than a no-op.
+
 ## [0.9.0] - 2026-08-06
 
 ### Fixed

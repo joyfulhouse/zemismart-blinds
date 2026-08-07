@@ -69,7 +69,35 @@ After the learn step, you add covers one at a time. Each needs:
 | **Channels** | `1` for a single blind, or `1,2,3` for a group |
 | **Travel time** | How many seconds it takes to go fully up, and fully down |
 
-Time your blind with a stopwatch — that's how position gets estimated.
+Time your blind with a stopwatch — that's how position gets estimated. Or don't: leave both
+travel fields **blank** and the wizard measures it for you.
+
+<details>
+<summary><b>Measuring travel times with the remote</b></summary>
+
+Leave the travel fields empty and the flow asks which bridge should listen, then you run the
+shade once in each direction with its physical remote:
+
+1. Press **UP or DOWN** (either order — the integration detects which from the RF frame itself).
+2. Watch the shade run to its limit.
+3. Press **STOP** the moment it stops moving.
+4. Repeat for the other direction when prompted.
+
+The interval between the direction press and the STOP is measured on the bridge's own clock and
+**rounded up** to whole seconds — pressing STOP after arrival already measures a little long, and
+a generous travel time simply stalls the motor at its own limit switch instead of leaving a close
+visibly short. A confirmation screen shows the raw measurements in editable fields before
+anything is saved.
+
+Also available when editing an existing cover: pick the cover under **Edit cover**, then choose
+*Measure travel times with the remote* — or just clear both travel fields on the edit form.
+While a re-measurement runs, the shade's reported position may look wrong; it resets when the
+new values save.
+
+Virtual remotes can't be measured this way — nothing physical transmits a synthesized identity —
+so their covers still require typed travel times.
+
+</details>
 
 <details>
 <summary><b>Changing things later</b></summary>
