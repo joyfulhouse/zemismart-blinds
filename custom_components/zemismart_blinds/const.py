@@ -40,6 +40,24 @@ DEFAULT_REPEATS: Final = 3
 DEFAULT_COALESCE_WINDOW_MS: Final = 150
 DEFAULT_SNIFF_WINDOW_SECONDS: Final = 30
 MAX_SNIFF_WINDOW_SECONDS: Final = 60
+
+# Travel-time capture. The arming deadline is how long we wait to hear any
+# direction press at all; the run deadline is how long a started run may take
+# to reach its STOP. Split because they are two different user situations --
+# nothing heard versus a run that never finished -- and each gets its own
+# failure copy. The run deadline also bounds the largest measurable value,
+# which must stay inside MAX_TRAVEL_SECONDS.
+TRAVEL_ARM_TIMEOUT_SECONDS: Final = 120.0
+TRAVEL_RUN_TIMEOUT_SECONDS: Final = 300.0
+# The firmware's start_sniff takes the LATER of its current and candidate
+# deadlines, so re-publishing extends the bounded window instead of restarting
+# it. That is the only way to measure a run longer than the command contract's
+# 60-second cap.
+TRAVEL_REARM_INTERVAL_SECONDS: Final = 15.0
+# One press puts 8 embedded OEM frames on air across ~609 ms and a bridge hears
+# an unreliable subset of them. Matches state_sync's physical-press debounce.
+TRAVEL_BURST_WINDOW_SECONDS: Final = 1.5
+MIN_MEASURED_SECONDS: Final = 1.0
 FULL_TRAVEL_MARGIN_SECONDS: Final = 1.0
 POSITION_UPDATE_INTERVAL_SECONDS: Final = 0.25
 
@@ -63,6 +81,8 @@ MQTT_CMD_ACTION_SNIFF: Final = "sniff"
 MQTT_CMD_FIELD_ACTION: Final = "action"
 MQTT_CMD_FIELD_SECONDS: Final = "seconds"
 MQTT_RX_FIELD_FRAME: Final = "frame"
+MQTT_RX_FIELD_T: Final = "t"
+MQTT_RX_FIELD_BOOT: Final = "boot"
 
 SERVICE_SEND_RAW: Final = "send_raw"
 SERVICE_NEW_VIRTUAL_REMOTE: Final = "new_virtual_remote"

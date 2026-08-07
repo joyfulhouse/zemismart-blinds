@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from homeassistant import config_entries
 
 __all__ = [
+    "MEASURE_REQUESTED",
     "_AUTOMATIC_BRIDGE",
     "_cover_display_values",
     "_cover_picker_schema",
@@ -50,6 +51,8 @@ __all__ = [
     "_int_value",
     "_learn_setup_schema",
     "_manual_schema",
+    "_measure_confirm_schema",
+    "_measure_setup_schema",
     "_reconfigure_edit_schema",
     "_remote_settings_schema",
     "_row_cover_id",
@@ -58,6 +61,10 @@ __all__ = [
 ]
 
 _COERCION_ERRORS: Final = (TypeError, ValueError)
+# Sentinel error key: blank travel on a measurable cover is a routing signal,
+# not a validation failure. Callers translate it to travel_required when no
+# calibrated physical identity exists to measure against.
+MEASURE_REQUESTED: Final = "measure_requested"
 _ADVANCED_SECTION = "advanced"
 _AUTOMATIC_BRIDGE = "automatic"
 _PENDING_COVER_ID = "pending"
@@ -279,7 +286,10 @@ def _validate_cover_input(
     raw_up = user_input.get(CONF_TRAVEL_UP)
     raw_down = user_input.get(CONF_TRAVEL_DOWN)
     if not born_aggregate and (raw_up is None or raw_down is None):
-        return None, {"base": "travel_required"}
+        # Blank travel is a request to measure, not a mistake. The caller
+        # routes to the capture flow; only a caller that cannot measure (no
+        # calibrated physical identity) renders this as travel_required.
+        return None, {"base": MEASURE_REQUESTED}
     try:
         cover = CoverConfig(
             name=str(user_input.get(CONF_NAME, "")),
@@ -293,15 +303,12 @@ def _validate_cover_input(
     return cover, {}
 
 
-def _learn_setup_schema(
+def _bridge_selector(
     registry: BridgeRegistry,
-    suggested: Mapping[str, object] | None,
-) -> vol.Schema:
-    """Build name/area/bridge fields from one discovery snapshot."""
-    values = suggested or {}
-    area_id = str(values.get(CONF_AREA_ID, ""))
+    requested_bridge: str,
+) -> tuple[str, selector.SelectSelector]:
+    """Build one online-bridge selector shared by every bridge-picking form."""
     online = [bridge for bridge in registry.bridges if bridge.online]
-    requested_bridge = str(values.get(CONF_BRIDGE, _AUTOMATIC_BRIDGE))
     bridge_ids = {bridge.bridge_id for bridge in online}
     if requested_bridge != _AUTOMATIC_BRIDGE and requested_bridge not in bridge_ids:
         requested_bridge = _AUTOMATIC_BRIDGE
@@ -311,6 +318,25 @@ def _learn_setup_schema(
         if bridge.area_id:
             label = f"{label} — {bridge.area_id}"
         options.append({"value": bridge.bridge_id, "label": label})
+    return requested_bridge, selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=options,
+            translation_key="bridge",
+        )
+    )
+
+
+def _learn_setup_schema(
+    registry: BridgeRegistry,
+    suggested: Mapping[str, object] | None,
+) -> vol.Schema:
+    """Build name/area/bridge fields from one discovery snapshot."""
+    values = suggested or {}
+    area_id = str(values.get(CONF_AREA_ID, ""))
+    requested_bridge, bridge_field = _bridge_selector(
+        registry,
+        str(values.get(CONF_BRIDGE, _AUTOMATIC_BRIDGE)),
+    )
     return vol.Schema(
         {
             vol.Required(
@@ -318,12 +344,43 @@ def _learn_setup_schema(
                 default=str(values.get(CONF_NAME, "")),
             ): selector.TextSelector(),
             vol.Required(CONF_AREA_ID, default=area_id): selector.AreaSelector(),
-            vol.Required(CONF_BRIDGE, default=requested_bridge): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=options,
-                    translation_key="bridge",
-                )
-            ),
+            vol.Required(CONF_BRIDGE, default=requested_bridge): bridge_field,
+        }
+    )
+
+
+def _measure_confirm_schema(measured: Mapping[str, int]) -> vol.Schema:
+    """Build the confirm form, pre-filled with the rounded measurements."""
+    travel_selector = selector.NumberSelector(
+        selector.NumberSelectorConfig(
+            min=0.1,
+            max=600,
+            step=0.1,
+            mode=selector.NumberSelectorMode.BOX,
+            unit_of_measurement="s",
+        )
+    )
+    return vol.Schema(
+        {
+            vol.Required(CONF_TRAVEL_UP, default=measured["UP"]): travel_selector,
+            vol.Required(CONF_TRAVEL_DOWN, default=measured["DOWN"]): travel_selector,
+        }
+    )
+
+
+def _measure_setup_schema(
+    registry: BridgeRegistry,
+    suggested: Mapping[str, object] | None,
+) -> vol.Schema:
+    """Build the bridge picker for one travel measurement."""
+    values = suggested or {}
+    requested_bridge, bridge_field = _bridge_selector(
+        registry,
+        str(values.get(CONF_BRIDGE, _AUTOMATIC_BRIDGE)),
+    )
+    return vol.Schema(
+        {
+            vol.Required(CONF_BRIDGE, default=requested_bridge): bridge_field,
         }
     )
 

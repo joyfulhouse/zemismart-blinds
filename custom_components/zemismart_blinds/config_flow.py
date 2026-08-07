@@ -12,10 +12,12 @@ import functools
 import json
 import logging
 import secrets
+import time
 from collections.abc import Iterable as Iterable
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass as dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import voluptuous as vol
@@ -33,6 +35,9 @@ from .codec import (
     derive_bases,
     derive_bases_from_base,
     infer_action_button,
+)
+from .config_flow_schema import (
+    MEASURE_REQUESTED as MEASURE_REQUESTED,
 )
 from .config_flow_schema import (
     _cover_display_values as _cover_display_values,
@@ -66,6 +71,12 @@ from .config_flow_schema import (
 )
 from .config_flow_schema import (
     _manual_schema as _manual_schema,
+)
+from .config_flow_schema import (
+    _measure_confirm_schema as _measure_confirm_schema,
+)
+from .config_flow_schema import (
+    _measure_setup_schema as _measure_setup_schema,
 )
 from .config_flow_schema import (
     _reconfigure_edit_schema as _reconfigure_edit_schema,
@@ -113,6 +124,9 @@ from .const import (
     MQTT_INFO_TOPIC,
     MQTT_ROOT,
     MQTT_RX_FIELD_FRAME,
+    TRAVEL_ARM_TIMEOUT_SECONDS,
+    TRAVEL_REARM_INTERVAL_SECONDS,
+    TRAVEL_RUN_TIMEOUT_SECONDS,
 )
 from .const import (
     DEFAULT_REPEATS as DEFAULT_REPEATS,
@@ -158,6 +172,7 @@ from .models import (
 from .models import (
     parse_channels as parse_channels,
 )
+from .travel_capture import DIRECTIONS, TravelMeasurement, TravelRun
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -424,6 +439,109 @@ def _handle_sniff_message(
         attempt.unrecognized = capture
 
 
+@dataclass(slots=True)
+class _PendingMeasure:
+    """Where a travel measurement came from and where its result must go."""
+
+    origin: Literal["wizard", "add", "edit"]
+    name: str
+    channels: tuple[int, ...]
+    cover_id: str | None = None
+    bridge: str | None = None
+    measured: dict[str, TravelMeasurement] = field(default_factory=dict)
+
+    @property
+    def wanted(self) -> frozenset[str]:
+        """Return the directions still to be measured."""
+        return frozenset(DIRECTIONS) - frozenset(self.measured)
+
+
+@callback
+def _handle_travel_message(
+    flow: ZemismartBlindsConfigFlow,
+    session_id: str,
+    expected_topic: str,
+    run: TravelRun,
+    armed: asyncio.Event,
+    future: asyncio.Future[TravelMeasurement],
+    message: ReceiveMessage,
+) -> None:
+    """Offer one received frame to the open travel run."""
+    if (
+        flow._sniff_session_id != session_id
+        or future.done()
+        or message.retain
+        or message.topic != expected_topic
+    ):
+        return
+    try:
+        text = _payload_text(message.payload)
+        decoded_payload: object = json.loads(text)
+    except _PAYLOAD_ERRORS:
+        return
+    if not isinstance(decoded_payload, Mapping):
+        return
+    frame = decoded_payload.get(MQTT_RX_FIELD_FRAME)
+    # Checked before the run sees it: an automation driving this very cover
+    # mid-measurement echoes back off the sniffing bridge looking exactly like
+    # a human's press.
+    if isinstance(frame, str) and _is_own_emission(flow.hass, frame):
+        return
+    measurement = run.offer_payload(decoded_payload, time.monotonic())
+    if run.started is not None:
+        armed.set()
+    if measurement is not None:
+        future.set_result(measurement)
+
+
+async def _async_hold_sniff_open(hass: HomeAssistant, command_topic: str) -> None:
+    """Keep one bridge's bounded sniff window open for a whole run.
+
+    The firmware's ``start_sniff`` takes the LATER of its current and candidate
+    deadlines rather than replacing it, so re-publishing extends the window.
+    That is the only way to measure a run longer than the command contract's
+    60-second cap.
+    """
+    from homeassistant.components import mqtt
+
+    while True:
+        await mqtt.async_publish(
+            hass,
+            command_topic,
+            json.dumps(
+                {
+                    MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
+                    MQTT_CMD_FIELD_SECONDS: DEFAULT_SNIFF_WINDOW_SECONDS,
+                },
+                separators=(",", ":"),
+            ),
+            qos=1,
+            retain=False,
+        )
+        await asyncio.sleep(TRAVEL_REARM_INTERVAL_SECONDS)
+
+
+async def _async_await_measurement(
+    armed: asyncio.Event,
+    future: asyncio.Future[TravelMeasurement],
+) -> TravelMeasurement | str:
+    """Wait out the arming deadline, then the run deadline.
+
+    Two deadlines because they are two different user situations: nothing was
+    heard at all, or a run started and never finished. Each gets its own copy.
+    """
+    try:
+        async with asyncio.timeout(TRAVEL_ARM_TIMEOUT_SECONDS):
+            await armed.wait()
+    except TimeoutError:
+        return "no_press"
+    try:
+        async with asyncio.timeout(TRAVEL_RUN_TIMEOUT_SECONDS):
+            return await future
+    except TimeoutError:
+        return "no_stop"
+
+
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
@@ -443,6 +561,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _remote: RemoteConfig | None = None
     _sniff_session_id: str | None = None
     _sniff_task: asyncio.Task[Literal["captured", "timeout"]] | None = None
+    _pending_measure: _PendingMeasure | None = None
+    _measure_task: asyncio.Task[TravelMeasurement | str] | None = None
+    _measure_outcome: str | None = None
+    _measure_error: str | None = None
+    _identity_is_virtual: bool = False
 
     async def async_step_reconfigure(
         self,
@@ -482,7 +605,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Append one validated cover row with a fresh identity."""
         entry = self._get_reconfigure_entry()
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         if user_input is not None:
             try:
                 rows = _entry_cover_rows(entry)
@@ -499,6 +622,16 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         }
                     )
                     return self._update_covers_and_abort(rows, "cover_added")
+                if errors.get("base") == MEASURE_REQUESTED:
+                    if self._measure_identity() is None:
+                        errors = {"base": "travel_required"}
+                    else:
+                        self._pending_measure = _PendingMeasure(
+                            origin="add",
+                            name=str(user_input.get(CONF_NAME, "")).strip(),
+                            channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                        )
+                        return await self.async_step_cover_measure_setup()
         return self.async_show_form(
             step_id="cover_add",
             data_schema=self.add_suggested_values_to_schema(
@@ -526,12 +659,50 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_COVER_ID] = "cover_not_found"
             else:
                 self._cover_id = cover_id
-                return await self.async_step_cover_edit()
+                return await self.async_step_cover_edit_menu()
         return self.async_show_form(
             step_id="cover_pick_edit",
             data_schema=_cover_picker_schema(rows),
             errors=errors,
         )
+
+    async def async_step_cover_edit_menu(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer editing this cover's fields or measuring its travel times."""
+        del user_input
+        if self._cover_id is None:
+            return await self.async_step_cover_pick_edit()
+        return self.async_show_menu(
+            step_id="cover_edit_menu",
+            menu_options=["cover_edit", "cover_measure_start"],
+        )
+
+    async def async_step_cover_measure_start(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Begin measuring the already-chosen cover."""
+        del user_input
+        cover_id = self._cover_id
+        if cover_id is None:
+            return await self.async_step_cover_pick_edit()
+        entry = self._get_reconfigure_entry()
+        try:
+            _index, stored = _find_cover_row(_entry_cover_rows(entry), cover_id)
+            cover = CoverConfig.from_stored(cover_id, stored)
+        except _COERCION_ERRORS:
+            return self.async_abort(reason="cover_not_found")
+        if self._measure_identity() is None:
+            return self.async_abort(reason="invalid_config")
+        self._pending_measure = _PendingMeasure(
+            origin="edit",
+            name=cover.name,
+            channels=cover.channels,
+            cover_id=cover_id,
+        )
+        return await self.async_step_cover_measure_setup()
 
     async def async_step_cover_edit(
         self,
@@ -546,18 +717,19 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             index, stored = _find_cover_row(rows, self._cover_id)
         except ValueError:
             return self.async_abort(reason="cover_not_found")
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         suggested: Mapping[str, object] = _cover_display_values(
             self._cover_id,
             stored,
             str(stored.get(CONF_NAME, "")),
         )
         if user_input is not None:
-            merged = dict(user_input)
-            for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
-                stored_value = stored.get(key)
-                if key not in merged and stored_value not in (None, ""):
-                    merged[key] = stored_value
+            # No travel backfill from the stored row here, deliberately: this
+            # form arrives pre-filled through _cover_display_values, so an
+            # empty travel field is a user's deliberate clear -- the signal
+            # that requests a measurement -- and restoring the stored value
+            # would make that signal unreachable on the one form where a user
+            # with a wrong travel time actually goes.
             try:
                 existing = _sibling_channel_sets(
                     entry,
@@ -566,7 +738,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ValueError:
                 errors = {"base": "invalid_config"}
             else:
-                cover, errors = _validate_cover_input(merged, existing)
+                cover, errors = _validate_cover_input(user_input, existing)
                 if cover is not None:
                     rows[index] = {
                         **stored,
@@ -574,6 +746,17 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_COVER_ID: self._cover_id,
                     }
                     return self._update_covers_and_abort(rows, "cover_updated")
+                if errors.get("base") == MEASURE_REQUESTED:
+                    if self._measure_identity() is None:
+                        errors = {"base": "travel_required"}
+                    else:
+                        self._pending_measure = _PendingMeasure(
+                            origin="edit",
+                            name=str(user_input.get(CONF_NAME, "")).strip(),
+                            channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                            cover_id=self._cover_id,
+                        )
+                        return await self.async_step_cover_measure_setup()
             suggested = user_input
         return self.async_show_form(
             step_id="cover_edit",
@@ -1095,7 +1278,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Collect one cover: name, channels, and leaf travel times."""
         if self._remote is None or self._covers is None:
             return await self.async_step_user()
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         if user_input is not None:
             cover, errors = _validate_cover_input(
                 user_input,
@@ -1104,6 +1287,16 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if cover is not None:
                 self._covers.append(cover)
                 return await self.async_step_cover_menu()
+            if errors.get("base") == MEASURE_REQUESTED:
+                if self._measure_identity() is None:
+                    errors = {"base": "travel_required"}
+                else:
+                    self._pending_measure = _PendingMeasure(
+                        origin="wizard",
+                        name=str(user_input.get(CONF_NAME, "")).strip(),
+                        channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                    )
+                    return await self.async_step_cover_measure_setup()
         suggested: dict[str, object] = {}
         if not self._covers and self._captures:
             reference = next(iter(self._captures.values()))
@@ -1173,7 +1366,280 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             remote_id=remote_id,
             bases=bases,
         )
+        # Nothing physical transmits a synthesized identity, so travel
+        # measurement can never hear this remote. Entries do not record
+        # provenance, so this in-memory flag is the only place we know.
+        self._identity_is_virtual = True
         return await self.async_step_remote_settings()
+
+    async def async_step_cover_measure_setup(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose the bridge that will listen for this cover's run."""
+        pending = self._pending_measure
+        if pending is None or self._measure_identity() is None:
+            return await self._async_measure_abandoned()
+        if self._learn_registry is None:
+            self._learn_registry = await self._async_discover_bridges()
+        if self._learn_registry is None:
+            # Flow-local MQTT discovery failed outright, so no bridge can
+            # listen. Retrying cannot help inside this step; the cover form
+            # still accepts typed times.
+            return await self._async_measure_abandoned(error="measure_no_bridge")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            bridge_id = str(user_input.get(CONF_BRIDGE, "")).strip()
+            try:
+                if bridge_id == _AUTOMATIC_BRIDGE:
+                    bridge_id = self._learn_registry.resolve(self._measure_area_id()).bridge_id
+                else:
+                    self._learn_registry.online_bridge(bridge_id)
+            except NoOnlineBridgeError:
+                errors[CONF_BRIDGE] = "bridge_unavailable"
+            else:
+                pending.bridge = bridge_id
+                return await self.async_step_cover_measure_run()
+
+        return self.async_show_form(
+            step_id="cover_measure_setup",
+            data_schema=_measure_setup_schema(self._learn_registry, user_input),
+            errors=errors,
+            description_placeholders={"name": pending.name},
+        )
+
+    async def async_step_cover_measure_run(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Start one measurement task, then report its transition."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None:
+            return await self._async_measure_abandoned()
+        if self._measure_task is not None and self._measure_task.done():
+            outcome = "failed" if self._measure_task.cancelled() else self._measure_task.result()
+            self._measure_task = None
+            if isinstance(outcome, TravelMeasurement):
+                pending.measured[outcome.direction] = outcome
+                return self.async_show_progress_done(next_step_id="cover_measure_next")
+            self._measure_outcome = outcome
+            return self.async_show_progress_done(next_step_id="cover_measure_timeout")
+
+        if self._measure_task is None:
+            session_id = secrets.token_hex(16)
+            self._sniff_session_id = session_id
+            self._measure_task = self.hass.async_create_task(
+                self._async_capture_travel(session_id, pending.wanted),
+                f"{DOMAIN} travel capture",
+            )
+
+        return self.async_show_progress(
+            step_id="cover_measure_run",
+            progress_action="measuring",
+            progress_task=self._measure_task,
+            description_placeholders={
+                "name": pending.name,
+                "bridge": pending.bridge or "",
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_next(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Report the direction just measured and ask for the other one."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None or not pending.measured:
+            return await self._async_measure_abandoned()
+        if not pending.wanted:
+            return await self.async_step_cover_measure_confirm()
+        last = next(reversed(list(pending.measured.values())))
+        return self.async_show_menu(
+            step_id="cover_measure_next",
+            menu_options=["cover_measure_run", "cover_measure_redo"],
+            description_placeholders={
+                "measured": last.direction,
+                "seconds": f"{last.measured_seconds:.2f}",
+                "stored": str(last.stored_seconds),
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_redo(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Discard the direction just measured and run it again."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None or not pending.measured:
+            return await self._async_measure_abandoned()
+        pending.measured.pop(next(reversed(list(pending.measured))), None)
+        self._measure_task = None
+        self._sniff_session_id = None
+        return await self.async_step_cover_measure_run()
+
+    async def async_step_cover_measure_timeout(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer another attempt or typing the times by hand."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None:
+            return await self._async_measure_abandoned()
+        self._measure_task = None
+        self._sniff_session_id = None
+        return self.async_show_menu(
+            step_id="cover_measure_timeout",
+            menu_options=["cover_measure_run", "cover_measure_manual"],
+            description_placeholders={
+                "reason": self._measure_outcome or "failed",
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Show what was measured, let it be corrected, then store it.
+
+        A form, not a menu: a config-flow form has one submit, so there is no
+        second "measure again" button here. Correcting a mistimed run is done
+        by typing the right value, and a full redo lives on cover_measure_next.
+        """
+        pending = self._pending_measure
+        if pending is None or pending.wanted:
+            return await self._async_measure_abandoned()
+        measured = {
+            direction: measurement.stored_seconds
+            for direction, measurement in pending.measured.items()
+        }
+        if user_input is not None:
+            return await self._async_store_measured_cover(pending, user_input)
+        return self.async_show_form(
+            step_id="cover_measure_confirm",
+            data_schema=_measure_confirm_schema(measured),
+            description_placeholders={
+                "name": pending.name,
+                "up": f"{pending.measured['UP'].measured_seconds:.2f}",
+                "down": f"{pending.measured['DOWN'].measured_seconds:.2f}",
+            },
+        )
+
+    async def async_step_cover_measure_manual(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Abandon measurement and return to the cover form."""
+        del user_input
+        return await self._async_measure_abandoned()
+
+    async def _async_store_measured_cover(
+        self,
+        pending: _PendingMeasure,
+        user_input: Mapping[str, Any],
+    ) -> ConfigFlowResult:
+        """Write the confirmed cover back where the measurement came from.
+
+        Dispatches on the recorded origin rather than on ``self.source``: the
+        wizard and the reconfigure add path both persist differently, and
+        inferring the destination would let a new entry point silently reuse
+        the wrong one.
+        """
+        fields = {
+            CONF_NAME: pending.name,
+            CONF_CHANNELS: ",".join(str(channel) for channel in pending.channels),
+            CONF_TRAVEL_UP: user_input.get(CONF_TRAVEL_UP),
+            CONF_TRAVEL_DOWN: user_input.get(CONF_TRAVEL_DOWN),
+        }
+        self._pending_measure = None
+        if pending.origin == "wizard":
+            covers = self._covers
+            if covers is None:
+                return await self.async_step_user()
+            cover, errors = _validate_cover_input(
+                fields, [existing.channels for existing in covers]
+            )
+            if cover is None:
+                self._measure_error = errors.get("base", "invalid_config")
+                return await self.async_step_cover()
+            covers.append(cover)
+            return await self.async_step_cover_menu()
+
+        entry = self._get_reconfigure_entry()
+        try:
+            rows = _entry_cover_rows(entry)
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        if pending.origin == "add":
+            try:
+                existing = _sibling_channel_sets(entry)
+            except ValueError:
+                return self.async_abort(reason="invalid_config")
+            cover, errors = _validate_cover_input(fields, existing)
+            if cover is None:
+                self._measure_error = errors.get("base", "invalid_config")
+                return await self.async_step_cover_add()
+            rows.append({CONF_COVER_ID: ulid_now(), **cover.as_dict()})
+            return self._update_covers_and_abort(rows, "cover_added")
+
+        cover_id = pending.cover_id
+        if cover_id is None:
+            return self.async_abort(reason="cover_not_found")
+        try:
+            index, stored = _find_cover_row(rows, cover_id)
+        except ValueError:
+            return self.async_abort(reason="cover_not_found")
+        try:
+            existing = _sibling_channel_sets(entry, exclude_cover_id=cover_id)
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        cover, errors = _validate_cover_input(fields, existing)
+        if cover is None:
+            self._measure_error = errors.get("base", "invalid_config")
+            self._cover_id = cover_id
+            return await self.async_step_cover_edit()
+        rows[index] = {**stored, **cover.as_dict(), CONF_COVER_ID: cover_id}
+        return self._update_covers_and_abort(rows, "cover_updated")
+
+    def _consume_measure_error(self) -> dict[str, str]:
+        """Surface an abandoned measurement's error on the cover form, once."""
+        error = self._measure_error
+        self._measure_error = None
+        return {"base": error} if error else {}
+
+    def _measure_area_id(self) -> str:
+        """Return the area whose bridge should listen for this measurement."""
+        if self._learn_area_id is not None:
+            return self._learn_area_id
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            return ""
+        try:
+            return RemoteConfig.from_entry(self._get_reconfigure_entry().data).area_id
+        except _COERCION_ERRORS:
+            return ""
+
+    async def _async_measure_abandoned(
+        self,
+        error: str | None = None,
+    ) -> ConfigFlowResult:
+        """Return to the cover form when measurement cannot continue."""
+        pending = self._pending_measure
+        self._pending_measure = None
+        self._measure_task = None
+        self._sniff_session_id = None
+        self._measure_error = error
+        if pending is None or pending.origin == "wizard":
+            return await self.async_step_cover()
+        if pending.origin == "add":
+            return await self.async_step_cover_add()
+        return await self.async_step_cover_edit()
 
     async def _async_discover_bridges(self) -> BridgeRegistry | None:
         """Collect retained discovery state without relying on a loaded hub."""
@@ -1313,6 +1779,116 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     retain=False,
                 ),
                 f"{DOMAIN} learn sniff stop",
+            )
+            stop_task.add_done_callback(
+                functools.partial(_release_capture_owner, owner_key, session_id)
+            )
+            try:
+                with suppress(Exception):
+                    await asyncio.shield(stop_task)
+            finally:
+                if stop_task.done():
+                    _release_capture_owner(owner_key, session_id, stop_task)
+
+    def _measure_identity(self) -> RemoteIdentity | None:
+        """Return the calibrated identity a travel capture must match.
+
+        None for a virtual remote: its bases are synthesized, so no physical
+        remote transmits that identity and no press could ever match. Detected
+        in memory rather than from stored data, because an entry does not
+        record whether its identity was learned or synthesized.
+        """
+        if self._identity_is_virtual:
+            return None
+        if self._identity is not None and self._identity.bases is not None:
+            return self._identity
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            return None
+        try:
+            remote = RemoteConfig.from_entry(self._get_reconfigure_entry().data)
+        except _COERCION_ERRORS:
+            return None
+        return remote.remote if remote.remote.bases is not None else None
+
+    async def _async_capture_travel(
+        self,
+        session_id: str,
+        wanted: frozenset[str],
+    ) -> TravelMeasurement | str:
+        """Measure one run, always releasing the bridge sniff session."""
+        from homeassistant.components import mqtt
+
+        pending = self._pending_measure
+        identity = self._measure_identity()
+        if pending is None or pending.bridge is None or identity is None:
+            return "failed"
+        bridge = pending.bridge
+        owner_key = (id(self.hass), bridge)
+        if owner_key in _CAPTURE_OWNERS:
+            if self._sniff_session_id == session_id:
+                self._sniff_session_id = None
+            return "failed"
+        _CAPTURE_OWNERS[owner_key] = session_id
+        rx_topic = f"{MQTT_ROOT}/{bridge}/rx"
+        command_topic = MQTT_CMD_TEMPLATE.format(bridge=bridge)
+        run = TravelRun(identity=identity, channels=pending.channels, wanted=wanted)
+        armed = asyncio.Event()
+        future: asyncio.Future[TravelMeasurement] = self.hass.loop.create_future()
+        unsubscribe: Unsubscriber | None = None
+        holder: asyncio.Task[None] | None = None
+        try:
+            async with asyncio.timeout(_MQTT_BOOTSTRAP_TIMEOUT_SECONDS):
+                if not await mqtt.async_wait_for_mqtt_client(self.hass):
+                    return "failed"
+                unsubscribe = await _async_subscribe_ready(
+                    self.hass,
+                    rx_topic,
+                    functools.partial(
+                        _handle_travel_message,
+                        self,
+                        session_id,
+                        rx_topic,
+                        run,
+                        armed,
+                        future,
+                    ),
+                )
+            holder = self.hass.async_create_task(
+                _async_hold_sniff_open(self.hass, command_topic),
+                f"{DOMAIN} travel sniff hold",
+            )
+            return await _async_await_measurement(armed, future)
+        except TimeoutError:
+            return "failed"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("Flow-local travel capture failed", exc_info=True)
+            return "failed"
+        finally:
+            if self._sniff_session_id == session_id:
+                self._sniff_session_id = None
+            if holder is not None:
+                holder.cancel()
+            if unsubscribe is not None:
+                unsubscribe()
+            if not future.done():
+                future.cancel()
+            stop_task = self.hass.async_create_task(
+                mqtt.async_publish(
+                    self.hass,
+                    command_topic,
+                    json.dumps(
+                        {
+                            MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
+                            MQTT_CMD_FIELD_SECONDS: 0,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    qos=1,
+                    retain=False,
+                ),
+                f"{DOMAIN} travel sniff stop",
             )
             stop_task.add_done_callback(
                 functools.partial(_release_capture_owner, owner_key, session_id)
