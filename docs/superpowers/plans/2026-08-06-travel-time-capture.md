@@ -20,6 +20,14 @@
 - Every new public function and dataclass needs a docstring. Comments explain constraints, not narration.
 - Pre-commit gate for every task: `uv run ruff check --fix && uv run ruff format && uv run mypy --strict . && uv run pytest`.
 - Working directory for all commands: the repo root of this worktree.
+- `tests/` is not a package (`pythonpath = ["."]` in `pyproject.toml`). Import fixtures absolutely: `from tests.synthetic import ...`, never `from .synthetic import ...`.
+- ruff targets `py314` with `line-length = 100` and selects `TC`, so type-only imports must live in a `TYPE_CHECKING` block even when they annotate dataclass fields.
+
+## Status
+
+Tasks 1-3 are **implemented and committed** (`53feb53`, `a3e208c`, `5b68b9d`), each with the
+full gate green: 27 tests in `tests/test_travel_capture.py`, 938 in the suite,
+ruff and `mypy --strict` clean. Tasks 4-8 remain.
 
 ## File Structure
 
@@ -728,11 +736,7 @@ class TravelRun:
         )
 ```
 
-`RemoteIdentity` must move out of the `TYPE_CHECKING` block into a runtime import, because it is now a dataclass field annotation evaluated by `@dataclass(slots=True)`:
-
-```python
-from .config_models import MAX_TRAVEL_SECONDS, RemoteIdentity
-```
+`RemoteIdentity` **stays** in the `TYPE_CHECKING` block. `from __future__ import annotations` makes every annotation a string, and `@dataclass` only inspects `__annotations__` keys, so a type-only import is correct even for a dataclass field — and ruff's `TC` rule, which this project selects, requires it there.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
