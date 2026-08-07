@@ -28,6 +28,9 @@ _ACTION_LOW_FROM_UP: Final[dict[str, int]] = {
     "DOWN": -0x38,
     "STOP": -0x18,
 }
+_ACTION_BY_COMMAND_HIGH: Final[dict[int, str]] = {
+    high: button for button, high in _ACTION_COMMAND_HIGH.items()
+}
 _CALIBRATION_CHANNELS: Final = (1, 2, 3, 4, 5, 6)
 
 DEFAULT_BUCKETS: Final = "1414026C01181414"
@@ -149,22 +152,35 @@ def group_offset(channels: Iterable[int]) -> int:
     return _signed8(2 + sum(1 << ((channel - 1) % 8) for channel in normalized))
 
 
+def _command_from_base(base: int, remote_id: int, chans: Iterable[int]) -> int:
+    """Apply the protocol command formula: fixed opcode byte, mod-256 low byte.
+
+    Live-validated 2026-08-06: the OEM never carries a low-byte overflow into
+    the opcode high byte. A remote whose ``base_low + remote_id`` straddles
+    0x100 across channel-group offsets transmits the SAME opcode byte on every
+    channel set (0xBC2A on channel 1, 0xBCEC on 1-6), where 16-bit arithmetic
+    produced 0xBD2A — a command the motor provably ignored while the wrapped
+    form moved it. The other 11 surveyed remotes never exposed the difference
+    because their carries are uniform across every channel set they use.
+    """
+    return (base & 0xFF00) | ((base + remote_id - group_offset(chans)) & 0xFF)
+
+
 def _recover_base(remote_id: int, chans: Iterable[int], cmd: int) -> int:
     """Recover a calibrated base using the inverse protocol command formula."""
-    return (cmd - remote_id + group_offset(chans)) & 0xFFFF
+    return (cmd & 0xFF00) | ((cmd - remote_id + group_offset(chans)) & 0xFF)
 
 
 def infer_action_button(chans: Iterable[int], cmd: int) -> str | None:
-    """Infer an action from a captured command after channel normalization."""
-    normalized = validate_channels(chans, allow_empty=False)
+    """Infer an action from a captured command's channel-invariant opcode byte.
+
+    ``chans`` is validated but cannot influence the answer: the opcode byte is
+    the same on every channel set. The parameter stays so every capture path
+    proves it decoded a coherent frame before asking what the frame means.
+    """
+    validate_channels(chans, allow_empty=False)
     _require_uint(cmd, 16, "command")
-    calibration_command = (
-        cmd + group_offset(normalized) - group_offset(_CALIBRATION_CHANNELS)
-    ) & 0xFFFF
-    for button, command_high in _ACTION_COMMAND_HIGH.items():
-        if calibration_command >> 8 == command_high:
-            return button
-    return None
+    return _ACTION_BY_COMMAND_HIGH.get(cmd >> 8)
 
 
 def button_for_command(
@@ -225,22 +241,21 @@ def derive_bases(
     ref_cmd: int,
     remote_id: int,
 ) -> CommandBases:
-    """Derive all action bases from one labeled UP, DOWN, or STOP reference."""
+    """Derive all action bases from one labeled UP, DOWN, or STOP reference.
+
+    Bases are channel-normalized, so the reference's own base carries all the
+    information a capture has; the other actions differ from it only by the
+    fixed opcode byte and the observed per-action low-byte offsets.
+    """
     normalized = validate_channels(ref_channels, allow_empty=False)
-    derive_base(normalized, button, ref_cmd, remote_id)
-    calibration_command = (
-        ref_cmd + group_offset(normalized) - group_offset(_CALIBRATION_CHANNELS)
-    ) & 0xFFFF
-    if calibration_command >> 8 != _ACTION_COMMAND_HIGH[button]:
-        msg = f"normalized reference command does not have the {button} opcode byte"
+    if button in _ACTION_COMMAND_HIGH and ref_cmd >> 8 != _ACTION_COMMAND_HIGH[button]:
+        msg = f"reference command does not have the {button} opcode byte"
         raise ValueError(msg)
-    up_low = ((calibration_command & 0xFF) - _ACTION_LOW_FROM_UP[button]) & 0xFF
+    reference_base = derive_base(normalized, button, ref_cmd, remote_id)
+    up_low = ((reference_base & 0xFF) - _ACTION_LOW_FROM_UP[button]) & 0xFF
 
     def button_base(action: str) -> int:
-        command = (_ACTION_COMMAND_HIGH[action] << 8) | (
-            (up_low + _ACTION_LOW_FROM_UP[action]) & 0xFF
-        )
-        return derive_base(_CALIBRATION_CHANNELS, action, command, remote_id)
+        return (_ACTION_COMMAND_HIGH[action] << 8) | ((up_low + _ACTION_LOW_FROM_UP[action]) & 0xFF)
 
     return CommandBases(
         up=button_base("UP"),
@@ -253,7 +268,7 @@ def derive_bases_from_base(button: str, base: int, remote_id: int) -> CommandBas
     """Complete all action bases from one labeled per-remote action base."""
     _require_uint(base, 16, "command base")
     reference_channels = (1,)
-    reference_command = (base + remote_id - group_offset(reference_channels)) & 0xFFFF
+    reference_command = _command_from_base(base, remote_id, reference_channels)
     return derive_bases(reference_channels, button, reference_command, remote_id)
 
 
@@ -288,7 +303,7 @@ def make_payload(
         raise ValueError(msg)
     base = bases.base(button)
 
-    command = (base + remote_id - group_offset(normalized)) & 0xFFFF
+    command = _command_from_base(base, remote_id, normalized)
     return (prefix << 40) | (remote_id << 32) | (channel_field(normalized) << 16) | command
 
 

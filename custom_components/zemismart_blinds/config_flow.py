@@ -316,8 +316,9 @@ def _capture_belongs_to_this_action(
 
     Compared on the DERIVED BASE rather than the raw command, deliberately.
     `derive_base` validates its button argument but does not use it -- the
-    recovery is `(cmd - remote_id + group_offset(chans))`, which is
-    action-independent -- so one physical frame yields one base whichever
+    recovery keeps the capture's opcode byte and inverts only the low byte,
+    `(cmd & 0xFF00) | ((cmd - remote_id + group_offset(chans)) & 0xFF)`, which
+    is action-independent -- so one physical frame yields one base whichever
     action is currently being solicited, and the comparison works across the
     action boundary. Because the base is also CHANNEL-normalised, it catches a
     lingering repeat of the same button on a different channel, which comparing
@@ -426,7 +427,7 @@ def _handle_sniff_message(
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
-    VERSION = 2
+    VERSION = 3
 
     _captures: dict[str, _LearnCapture] | None = None
     _cover_id: str | None = None

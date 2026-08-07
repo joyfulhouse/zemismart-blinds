@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-08-06
+
+### Fixed
+
+- **The command opcode byte no longer absorbs a low-byte carry; commands wrap modulo 256.**
+  Live captures from a carry-straddle remote (its DOWN base low byte plus remote id crosses
+  0x100 for small channel groups but not for the 1–6 group) proved the OEM keeps the opcode
+  high byte fixed per action: the remote transmitted `bc2a`/`bc27`/`bcec` for DOWN on channels
+  {1}/{3}/{1..6}, where the previous 16-bit arithmetic produced `bd2a`/`bd27` — commands the
+  motor provably ignored while the wrapped form physically moved it. Symptom fixed: UP and STOP
+  worked on every cover but DOWN only worked on the all-channel cover. The same fix makes the
+  Learn wizard classify such a remote's single-channel presses instead of failing the capture.
+  `PROTOCOL.md` now documents the corrected formula and the field evidence.
+
+- **Config entries migrate to version 3, renormalizing stored command bases.** Each base is
+  re-derived from the legacy formula's output at every configured cover's channel set: when the
+  candidates agree (every carry-uniform remote) the frames the entry was validated on stay
+  byte-identical, and when they disagree (a carry-straddle) the known per-action opcode byte
+  picks the physically real side. The migration never refuses an entry — values it cannot parse
+  pass through byte-identical for setup's own validation to surface, and an unresolvable
+  ambiguity is logged and resolved conservatively (an ambiguous OEM trailer is dropped; action
+  frames fall back to preserving the first cover's bytes). No user action needed; the migration
+  runs once at startup.
+
+### Changed
+
+- **Manual calibration references are validated against the fixed-opcode model.** A calibration
+  base or reference frame recorded from a pre-0.9.0 diagnostics dump may carry an opcode byte
+  the legacy formula invented (`bd`/`f5`/`dd`); Advanced setup now rejects those instead of
+  deriving sibling commands from them. Recapture the remote, or enter the migrated per-action
+  bases directly under Edit remote settings. For the same reason, sibling-base derivation from
+  one entered base is only possible for remotes using the common opcode layout — a remote
+  outside it (issue #26) needs each action entered or captured individually.
+
+  Known residual: a base that was never captured live (the wizard's "calculate the remaining
+  bases" fallback) was derived against the 1–6 calibration channel set, which the migration
+  cannot know; on a carry-straddle remote with no 1–6 cover such a derived base can migrate to
+  the wrong opcode byte. Derived bases were always flagged "test them afterwards" — recapture
+  fixes them. No known remote is affected.
+
+- **Learn wizard step titles no longer use placeholders** (`Capture the {action} button`,
+  `Captured {captured}`), which the frontend rendered without values in some contexts and
+  logged hundreds of `MISSING_VALUE` translation errors. Titles are static; the dynamic
+  action names stay in the step descriptions and menu labels.
+
 ## [0.8.0] - 2026-08-02
 
 ### Added

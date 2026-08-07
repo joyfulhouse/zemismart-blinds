@@ -25,10 +25,14 @@ from custom_components.zemismart_blinds import (
 from custom_components.zemismart_blinds.codec import CommandBases, derive_bases_from_base
 from custom_components.zemismart_blinds.const import (
     CONF_AIR_ARBITRATION_MODE,
+    CONF_BASE_DOWN,
+    CONF_BASE_STOP,
+    CONF_BASE_UP,
     CONF_CHANNELS,
     CONF_COVER_ID,
     CONF_COVERS,
     CONF_NAME,
+    CONF_REMOTE_ID,
     DOMAIN,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
@@ -925,7 +929,7 @@ async def test_migration_folds_subentries_into_data_preserving_identity(
     assert await async_migrate_entry(hass, entry)
     assert await async_setup_entry(hass, entry)
 
-    assert entry.version == 2
+    assert entry.version == 3
     assert entry.data[CONF_COVERS] == expected_covers
     assert not entry.subentries
     entity_registry = er.async_get(hass)
@@ -1047,7 +1051,7 @@ async def test_migration_resumes_after_partial_cleanup(hass: HomeAssistant) -> N
 
     assert await async_migrate_entry(hass, entry)
 
-    assert entry.version == 2
+    assert entry.version == 3
     assert entry.data[CONF_COVERS] == staged_covers
     assert not entry.subentries
     for entity in entities.values():
@@ -1072,7 +1076,7 @@ async def test_migration_passes_legacy_entries_through_untouched(
 
     assert await async_migrate_entry(hass, entry)
 
-    assert entry.version == 2
+    assert entry.version == 3
     assert entry.data is original_data
     assert CONF_COVERS not in entry.data
     with pytest.raises(ConfigEntryError, match="legacy_entry_format"):
@@ -1080,7 +1084,173 @@ async def test_migration_passes_legacy_entries_through_untouched(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [0, 3])
+@pytest.mark.parametrize("all_channel_cover_first", [True, False])
+async def test_v2_straddle_bases_renormalize_independent_of_cover_order(
+    hass: HomeAssistant,
+    all_channel_cover_first: bool,
+) -> None:
+    """A carry-straddle v2 entry migrates to the same bases whatever the order.
+
+    Shaped like the live remote that exposed the carry bug (2026-08-06): the
+    legacy 16-bit formula carried this DOWN base's low-byte overflow into the
+    opcode byte on small channel groups, so its single-channel cover never
+    moved while its all-channel cover worked. The candidate renormalizations
+    disagree across the two covers, and cover order carries no evidence of
+    which channel set the calibration was captured on — the action's tabled
+    opcode byte breaks the tie, so both orders converge on the bases that
+    reproduce the field-captured commands.
+    """
+    from custom_components.zemismart_blinds.codec import CommandBases, make_payload
+
+    covers = [
+        {
+            CONF_COVER_ID: "cover-all",
+            CONF_NAME: "All",
+            CONF_CHANNELS: [1, 2, 3, 4, 5, 6],
+        },
+        {CONF_COVER_ID: "cover-one", CONF_NAME: "One", CONF_CHANNELS: [1]},
+    ]
+    if not all_channel_cover_first:
+        covers.reverse()
+    entry = migration_config_entry(
+        f"migration-straddle-{all_channel_cover_first}",
+        subentries=[],
+        covers=covers,
+        version=2,
+    )
+    add_to_manager(hass, entry)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_REMOTE_ID: "fd",
+            CONF_BASE_UP: "f368",
+            CONF_BASE_DOWN: "bc30",
+            CONF_BASE_STOP: "db50",
+        },
+    )
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 3
+    assert entry.data[CONF_BASE_UP] == "f468"
+    assert entry.data[CONF_BASE_DOWN] == "bc30"
+    assert entry.data[CONF_BASE_STOP] == "dc50"
+    bases = CommandBases(up=0xF468, down=0xBC30, stop=0xDC50)
+    # The all-channel DOWN the entry was validated on stays byte-identical...
+    assert make_payload(0xA1B2C3, 0xFD, range(1, 7), "DOWN", bases=bases) & 0xFFFF == 0xBCEC
+    # ...and the single-channel DOWN now matches the field-captured command.
+    assert make_payload(0xA1B2C3, 0xFD, [1], "DOWN", bases=bases) & 0xFFFF == 0xBC2A
+
+
+@pytest.mark.asyncio
+async def test_v2_migration_drops_an_ambiguous_trailer_base(
+    hass: HomeAssistant,
+) -> None:
+    """A straddling OEM trailer has no tabled opcode to break the tie: dropped.
+
+    A wrong trailer is worse than none (action frames are live-proven to work
+    without one), and refusing the whole migration would strand the entry in
+    MIGRATION_ERROR where no flow can repair it.
+    """
+    entry = migration_config_entry(
+        "migration-trailer-straddle",
+        subentries=[],
+        covers=[
+            {
+                CONF_COVER_ID: "cover-all",
+                CONF_NAME: "All",
+                CONF_CHANNELS: [1, 2, 3, 4, 5, 6],
+            },
+            {CONF_COVER_ID: "cover-one", CONF_NAME: "One", CONF_CHANNELS: [1]},
+        ],
+        version=2,
+    )
+    add_to_manager(hass, entry)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_REMOTE_ID: "fd",
+            CONF_BASE_UP: "f368",
+            CONF_BASE_DOWN: "bc30",
+            CONF_BASE_STOP: "db50",
+            "base_trailer": "bb30",
+        },
+    )
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 3
+    assert entry.data["base_trailer"] == ""
+    assert entry.data[CONF_BASE_DOWN] == "bc30"
+
+
+@pytest.mark.asyncio
+async def test_v2_migration_leaves_unparseable_bases_for_setup_to_refuse(
+    hass: HomeAssistant,
+) -> None:
+    """A junk base migrates byte-identical; setup's parser owns the error.
+
+    Refusing here would strand the entry in MIGRATION_ERROR — unrecoverable
+    from the UI — while setup already refuses the same value with an
+    actionable config error the user can repair.
+    """
+    entry = migration_config_entry(
+        "migration-bad-base",
+        subentries=[],
+        covers=[{CONF_COVER_ID: "cover-one", CONF_NAME: "One", CONF_CHANNELS: [1]}],
+        version=2,
+    )
+    add_to_manager(hass, entry)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_BASE_DOWN: "not-hex"},
+    )
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 3
+    assert entry.data[CONF_BASE_DOWN] == "not-hex"
+    # The parseable siblings still renormalized (base_stop dc12 is
+    # carry-uniform for this remote id, so it is unchanged byte-identical).
+    assert entry.data["base_stop"] == "dc12"
+
+
+@pytest.mark.asyncio
+async def test_v2_migration_reads_int_typed_fields_like_setup_does(
+    hass: HomeAssistant,
+) -> None:
+    """Int-typed stored values parse via parse_hex, not a hex re-read of str().
+
+    parse_hex accepts an int as the already-parsed value (config-entry data
+    round-trips through JSON, which a hand-migrated install may have stored as
+    numbers), so remote_id 0x42 stored as the int 66 must not be re-read as
+    hex 0x66.
+    """
+    entry = migration_config_entry(
+        "migration-int-fields",
+        subentries=[],
+        covers=[{CONF_COVER_ID: "cover-one", CONF_NAME: "One", CONF_CHANNELS: [1]}],
+        version=2,
+    )
+    add_to_manager(hass, entry)
+    hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_REMOTE_ID: 0x42, CONF_BASE_DOWN: 0xBCF2},
+    )
+
+    assert await async_migrate_entry(hass, entry)
+
+    assert entry.version == 3
+    # Same result as the canonical string-typed template entry: remote 0x42,
+    # base low 0xF2 carries on channel 1, so the legacy ch-1 frames (0xBD31)
+    # are preserved byte-identical by the single-candidate path.
+    assert entry.data[CONF_BASE_DOWN] == "bdf2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [0, 4])
 async def test_migration_refuses_unknown_and_future_versions(
     hass: HomeAssistant,
     version: int,

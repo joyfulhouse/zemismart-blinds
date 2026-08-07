@@ -34,10 +34,10 @@
         }
       },
       "learn_sniff": {
-        "title": "Capture the {action} button"
+        "title": "Capture a remote button"
       },
       "learn_next": {
-        "title": "Captured {captured}",
+        "title": "Button captured",
         "description": "Measured so far: {measured}. Choose Capture {action}, then press {action} on the remote while the bridge listens. Every action is measured from its own press: the command bytes for Up, Down, and Stop are not related the same way on every remote, so calculating one from another can produce a command your motor ignores.",
         "menu_options": {
           "learn_sniff": "Capture {action}",
@@ -46,7 +46,7 @@
         }
       },
       "learn_timeout": {
-        "title": "No {action} press was detected",
+        "title": "No press was detected",
         "description": "Press {action} on the remote during the capture window. If this remote has no {action} button the wizard can hear, the remaining bases can be calculated from what was already measured — they may be wrong for your remote, so test them afterwards.",
         "menu_options": {
           "learn_retry": "Try again",

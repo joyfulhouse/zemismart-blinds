@@ -30,6 +30,11 @@ from custom_components.zemismart_blinds.codec import (
     validate_b0_frame,
 )
 from tests.synthetic import (
+    STRADDLE_BASES,
+    STRADDLE_DOWN_CAPTURES,
+    STRADDLE_REMOTE_ID,
+    STRADDLE_STOP_CAPTURES,
+    STRADDLE_UP_CAPTURES,
     SYNTHETIC_REMOTES,
     TEST_ALL_UP_B0,
     TEST_ALL_UP_PAYLOAD,
@@ -193,18 +198,21 @@ def test_all_channel_reference_derives_single_channel_command() -> None:
     (
         ((1, 2, 3, 4, 5, 6), 0xF42B, "UP"),
         ((1, 2), 0xF467, "UP"),
-        ((1, 2), 0xBD2F, "DOWN"),
+        ((1, 2), 0xBC2F, "DOWN"),
         ((1, 2), 0xDC4F, "STOP"),
-        ((1,), 0xF53C, "UP"),
+        ((1,), 0xF462, "UP"),
+        # A carried opcode byte is not a real command: the OEM never carries a
+        # low-byte overflow into the opcode (live-validated 2026-08-06).
+        ((1, 2), 0xBD2F, None),
         ((1, 2), 0xAA45, None),
     ),
 )
-def test_infer_action_button_normalizes_golden_commands(
+def test_infer_action_button_reads_the_opcode_byte(
     channels: tuple[int, ...],
     command: int,
     expected: str | None,
 ) -> None:
-    """Captured commands identify their action after channel normalization."""
+    """Captured commands identify their action by the channel-invariant opcode."""
     assert infer_action_button(channels, command) == expected
 
 
@@ -226,20 +234,20 @@ def test_every_direct_base_completes_the_same_action_calibration(
     _payload: int,
     button: str,
 ) -> None:
-    """Any one stored action base reconstructs all three bases despite 16-bit carries."""
+    """Any one stored action base reconstructs all three bases."""
     del name, prefix
     actual = derive_bases_from_base(button, expected.base(button), remote_id)
 
     assert actual == CommandBases(expected.up, expected.down, expected.stop)
 
 
-def test_arbitrary_channel_capture_normalizes_before_action_derivation() -> None:
-    """A captured action stays derivable when its command crossed an opcode byte."""
+def test_low_byte_overflow_capture_derives_the_same_calibration() -> None:
+    """A capture whose low byte overflowed still derives the same calibration."""
     _, prefix, remote_id, expected, _ = SYNTHETIC_REMOTES[3]
     command = make_payload(prefix, remote_id, [1], "UP", bases=expected) & 0xFFFF
 
-    # The channel-1 command carries into 0xF5xx while the UP opcode byte is 0xF4.
-    assert command == 0xF53C
+    # The channel-1 low-byte sum crosses 0x100 and wraps; the opcode stays 0xF4.
+    assert command == 0xF462
     assert derive_bases([1], "UP", command, remote_id) == CommandBases(
         expected.up,
         expected.down,
@@ -265,12 +273,12 @@ def test_synthesize_bases_rejects_invalid_low_byte(up_low: object) -> None:
 @pytest.mark.parametrize(
     ("channel", "expected_field", "expected_up", "expected_down"),
     (
-        (1, 0xFEFF, 0xF469, 0xBD31),
-        (2, 0xFDFF, 0xF468, 0xBD30),
-        (3, 0xFBFF, 0xF466, 0xBD2E),
-        (4, 0xF7FF, 0xF462, 0xBD2A),
-        (5, 0xEFFF, 0xF45A, 0xBD22),
-        (6, 0xDFFF, 0xF44A, 0xBD12),
+        (1, 0xFEFF, 0xF469, 0xBC31),
+        (2, 0xFDFF, 0xF468, 0xBC30),
+        (3, 0xFBFF, 0xF466, 0xBC2E),
+        (4, 0xF7FF, 0xF462, 0xBC2A),
+        (5, 0xEFFF, 0xF45A, 0xBC22),
+        (6, 0xDFFF, 0xF44A, 0xBC12),
     ),
 )
 def test_all_single_channels(
@@ -482,3 +490,59 @@ def test_decode_rejects_malformed_frames(frame: str) -> None:
     """Malformed bridge traffic produces a useful value error."""
     with pytest.raises(ValueError, match=r"B0|hex|frame|bucket|payload"):
         decode_b0(frame)
+
+
+# Live-validated 2026-08-06: a remote whose command low byte plus remote id
+# straddles 0x100 across channel-group offsets. The OEM keeps the opcode high
+# byte FIXED per action and wraps only the low byte mod 256; 16-bit arithmetic
+# that carries the low-byte overflow into the opcode byte reproduces the small
+# offsets wrongly (the motor provably ignored the carried 0xBDxx DOWN while
+# the wrapped 0xBCxx moved it). The captures live in tests/synthetic.py next
+# to the SYNTHETIC_REMOTES entry ("D") whose identity they belong to.
+
+
+def test_straddle_remote_base_is_channel_invariant() -> None:
+    """One physical button recovers ONE base from captures on any channel set."""
+    for button, captures in (
+        ("DOWN", STRADDLE_DOWN_CAPTURES),
+        ("STOP", STRADDLE_STOP_CAPTURES),
+    ):
+        bases = {
+            derive_base(channels, button, command, STRADDLE_REMOTE_ID)
+            for channels, command in captures.items()
+        }
+        assert len(bases) == 1, f"{button} base differs by capture channel set: {bases}"
+
+
+def test_straddle_remote_round_trips_every_field_capture() -> None:
+    """Bases measured from any one capture reproduce every live capture byte-exactly."""
+    bases = CommandBases(
+        up=derive_base((1,), "UP", STRADDLE_UP_CAPTURES[(1,)], STRADDLE_REMOTE_ID),
+        down=derive_base((1,), "DOWN", STRADDLE_DOWN_CAPTURES[(1,)], STRADDLE_REMOTE_ID),
+        stop=derive_base((1,), "STOP", STRADDLE_STOP_CAPTURES[(1,)], STRADDLE_REMOTE_ID),
+    )
+    # The capture-derived bases ARE synthetic remote D's stored calibration.
+    assert bases == STRADDLE_BASES
+    for button, captures in (
+        ("UP", STRADDLE_UP_CAPTURES),
+        ("DOWN", STRADDLE_DOWN_CAPTURES),
+        ("STOP", STRADDLE_STOP_CAPTURES),
+    ):
+        for channels, command in captures.items():
+            payload = make_payload(
+                SYNTHETIC_REMOTES[3][1],
+                STRADDLE_REMOTE_ID,
+                channels,
+                button,
+                bases=bases,
+            )
+            assert payload & 0xFFFF == command, (
+                f"{button} {channels}: {payload & 0xFFFF:04x} != live {command:04x}"
+            )
+
+
+def test_straddle_single_channel_press_classifies_as_its_action() -> None:
+    """A small-offset capture keeps its opcode byte and is inferred directly."""
+    assert infer_action_button((1,), STRADDLE_DOWN_CAPTURES[(1,)]) == "DOWN"
+    assert infer_action_button((1,), STRADDLE_STOP_CAPTURES[(1,)]) == "STOP"
+    assert infer_action_button((1,), STRADDLE_UP_CAPTURES[(1,)]) == "UP"
