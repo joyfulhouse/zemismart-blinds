@@ -16,6 +16,7 @@ from custom_components.zemismart_blinds.codec import (
 from custom_components.zemismart_blinds.config_models import MAX_TRAVEL_SECONDS, RemoteIdentity
 from custom_components.zemismart_blinds.travel_capture import (
     TimedPress,
+    TravelRun,
     identify_button,
     interval_seconds,
     stored_value,
@@ -190,3 +191,136 @@ def test_stored_value_rejects_an_impossibly_fast_run() -> None:
 def test_stored_value_rejects_beyond_the_storable_maximum() -> None:
     """A value CoverConfig would refuse must never reach it."""
     assert stored_value(float(MAX_TRAVEL_SECONDS) + 1.0) is None
+
+
+def run_for(wanted: tuple[str, ...] = ("UP", "DOWN")) -> TravelRun:
+    """Build one run against the calibrated test remote on channels 1 and 2."""
+    return TravelRun(
+        identity=RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES),
+        channels=(1, 2),
+        wanted=frozenset(wanted),
+    )
+
+
+def rx(button: str, millis: int) -> dict[str, object]:
+    """Build one RX payload the bridge would publish for a press."""
+    return {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), button, TEST_BASES),
+        "t": millis,
+        "boot": 7,
+    }
+
+
+def test_a_direction_then_stop_yields_a_measurement() -> None:
+    """The happy path: press DOWN, watch it arrive, press STOP."""
+    run = run_for()
+    assert run.offer_payload(rx("DOWN", 1_000), 100.0) is None
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31)
+    assert measurement is not None
+    assert measurement.direction == "DOWN"
+    assert measurement.measured_seconds == 14.31
+    assert measurement.stored_seconds == 15
+
+
+def test_burst_repeats_neither_restart_nor_close_the_run() -> None:
+    """One press is 8 frames across ~609 ms; the run starts once, at the first.
+
+    A bridge hears an unreliable subset of a burst, so a later copy must not
+    re-stamp the start -- that would silently shorten every measurement by
+    however much of the opening burst happened to be heard.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    for index in range(1, 8):
+        assert run.offer_payload(rx("DOWN", 1_000 + index * 76), 100.0 + index * 0.076) is None
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31)
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, "the FIRST frame must stamp the start"
+
+
+def test_a_later_press_restarts_the_run() -> None:
+    """A direction press outside the burst window is the user starting over."""
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    run.offer_payload(rx("DOWN", 5_000), 104.0)
+    measurement = run.offer_payload(rx("STOP", 19_000), 118.0)
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.0
+
+
+def test_a_reversal_restarts_on_the_new_direction() -> None:
+    """DOWN then UP with no STOP between is a user changing their mind."""
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    run.offer_payload(rx("UP", 4_000), 103.0)
+    measurement = run.offer_payload(rx("STOP", 20_000), 119.0)
+    assert measurement is not None
+    assert measurement.direction == "UP"
+    assert measurement.stored_seconds == 16
+
+
+def test_a_stop_with_no_open_run_is_ignored() -> None:
+    """A stray STOP is the tail of something else, not a zero-length run."""
+    run = run_for()
+    assert run.offer_payload(rx("STOP", 1_000), 100.0) is None
+
+
+def test_a_stop_burst_closes_the_run_only_once() -> None:
+    """The seven repeats behind the closing STOP resolve nothing further."""
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    assert run.offer_payload(rx("STOP", 15_310), 114.31) is not None
+    for index in range(1, 8):
+        assert run.offer_payload(rx("STOP", 15_310 + index * 76), 114.31 + index * 0.076) is None
+
+
+def test_the_second_run_ignores_the_direction_already_measured() -> None:
+    """Only the direction still wanted may open the second run.
+
+    The screen has explicitly asked for the other one, and silently overwriting
+    a good measurement would make the redo menu option meaningless.
+    """
+    run = run_for(wanted=("UP",))
+    assert run.offer_payload(rx("DOWN", 1_000), 100.0) is None
+    assert run.started is None
+    assert run.offer_payload(rx("STOP", 15_000), 114.0) is None
+    run.offer_payload(rx("UP", 20_000), 119.0)
+    measurement = run.offer_payload(rx("STOP", 36_000), 135.0)
+    assert measurement is not None
+    assert measurement.direction == "UP"
+
+
+def test_a_run_too_fast_to_be_real_yields_nothing() -> None:
+    """A double-tap does not become a half-second travel time."""
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    assert run.offer_payload(rx("STOP", 1_400), 100.4) is None
+
+
+def test_a_foreign_press_never_opens_a_run() -> None:
+    """Another remote's traffic on the same bridge is not this cover's run."""
+    run = run_for()
+    foreign = {
+        "frame": b1_frame(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1, 2), "DOWN", UNTABLED_BASES),
+        "t": 1_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(foreign, 100.0) is None
+    assert run.started is None
+
+
+def test_a_malformed_payload_is_ignored() -> None:
+    """Missing and mistyped fields never raise out of the handler."""
+    run = run_for()
+    assert run.offer_payload({}, 100.0) is None
+    assert run.offer_payload({"frame": 42}, 100.0) is None
+    assert run.offer_payload({"frame": "not-a-frame", "t": 1}, 100.0) is None
+
+
+def test_a_boolean_timestamp_is_not_a_bridge_clock() -> None:
+    """`True` is an int in Python; it is not a uint32 millisecond stamp."""
+    run = run_for()
+    run.offer_payload({**rx("DOWN", 1_000), "t": True}, 100.0)
+    measurement = run.offer_payload({**rx("STOP", 15_000), "t": True}, 114.5)
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.5, "must fall back to monotonic"

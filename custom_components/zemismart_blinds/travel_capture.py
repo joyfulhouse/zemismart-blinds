@@ -14,9 +14,17 @@ from typing import TYPE_CHECKING, Final
 
 from .codec import decode_rx_capture, derive_base
 from .config_models import MAX_TRAVEL_SECONDS
-from .const import MIN_MEASURED_SECONDS
+from .const import (
+    MIN_MEASURED_SECONDS,
+    MQTT_RX_FIELD_BOOT,
+    MQTT_RX_FIELD_FRAME,
+    MQTT_RX_FIELD_T,
+    TRAVEL_BURST_WINDOW_SECONDS,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .config_models import RemoteIdentity
 
 __all__ = [
@@ -24,6 +32,7 @@ __all__ = [
     "DIRECTIONS",
     "TimedPress",
     "TravelMeasurement",
+    "TravelRun",
     "identify_button",
     "interval_seconds",
     "stored_value",
@@ -138,3 +147,84 @@ def identify_button(
         if base == bases.base(button):
             return button
     return None
+
+
+def _uint32(value: object) -> int | None:
+    """Return a real uint32, rejecting booleans and coercions."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not 0 <= value < _UINT32_MODULUS:
+        return None
+    return value
+
+
+@dataclass(slots=True)
+class TravelRun:
+    """One cover's measurement session for one direction.
+
+    Edge-triggered: the first direction frame opens a run and the first STOP
+    after it closes one. A fresh run is constructed per direction, so ``wanted``
+    is set once at construction and never mutated.
+    """
+
+    identity: RemoteIdentity
+    channels: tuple[int, ...]
+    wanted: frozenset[str]
+    started: TimedPress | None = None
+
+    def offer_payload(
+        self,
+        payload: Mapping[str, object],
+        received_at_monotonic: float,
+    ) -> TravelMeasurement | None:
+        """Feed one RX payload in; return a measurement when a run closes."""
+        frame = payload.get(MQTT_RX_FIELD_FRAME)
+        if not isinstance(frame, str):
+            return None
+        button = identify_button(self.identity, self.channels, frame)
+        if button is None:
+            return None
+        press = TimedPress(
+            button=button,
+            boot=_uint32(payload.get(MQTT_RX_FIELD_BOOT)),
+            bridge_millis=_uint32(payload.get(MQTT_RX_FIELD_T)),
+            received_at_monotonic=received_at_monotonic,
+        )
+        if button in DIRECTIONS:
+            self._open(press)
+            return None
+        return self._close(press)
+
+    def _open(self, press: TimedPress) -> None:
+        """Start a run, ignoring the repeats of the burst that already did."""
+        if press.button not in self.wanted:
+            # The screen has asked for the other direction. Re-pressing the one
+            # already measured is not an overwrite -- redo is a menu option.
+            return
+        started = self.started
+        if (
+            started is not None
+            and started.button == press.button
+            and press.received_at_monotonic - started.received_at_monotonic
+            <= TRAVEL_BURST_WINDOW_SECONDS
+        ):
+            return
+        self.started = press
+
+    def _close(self, press: TimedPress) -> TravelMeasurement | None:
+        """Resolve a STOP against the open run, if there is one."""
+        started = self.started
+        if started is None:
+            return None
+        self.started = None
+        elapsed = interval_seconds(started, press)
+        if elapsed is None:
+            return None
+        stored = stored_value(elapsed)
+        if stored is None:
+            return None
+        return TravelMeasurement(
+            direction=started.button,
+            measured_seconds=elapsed,
+            stored_seconds=stored,
+        )
