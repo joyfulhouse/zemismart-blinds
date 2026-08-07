@@ -16,6 +16,3 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
-          # Brands submission (home-assistant/brands) is tracked separately;
-          # custom repositories are installable without it.
-          ignore: brands
