@@ -172,7 +172,7 @@ from .models import (
 from .models import (
     parse_channels as parse_channels,
 )
-from .travel_capture import DIRECTIONS, TravelMeasurement, TravelRun
+from .travel_capture import DIRECTIONS, HeardPress, TravelMeasurement, TravelRun
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -564,6 +564,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _sniff_task: asyncio.Task[Literal["captured", "timeout"]] | None = None
     _pending_measure: _PendingMeasure | None = None
     _measure_session: _MeasureSession | None = None
+    _measure_heard: tuple[HeardPress, ...] = ()
     _measure_task: asyncio.Task[TravelMeasurement | str] | None = None
     _measure_outcome: str | None = None
     _measure_error: str | None = None
@@ -862,12 +863,34 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         del user_input
         if self._identity is None:
             return await self.async_step_reconfigure_learn()
+        failure = await self._async_swap_entry_identity(
+            self._identity,
+            name=self._learn_name,
+            area_id=self._learn_area_id,
+        )
+        if failure is not None:
+            return self.async_abort(reason=failure)
+        return self.async_abort(reason="reconfigure_successful")
+
+    async def _async_swap_entry_identity(
+        self,
+        identity: RemoteIdentity,
+        *,
+        name: str | None = None,
+        area_id: str | None = None,
+    ) -> str | None:
+        """Replace the reconfigured entry's identity; None means it worked.
+
+        The one procedure allowed to change a remote's identity on an
+        EXISTING entry, shared by relearn and the measurement mismatch path
+        so neither can skip the drain/disarm/re-key discipline.
+        """
         entry = self._get_reconfigure_entry()
         current = RemoteConfig.from_entry(entry.data)
         updated = RemoteConfig(
-            name=self._learn_name if self._learn_name is not None else current.name,
-            remote=self._identity,
-            area_id=(self._learn_area_id if self._learn_area_id is not None else current.area_id),
+            name=name if name is not None else current.name,
+            remote=identity,
+            area_id=area_id if area_id is not None else current.area_id,
             repeats=current.repeats,
             coalesce_window_ms=current.coalesce_window_ms,
             cover_rows=current.cover_rows,
@@ -876,7 +899,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             other.entry_id != entry.entry_id and other.unique_id == updated.key
             for other in self.hass.config_entries.async_entries(DOMAIN)
         ):
-            return self.async_abort(reason="already_configured")
+            return "already_configured"
         runtime = getattr(entry, "runtime_data", None)
         if isinstance(runtime, RemoteRuntime):
             # Drain first: a queued-unpublished old-identity frame must not
@@ -886,13 +909,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # window closes).
             runtime.hub.drain_owner(entry.entry_id)
             await runtime.hub.async_disarm_remote(current.key)
-        # The remote device is keyed by the remote identity, and a relearn is
-        # the one flow that changes that identity on an EXISTING entry. Re-key
-        # in place before the entry update: otherwise the reload finds neither
-        # the new key nor the retired entry-id key, mints a fresh device, and
-        # the old one is pruned once its covers re-home -- churning the
-        # device_id every automation targets and silently dropping the user's
-        # area override with it.
+        # The remote device is keyed by the remote identity. Re-key in place
+        # before the entry update: otherwise the reload finds neither the new
+        # key nor the retired entry-id key, mints a fresh device, and the old
+        # one is pruned once its covers re-home -- churning the device_id
+        # every automation targets and silently dropping the user's area
+        # override with it.
         _rekey_remote_device(self.hass, current.key, updated.key)
         self.hass.config_entries.async_update_entry(
             entry,
@@ -900,7 +922,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             unique_id=updated.key,
             data=updated.as_dict(),
         )
-        return self.async_abort(reason="reconfigure_successful")
+        return None
 
     async def async_step_reconfigure_edit(
         self,
@@ -1433,11 +1455,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if outcome == "armed":
                 return self.async_show_progress_done(next_step_id="cover_measure_stop")
             self._measure_outcome = str(outcome)
+            if outcome == "no_press" and self._measure_heard:
+                return self.async_show_progress_done(next_step_id="cover_measure_mismatch")
             return self.async_show_progress_done(next_step_id="cover_measure_timeout")
 
         if self._measure_task is None:
             session_id = secrets.token_hex(16)
             self._sniff_session_id = session_id
+            self._measure_heard = ()
             self._measure_task = self.hass.async_create_task(
                 self._async_measure_arm(session_id),
                 f"{DOMAIN} travel arm",
@@ -1561,6 +1586,103 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "wanted": " or ".join(sorted(pending.wanted)),
             },
         )
+
+    async def async_step_cover_measure_mismatch(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Nothing matched, but a real press was heard -- say which, offer to adopt.
+
+        The two actionable rejections are a different remote identity and this
+        remote on a different channel set. The first offers a one-click
+        identity update (when the heard opcodes are inferable); the second
+        names both channel sets so the user can move the selector.
+        """
+        del user_input
+        pending = self._pending_measure
+        heard = self._measure_heard
+        identity = self._measure_identity()
+        if pending is None or not heard or identity is None:
+            return await self.async_step_cover_measure_timeout()
+        self._measure_task = None
+        self._sniff_session_id = None
+        first = heard[0]
+        heard_channels = ",".join(str(channel) for channel in first.channels)
+        stored_channels = ",".join(str(channel) for channel in pending.channels)
+        same_identity = (first.prefix, first.remote_id) == (identity.prefix, identity.remote_id)
+        menu_options = ["cover_measure_run", "cover_measure_manual"]
+        if same_identity:
+            detail = (
+                f"This device's own remote was heard, but on channels {heard_channels} -- "
+                f"the cover being measured stores channels {stored_channels}. Move the "
+                "remote's channel selector to match, or edit the cover's channels first."
+            )
+        else:
+            detail = (
+                f"A press from remote {first.prefix:06x}:{first.remote_id:02x} on channels "
+                f"{heard_channels} was heard, but this device stores remote "
+                f"{identity.prefix:06x}:{identity.remote_id:02x}. If the heard remote is the "
+                "one that actually drives this shade, the device's stored remote can be "
+                "updated to it."
+            )
+            if any(
+                press.button is not None
+                for press in heard
+                if (press.prefix, press.remote_id) == (first.prefix, first.remote_id)
+            ):
+                menu_options.insert(0, "cover_measure_use_heard")
+        return self.async_show_menu(
+            step_id="cover_measure_mismatch",
+            menu_options=menu_options,
+            description_placeholders={"detail": detail},
+        )
+
+    async def async_step_cover_measure_use_heard(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Adopt the heard remote as this device's identity, then re-measure.
+
+        Calibration is seeded from the presses actually heard during the
+        arming window (the user was pressing UP/DOWN/STOP at the shade), with
+        ``_remote_identity_from_captures`` deriving only the untouched
+        buttons -- the same measured-first discipline the Learn wizard uses.
+        """
+        del user_input
+        pending = self._pending_measure
+        heard = self._measure_heard
+        if pending is None or not heard:
+            return await self.async_step_cover_measure_timeout()
+        key = (heard[0].prefix, heard[0].remote_id)
+        captures: dict[str, _LearnCapture] = {}
+        for press in heard:
+            if (press.prefix, press.remote_id) != key or press.button is None:
+                continue
+            if press.button in captures:
+                continue
+            captures[press.button] = _LearnCapture(
+                frame=press.frame,
+                prefix=press.prefix,
+                remote_id=press.remote_id,
+                channels=press.channels,
+                command=press.command,
+                button=press.button,
+                inferred_button=press.button,
+                base=derive_base(press.channels, press.button, press.command, press.remote_id),
+            )
+        try:
+            identity, _derived = _remote_identity_from_captures(captures)
+        except ValueError:
+            return await self.async_step_cover_measure_timeout()
+        self._measure_heard = ()
+        if self.source == config_entries.SOURCE_RECONFIGURE:
+            failure = await self._async_swap_entry_identity(identity)
+            if failure is not None:
+                return self.async_abort(reason=failure)
+        else:
+            self._identity = identity
+            self._identity_is_virtual = False
+        return await self.async_step_cover_measure_run()
 
     async def async_step_cover_measure_confirm(
         self,
@@ -1695,6 +1817,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._measure_task.cancel()
         self._measure_task = None
         self._sniff_session_id = None
+        self._measure_heard = ()
         session = self._measure_session
         self._measure_session = None
         if session is not None:
@@ -1942,6 +2065,9 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 async with asyncio.timeout(TRAVEL_ARM_TIMEOUT_SECONDS):
                     await session.armed.wait()
             except TimeoutError:
+                # What WAS heard survives the session so the timeout screen
+                # can name the remote actually in the user's hand.
+                self._measure_heard = tuple(session.run.heard)
                 return "no_press"
             armed = True
             return "armed"

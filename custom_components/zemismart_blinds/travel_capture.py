@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
-from .codec import decode_rx_capture, derive_base
+from .codec import decode_rx_capture, derive_base, infer_action_button
 from .config_models import MAX_TRAVEL_SECONDS
 from .const import (
     MIN_MEASURED_SECONDS,
@@ -26,18 +26,23 @@ from .const import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from .codec import DecodedFrame
     from .config_models import RemoteIdentity
 
 __all__ = [
     "BUTTONS",
     "DIRECTIONS",
+    "HeardPress",
     "TimedPress",
     "TravelMeasurement",
     "TravelRun",
+    "classify_frame",
     "identify_button",
     "interval_seconds",
     "stored_value",
 ]
+
+_HEARD_CAP: Final = 8
 
 DIRECTIONS: Final = ("UP", "DOWN")
 BUTTONS: Final = ("UP", "DOWN", "STOP")
@@ -48,6 +53,24 @@ _DECODE_ERRORS: Final = (KeyError, TypeError, ValueError)
 _UINT32_MODULUS: Final = 1 << 32
 _UINT32_HALF_RANGE: Final = _UINT32_MODULUS // 2
 _MILLISECONDS_PER_SECOND: Final = 1_000.0
+
+
+@dataclass(frozen=True, slots=True)
+class HeardPress:
+    """A decodable press the matcher rejected, kept so timeouts can explain.
+
+    ``button`` is ``infer_action_button``'s guess -- an empirical-table
+    inference, not a calibrated match -- and is ``None`` for untabled
+    opcodes. It exists so a mismatch heard during measurement can seed a
+    replacement calibration the same way the Learn wizard would.
+    """
+
+    frame: str
+    prefix: int
+    remote_id: int
+    channels: tuple[int, ...]
+    command: int
+    button: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +138,21 @@ def identify_button(
     channels: tuple[int, ...],
     frame: str,
 ) -> str | None:
-    """Return which calibrated button a captured frame is, or None.
+    """Return which calibrated button a captured frame is, or None."""
+    return classify_frame(identity, channels, frame)[0]
+
+
+def classify_frame(
+    identity: RemoteIdentity,
+    channels: tuple[int, ...],
+    frame: str,
+) -> tuple[str | None, HeardPress | None]:
+    """Match one frame against the calibration, or explain the rejection.
+
+    Returns ``(button, None)`` on a match; ``(None, HeardPress)`` when the
+    frame is a real press that fails the identity or channel gate -- the two
+    rejections a user can act on; ``(None, None)`` for everything else
+    (undecodable input and this remote's own non-action trailer burst).
 
     Exact, not inferred. ``derive_base`` validates its ``button`` argument and
     then never uses it -- the recovery keeps the capture's opcode byte and
@@ -133,11 +170,12 @@ def identify_button(
     """
     bases = identity.bases
     if bases is None:
-        return None
+        return None, None
     try:
         decoded = decode_rx_capture(frame)
     except _DECODE_ERRORS:
-        return None
+        return None, None
+    observed_channels = tuple(decoded["chans"])
     if (decoded["prefix"], decoded["remote_id"]) != (identity.prefix, identity.remote_id):
         _LOGGER.debug(
             "travel: ignoring a press from %06x:%02x while measuring %06x:%02x",
@@ -146,28 +184,44 @@ def identify_button(
             identity.prefix,
             identity.remote_id,
         )
-        return None
-    if tuple(decoded["chans"]) != channels:
+        return None, _heard(frame, decoded, observed_channels)
+    if observed_channels != channels:
         _LOGGER.debug(
             "travel: ignoring this remote's press on channels %s -- the cover being "
             "measured stores %s, and the remote's channel selector must match it exactly",
             decoded["chans"],
             list(channels),
         )
-        return None
+        return None, _heard(frame, decoded, observed_channels)
     try:
-        base = derive_base(decoded["chans"], "UP", decoded["cmd"], decoded["remote_id"])
+        base = derive_base(observed_channels, "UP", decoded["cmd"], decoded["remote_id"])
     except _DECODE_ERRORS:
-        return None
+        return None, None
     for button in BUTTONS:
         if base == bases.base(button):
-            return button
+            return button, None
     _LOGGER.debug(
         "travel: base 0x%04x matches none of this remote's calibrated actions "
         "(likely the OEM trailer burst)",
         base,
     )
-    return None
+    return None, None
+
+
+def _heard(
+    frame: str,
+    decoded: DecodedFrame,
+    channels: tuple[int, ...],
+) -> HeardPress:
+    """Record one rejected-but-real press for the timeout screen."""
+    return HeardPress(
+        frame=frame,
+        prefix=decoded["prefix"],
+        remote_id=decoded["remote_id"],
+        channels=channels,
+        command=decoded["cmd"],
+        button=infer_action_button(channels, decoded["cmd"]),
+    )
 
 
 def _uint32(value: object) -> int | None:
@@ -192,6 +246,7 @@ class TravelRun:
     channels: tuple[int, ...]
     wanted: frozenset[str]
     started: TimedPress | None = None
+    heard: list[HeardPress] = field(default_factory=list)
 
     def offer_payload(
         self,
@@ -202,7 +257,12 @@ class TravelRun:
         frame = payload.get(MQTT_RX_FIELD_FRAME)
         if not isinstance(frame, str):
             return None
-        button = identify_button(self.identity, self.channels, frame)
+        button, mismatch = classify_frame(self.identity, self.channels, frame)
+        if mismatch is not None and len(self.heard) < _HEARD_CAP and mismatch not in self.heard:
+            # A repeat burst is 8 copies of one press; keeping distinct
+            # presses only is what lets the timeout screen name the remote
+            # actually in the user's hand instead of a wall of duplicates.
+            self.heard.append(mismatch)
         if button is None:
             return None
         press = TimedPress(

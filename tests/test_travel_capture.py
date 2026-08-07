@@ -324,3 +324,53 @@ def test_a_boolean_timestamp_is_not_a_bridge_clock() -> None:
     measurement = run.offer_payload({**rx("STOP", 15_000), "t": True}, 114.5)
     assert measurement is not None
     assert measurement.measured_seconds == 14.5, "must fall back to monotonic"
+
+
+def test_a_foreign_press_is_recorded_for_the_timeout_screen() -> None:
+    """A rejected real press is kept -- deduplicated -- so a timeout can name it.
+
+    The burst repeats of one press must collapse to one record, or the
+    timeout screen would show a wall of duplicates instead of the remote
+    actually in the user's hand.
+    """
+    run = run_for()
+    foreign = {
+        "frame": b1_frame(UNTABLED_PREFIX, UNTABLED_REMOTE_ID, (1, 2), "DOWN", UNTABLED_BASES),
+        "t": 1_000,
+        "boot": 7,
+    }
+    for _ in range(8):
+        assert run.offer_payload(foreign, 100.0) is None
+    assert len(run.heard) == 1
+    press = run.heard[0]
+    assert (press.prefix, press.remote_id) == (UNTABLED_PREFIX, UNTABLED_REMOTE_ID)
+    assert press.channels == (1, 2)
+    assert press.button is None, "the untabled remote's opcode must not be inferred"
+
+
+def test_own_remote_on_other_channels_is_recorded() -> None:
+    """The same remote heard on another channel set is the actionable near-miss."""
+    run = run_for()
+    other = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", TEST_BASES),
+        "t": 1_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(other, 100.0) is None
+    assert len(run.heard) == 1
+    press = run.heard[0]
+    assert (press.prefix, press.remote_id) == (TEST_PREFIX, TEST_REMOTE_ID)
+    assert press.channels == (3,)
+    assert press.button == "UP", "a tabled opcode seeds the identity-update offer"
+
+
+def test_the_own_trailer_burst_is_not_recorded() -> None:
+    """The non-action trailer frame is noise, not a press worth reporting."""
+    run = run_for()
+    trailer = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "TRAILER", TEST_BASES),
+        "t": 1_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(trailer, 100.0) is None
+    assert run.heard == []

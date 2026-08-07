@@ -46,8 +46,11 @@ MAX_SNIFF_WINDOW_SECONDS: Final = 60
 # to reach its STOP. Split because they are two different user situations --
 # nothing heard versus a run that never finished -- and each gets its own
 # failure copy. The run deadline also bounds the largest measurable value,
-# which must stay inside MAX_TRAVEL_SECONDS.
-TRAVEL_ARM_TIMEOUT_SECONDS: Final = 120.0
+# which must stay inside MAX_TRAVEL_SECONDS. The arming deadline is short:
+# the user is standing at the shade pressing buttons, so if nothing matched
+# within half a minute nothing will, and the timeout screen (which can name
+# what WAS heard) is more useful than more spinning.
+TRAVEL_ARM_TIMEOUT_SECONDS: Final = 30.0
 TRAVEL_RUN_TIMEOUT_SECONDS: Final = 300.0
 # The firmware's start_sniff takes the LATER of its current and candidate
 # deadlines, so re-publishing extends the bounded window instead of restarting
