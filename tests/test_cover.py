@@ -5269,6 +5269,251 @@ async def attach_weighted_family(
     return wide, solo, aggregate
 
 
+async def attach_kitchen_family(
+    hass: HomeAssistant,
+    hub: ZemismartHub,
+    *,
+    travel: float = 1.0,
+) -> tuple[ZemismartCover, ZemismartCover, ZemismartCover, cover_module.ZemismartAggregateCover]:
+    """Attach the reported kitchen topology: leaves {1,2,3},{4},{5} under {1..6}.
+
+    Channel 6 is on the physical remote's group button and has no cover
+    configured for it anywhere -- the shape that made the whole group report
+    `unknown` forever before this was narrowed.
+    """
+    from custom_components.zemismart_blinds.models import CoverConfig
+    from custom_components.zemismart_blinds.models import Role as _Role
+
+    covers = {
+        "sub-slider": CoverConfig(
+            name="Slider",
+            channels=(1, 2, 3),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-slider",
+        ),
+        "sub-counter": CoverConfig(
+            name="Counter",
+            channels=(4,),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-counter",
+        ),
+        "sub-sink": CoverConfig(
+            name="Sink",
+            channels=(5,),
+            travel_up=travel,
+            travel_down=travel,
+            cover_id="sub-sink",
+        ),
+        "sub-agg": CoverConfig(name="Kitchen", channels=(1, 2, 3, 4, 5, 6), cover_id="sub-agg"),
+    }
+    remote = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_ACTION_BASES)
+    coordinator = RemoteCoordinator(hass, covers, "remote-entry", remote.key)
+
+    def leaf_config(name: str, channels: tuple[int, ...]) -> BlindConfig:
+        return BlindConfig(
+            name=name,
+            remote=remote,
+            channels=channels,
+            travel_up=travel,
+            travel_down=travel,
+            area_id="kitchen",
+            repeats=2,
+        )
+
+    slider = ZemismartCover(
+        "sub-slider", "remote-entry", leaf_config("Slider", (1, 2, 3)), hub, coordinator
+    )
+    counter = ZemismartCover(
+        "sub-counter", "remote-entry", leaf_config("Counter", (4,)), hub, coordinator
+    )
+    sink = ZemismartCover("sub-sink", "remote-entry", leaf_config("Sink", (5,)), hub, coordinator)
+    aggregate = cover_module.ZemismartAggregateCover(
+        "sub-agg",
+        "remote-entry",
+        BlindConfig(
+            name="Kitchen",
+            remote=remote,
+            channels=(1, 2, 3, 4, 5, 6),
+            travel_up=None,
+            travel_down=None,
+            area_id="kitchen",
+            repeats=2,
+            role=_Role.AGGREGATE,
+        ),
+        hub,
+        coordinator,
+    )
+    for entity, entity_id in (
+        (slider, "cover.slider"),
+        (counter, "cover.counter"),
+        (sink, "cover.sink"),
+        (aggregate, "cover.kitchen"),
+    ):
+        await attach_family_entity(hass, entity, entity_id)
+    return slider, counter, sink, aggregate
+
+
+@pytest.mark.asyncio
+async def test_aggregate_derives_state_from_its_modelled_channels_only(
+    hass: HomeAssistant,
+) -> None:
+    """A channel no cover models is disregarded, not a reason to say nothing.
+
+    The kitchen group is on channels 1-6 because that is the button on the
+    physical remote; covers exist for 1-5. #32's completeness guard compared the
+    live members against the group's FULL channel set, so the group reported
+    `unknown` position, `unknown` confidence and no open/closed state forever --
+    not caution about channel 6 but silence about the five blinds it does model.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    slider, counter, sink, aggregate = await attach_kitchen_family(hass, hub)
+    try:
+        # Channel-weighted over the five MODELLED channels: the slider is three
+        # of them. 100*3 + 0 + 0 over 5 == 60, where an unweighted mean of the
+        # three entities would read 33.
+        slider._position = 100.0
+        counter._position = 0.0
+        sink._position = 0.0
+        assert aggregate.current_cover_position == 60
+        assert aggregate.is_closed is False
+
+        slider._position = 0.0
+        assert aggregate.current_cover_position == 0
+        assert aggregate.is_closed is True
+        # Confidence derives normally -- the group HAS a position now, so the
+        # ordinary member ranking applies rather than the blanket `unknown`.
+        assert aggregate.position_confidence == "assumed"
+
+        # ...and an unknown member still takes the whole position away (#32).
+        counter._position = None
+        assert aggregate.current_cover_position is None
+        assert aggregate.position_confidence == "unknown"
+    finally:
+        await detach_family(slider, counter, sink, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_unmodelled_channels_are_published_and_still_transmitted(
+    hass: HomeAssistant,
+) -> None:
+    """The group reports 1-5 but keeps addressing all six on the air.
+
+    The physical remote's group button covers channel 6 whether or not Home
+    Assistant models it, so disregarding it for STATE must not quietly narrow
+    the frame -- that would stop a blind on channel 6 from moving with the rest.
+    """
+    hub: ZemismartHub
+    bodies: list[dict[str, Any]] = []
+
+    async def publish(topic: str, payload: str) -> None:
+        body = json.loads(payload)
+        bodies.append(body)
+        acknowledge(hub, topic.split("/")[1], body)
+
+    hub = ZemismartHub(online_registry(), publish)
+    slider, counter, sink, aggregate = await attach_kitchen_family(hass, hub)
+    try:
+        assert aggregate.extra_state_attributes["channels"] == [1, 2, 3, 4, 5, 6]
+        assert aggregate.extra_state_attributes["unmodelled_channels"] == [6]
+
+        await aggregate.async_open_cover()
+        assert len(bodies) == 1
+        assert bodies[0]["raw"] == encode_b0(
+            make_payload(
+                TEST_PREFIX,
+                TEST_REMOTE_ID,
+                (1, 2, 3, 4, 5, 6),
+                "UP",
+                bases=TEST_ACTION_BASES,
+            )
+        )
+    finally:
+        await detach_family(slider, counter, sink, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_unmodelled_channels_do_not_block_a_group_position(
+    hass: HomeAssistant,
+) -> None:
+    """A percentage fans out to the covers that model a channel, and succeeds.
+
+    Refusing the whole move over channel 6 would be refusing it forever: no
+    fan-out was ever going to address a channel no cover claims, and there is
+    nothing to add a cover for if no blind is on it.
+    """
+    hub: ZemismartHub
+
+    async def publish(topic: str, payload: str) -> None:
+        acknowledge(hub, topic.split("/")[1], json.loads(payload))
+
+    hub = ZemismartHub(online_registry(), publish)
+    slider, counter, sink, aggregate = await attach_kitchen_family(hass, hub, travel=5.0)
+    try:
+        for member in (slider, counter, sink):
+            member._position = 100.0
+        await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+        for member in (slider, counter, sink):
+            assert member._motion_target == 60.0
+    finally:
+        await detach_family(slider, counter, sink, aggregate)
+        hub.close()
+
+
+@pytest.mark.asyncio
+async def test_a_configured_member_with_no_entity_still_withholds_group_state(
+    hass: HomeAssistant,
+) -> None:
+    """Unmodelled and missing are different: only the first is disregarded.
+
+    Narrowing #32's guard to the modelled channels must not weaken its runtime
+    half. `async_setup_entry` skips any cover whose config fails to derive -- a
+    leaf with no travel times -- and a leaf can deregister mid-flight, so a
+    channel the remote HAS a cover for can have no entity behind it. That
+    channel is modelled and unaccounted for at once, and the group must still
+    say nothing.
+    """
+
+    async def publish(_topic: str, _payload: str) -> None:
+        return
+
+    hub = ZemismartHub(online_registry(), publish)
+    slider, counter, sink, aggregate = await attach_kitchen_family(hass, hub)
+    try:
+        for member in (slider, counter, sink):
+            member._position = 0.0
+        # Sanity: with every configured cover live the group does report.
+        assert aggregate.current_cover_position == 0
+
+        # The counter's entity goes away; its cover row does not.
+        aggregate._coordinator.unregister_leaf("sub-counter")
+
+        assert aggregate.current_cover_position is None
+        assert aggregate.is_closed is None, "channel 4 has a cover, and it is not answering"
+        assert aggregate.position_confidence == "unknown"
+        # Channel 6 is unmodelled either way; it is not what is missing.
+        assert aggregate.extra_state_attributes["unmodelled_channels"] == [6]
+
+        with pytest.raises(ServiceValidationError) as incomplete:
+            await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
+        assert incomplete.value.translation_key == "aggregate_incomplete"
+        missing = (incomplete.value.translation_placeholders or {})["missing"]
+        assert missing == "4"
+        # ...and the members it DID have were not moved.
+        assert slider._motion_target is None
+        assert sink._motion_target is None
+    finally:
+        await detach_family(slider, counter, sink, aggregate)
+        hub.close()
+
+
 @pytest.mark.asyncio
 async def test_aggregate_position_weights_members_by_channel_count(
     hass: HomeAssistant,
@@ -6891,32 +7136,39 @@ async def test_unknown_position_partial_move_is_a_validation_error(
 
 
 @pytest.mark.asyncio
-async def test_aggregate_with_an_unrepresented_channel_reports_nothing(
+async def test_aggregate_missing_one_of_its_own_covers_reports_nothing(
     hass: HomeAssistant,
 ) -> None:
-    """A group whose members do not cover all its channels has no position.
+    """A group with a cover it cannot see has no position (#32, runtime half).
 
-    The laminar topology permits it: `members_of` returns the live configured
-    leaves strictly inside the aggregate, and nothing requires their union to
-    equal the aggregate's own channels. `async_setup_entry` also skips any cover
-    whose config fails to derive, so a member can go missing at runtime.
+    `async_setup_entry` skips any cover whose config fails to derive -- a leaf
+    with no travel times -- and a leaf can deregister mid-flight, so a channel
+    the remote HAS a cover for can have no entity behind it. Before #32 the
+    group averaged the members it had and published a confident number --
+    possibly `anchored` -- for hardware it had no model of.
 
-    Before #32 the group averaged the members it had and published a confident
-    number -- possibly `anchored` -- for hardware it had no model of.
+    The trigger this test used to use, a channel NO cover is configured for, is
+    a different case and is no longer withheld for: that channel is unmodelled
+    and disregarded (see test_aggregate_derives_state_from_its_modelled_channels_only).
+    What is asserted here is the half that must survive that narrowing.
     """
 
     async def publish(_topic: str, _payload: str) -> None:
         return
 
     hub = ZemismartHub(online_registry(), publish)
-    # Leaves {1,2} and {3} under a group of {1,2,3,4}: channel 4 has no model.
+    # Configured leaves {1,2} and {3} under a group of {1,2,3}.
     wide, solo, aggregate = await attach_weighted_family(hass, hub)
-    aggregate._config = replace(aggregate._config, channels=(1, 2, 3, 4))
     try:
         wide._position = 50.0
         solo._position = 50.0
         wide.async_write_ha_state()
         solo.async_write_ha_state()
+        await hass.async_block_till_done()
+        assert aggregate.current_cover_position == 50
+
+        # Channel 3's cover row stays configured; only its entity goes away.
+        aggregate._coordinator.unregister_leaf("sub-solo")
         await hass.async_block_till_done()
 
         assert aggregate.current_cover_position is None
@@ -6928,8 +7180,8 @@ async def test_aggregate_with_an_unrepresented_channel_reports_nothing(
         with pytest.raises(HomeAssistantError) as incomplete:
             await aggregate.async_set_cover_position(**{ATTR_POSITION: 60})
         assert incomplete.value.translation_key == "aggregate_incomplete"
-        assert "4" in (incomplete.value.translation_placeholders or {})["missing"]
-        # and the members it DID have were not moved
+        assert "3" in (incomplete.value.translation_placeholders or {})["missing"]
+        # and the member it DID have was not moved
         assert wide._motion_target is None
         assert solo._motion_target is None
     finally:
@@ -7038,13 +7290,13 @@ async def test_aggregate_timeout_records_position_tombstones(
 
 @pytest.mark.asyncio
 async def test_incomplete_aggregate_is_never_reported_closed(hass: HomeAssistant) -> None:
-    """`closed` is the entity's PRIMARY state and needs full channel coverage.
+    """`closed` is the entity's PRIMARY state and needs every cover answering.
 
-    position and confidence already refuse an incomplete group, but `is_closed`
-    did not -- so an aggregate over {1,2,3,4} whose live members cover {1,2,3}
-    published itself to HA as `closed` with channel 4 entirely unmodelled. The
-    other incomplete-group test uses mid-travel positions and never reaches this
-    state.
+    position and confidence already refuse a group with a cover it cannot see,
+    but `is_closed` did not -- so an aggregate over {1,2,3} whose {3} cover had
+    no entity published itself to HA as `closed` on the strength of two thirds
+    of the evidence. The other incomplete-group test uses mid-travel positions
+    and never reaches this state.
     """
 
     async def publish(_topic: str, _payload: str) -> None:
@@ -7052,18 +7304,20 @@ async def test_incomplete_aggregate_is_never_reported_closed(hass: HomeAssistant
 
     hub = ZemismartHub(online_registry(), publish)
     wide, solo, aggregate = await attach_weighted_family(hass, hub)
-    aggregate._config = replace(aggregate._config, channels=(1, 2, 3, 4))
     try:
         wide._position = 0.0
         solo._position = 0.0
         assert wide.is_closed is True
         assert solo.is_closed is True
+        assert aggregate.is_closed is True
 
-        assert aggregate.is_closed is None, "an unmodelled channel cannot be called closed"
+        # Channel 3 keeps its configured cover; the entity stops answering.
+        aggregate._coordinator.unregister_leaf("sub-solo")
+        assert aggregate.is_closed is None, "a cover that is not answering cannot be called closed"
 
         # One member open still makes the GROUP open, coverage or not: that
-        # answer does not depend on the channels we have no model for.
-        solo._position = 60.0
+        # answer does not depend on the channels we cannot see.
+        wide._position = 60.0
         assert aggregate.is_closed is False
     finally:
         await detach_family(wide, solo, aggregate)

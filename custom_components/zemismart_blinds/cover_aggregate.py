@@ -44,6 +44,12 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
     ONE frame addressed to the full channel set; position commands fan out to
     each member's own timed positioning. The aggregate owns no position model
     of its own — members are the single source of truth.
+
+    Its channel set and the channels it can DERIVE state for are therefore two
+    different things. Every frame it sends addresses the full configured set,
+    including channels no cover is configured for; the state it publishes
+    covers only the channels its configured members model. See
+    `_modelled_channels`.
     """
 
     def __init__(
@@ -141,24 +147,59 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
                     member.entity_id,
                 )
 
-    def _members_cover_every_channel(self) -> bool:
-        """Return whether the live members account for ALL of our channels.
+    def _modelled_channels(self) -> frozenset[int]:
+        """Return our channels that some CONFIGURED member cover models.
 
-        The laminar topology does not require them to. `members_of` returns the
-        live configured LEAVES strictly inside this aggregate, and nothing
-        guarantees their union equals ours: an aggregate over {1..6} whose
-        leaves are {1,2,3}, {4} and {5} has no model for channel 6 at all, and
-        `async_setup_entry` skips any cover whose config fails to derive, so a
-        member can also be missing at runtime.
+        A channel outside this set is UNMODELLED: no cover on the remote claims
+        it, so nothing in Home Assistant knows its travel time, its position or
+        whether it is closed. The physical group still contains it -- every
+        open/close/stop frame this aggregate sends is addressed to the full
+        configured channel set, unchanged -- but it contributes nothing to the
+        derived state, because there is nothing to contribute.
+        """
+        return self._coordinator.modelled_channels(self._cover_id) & frozenset(
+            self._config.channels
+        )
 
-        Left unchecked, the aggregate reported a confident position -- possibly
-        `anchored` -- for hardware it had no model of, and `set_position` moved
-        the channels it could and returned success (#32).
+    def _unmodelled_channels(self) -> tuple[int, ...]:
+        """Return our channels no configured member cover models, ascending."""
+        return tuple(sorted(frozenset(self._config.channels) - self._modelled_channels()))
+
+    def _missing_member_channels(self) -> frozenset[int]:
+        """Return modelled channels whose configured member is not live now.
+
+        The runtime-safety half of #32. `async_setup_entry` skips any cover
+        whose config fails to derive -- a leaf with no travel times, say -- and
+        a leaf can deregister mid-flight, so a channel this remote DOES have a
+        cover for can still have no entity behind it. Those channels are
+        modelled and unaccounted for at once, which is the state the aggregate
+        must refuse to derive through.
         """
         covered = frozenset(
             channel for member in self._members() for channel in member._config.channels
         )
-        return covered == frozenset(self._config.channels)
+        return self._modelled_channels() - covered
+
+    def _members_cover_every_modelled_channel(self) -> bool:
+        """Return whether every MODELLED channel has a live member behind it.
+
+        Completeness is judged against the configured members, not against our
+        full channel set (#32, narrowed). Both halves matter, and they are not
+        the same question:
+
+        * A configured member with no live entity leaves a modelled channel
+          unaccounted for. The aggregate then reports no position, no
+          `is_closed` and `unknown` confidence -- the original #32 guard, intact.
+          Left unchecked it published a confident position, possibly `anchored`,
+          for hardware it had no model of, and `set_position` moved the channels
+          it could and returned success.
+        * A channel NO configured cover claims is unmodelled and disregarded.
+          The first guard treated the two alike, so a group over {1..6} with
+          covers for only {1..5} -- a legitimate configuration; channel 6 may
+          have no blind on it at all -- reported unknown forever, which is not
+          caution but silence about the five blinds it does model.
+        """
+        return not self._missing_member_channels()
 
     @property
     def available(self) -> bool:
@@ -171,16 +212,21 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
 
         Unknown members are NOT skipped (#32): averaging the rest produced a
         confident, specific number describing only part of the hardware the
-        aggregate claims to represent, and that number is what dashboards and
-        automations read. `is_closed` already returns None on a mixed state;
-        this now matches its honesty.
+        aggregate models, and that number is what dashboards and automations
+        read. `is_closed` already returns None on a mixed state; this matches
+        its honesty.
 
         Weighted by channel count because a member is a motor set, not a vote:
         a leaf covering {1,2} moves twice as much hardware as one covering {3},
         so an unweighted mean reported the midpoint of the two LEAVES rather
         than of the three MOTORS.
+
+        The mean spans the MODELLED channels only. An unmodelled channel has no
+        position to average in and no weight to carry, so a group over {1..6}
+        with covers for {1..5} reports the mean of those five -- the number a
+        user configuring five covers asked for.
         """
-        if not self._members_cover_every_channel():
+        if not self._members_cover_every_modelled_channel():
             return None
         travelled = 0.0
         channels = 0
@@ -212,15 +258,19 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         if not states:
             return None
         # `False` needs no completeness: one member demonstrably open makes the
-        # GROUP open whatever the unmodelled channels are doing.
+        # GROUP open whatever the channels we cannot see are doing.
         if any(state is False for state in states):
             return False
         # `True` does. This is the entity's PRIMARY state, so an aggregate over
-        # {1,2,3,4} whose live members cover only {1,2,3} would otherwise be
-        # published to HA as `closed` while channel 4 is entirely unmodelled --
-        # the same hole current_cover_position and position_confidence already
-        # close (#32).
-        if all(state is True for state in states) and self._members_cover_every_channel():
+        # {1,2,3,4} that HAS a cover configured for channel 4 but no entity
+        # behind it would otherwise be published to HA as `closed` on the
+        # strength of three quarters of the evidence -- the same hole
+        # current_cover_position and position_confidence close (#32).
+        #
+        # A channel no cover is configured for is a different matter: it is
+        # outside what this group models at all, so `closed` describes the five
+        # blinds the user configured and claims nothing about the sixth.
+        if all(state is True for state in states) and self._members_cover_every_modelled_channel():
             return True
         return None
 
@@ -229,8 +279,8 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         """Derive confidence from members -- the worst known value wins.
 
         One rule throughout: no position means `unknown`. That holds for a leaf
-        with no estimate, for a group whose members do not cover its channels,
-        and for a group with an unknown member -- because `current_cover_position`
+        with no estimate, for a group missing a member it has a cover for, and
+        for a group with an unknown member -- because `current_cover_position`
         returns None in every one of those cases.
 
         The older rule capped this at `assumed` instead, which was right while
@@ -242,7 +292,7 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         Once the group has a position, a suspect member still marks it suspect.
         """
         members = list(self._members())
-        if not self._members_cover_every_channel():
+        if not self._members_cover_every_modelled_channel():
             # `unknown`, not `assumed`: current_cover_position returns None in
             # this state, and the leaf's rule is that no position means unknown.
             # Reporting `assumed` implied there was an estimate that merely
@@ -273,6 +323,12 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
         """Expose topology metadata for diagnostics and restore discrimination."""
         return {
             "channels": list(self._config.channels),
+            # Always present, empty when there are none: the derived state of a
+            # group with unmodelled channels describes fewer motors than
+            # `channels` lists, and that gap should be readable rather than
+            # inferable. A stable key means a template never has to guess
+            # whether an absent attribute means "none" or "old version".
+            "unmodelled_channels": list(self._unmodelled_channels()),
             "remote": self._config.remote_key,
             "role": self._config.role.value,
             _ATTR_POSITION_CONFIDENCE: self.position_confidence,
@@ -501,21 +557,20 @@ class ZemismartAggregateCover(_ZemismartCoverEntity):
                 translation_key="no_members_available",
                 translation_placeholders={"unavailable": names},
             )
-        # Nor can a partial group be positioned at all: fanning out to the
-        # members we have would move some of this aggregate's channels and
-        # leave the rest, then report success (#32).
-        if not self._members_cover_every_channel():
-            covered = frozenset(
-                channel for member in registered for channel in member._config.channels
-            )
+        # Nor can a group missing one of its own covers be positioned: fanning
+        # out to the members we have would move some of the channels this
+        # aggregate models and leave the rest, then report success (#32).
+        #
+        # Unmodelled channels are not that case and do not block the move. No
+        # cover claims them, so no fan-out was ever going to address them and
+        # nothing here can position them; the group positions what it models,
+        # exactly as it reports what it models.
+        if missing := self._missing_member_channels():
             raise ServiceValidationError(
                 translation_domain=DOMAIN,
                 translation_key="aggregate_incomplete",
                 translation_placeholders={
-                    "missing": ", ".join(
-                        str(channel)
-                        for channel in sorted(frozenset(self._config.channels) - covered)
-                    )
+                    "missing": ", ".join(str(channel) for channel in sorted(missing))
                 },
             )
         # PREFLIGHT before any frame reaches the air (#32). A member with no

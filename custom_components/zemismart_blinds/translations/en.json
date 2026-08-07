@@ -352,7 +352,7 @@
       "message": "No frame was sent: the position is unknown for {members}. Run a full open or close calibration first."
     },
     "aggregate_incomplete": {
-      "message": "This group has no cover configured for channel(s) {missing}, so it cannot be positioned as a whole. Add a cover for them, or position the members individually."
+      "message": "This group's cover for channel(s) {missing} is not set up right now, so it cannot be positioned as a whole. Check that cover (a cover with no travel times is skipped at startup), or position the members individually."
     },
     "no_bridge_online": {
       "message": "No RF433 bridge is online, so the command could not be sent."

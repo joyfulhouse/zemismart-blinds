@@ -401,6 +401,28 @@ def test_derive_role_leaf_and_aggregate() -> None:
     assert derive_role(by_key["1-2-3-4-5-6"], covers) == Role.AGGREGATE
 
 
+def test_a_lone_cover_is_a_leaf_whatever_its_channel_span() -> None:
+    """One cover on a remote models its own position, 1 channel or 1-6.
+
+    A single-device remote is often wired to the 1-6 group button, and that
+    cover is whole in itself: nothing is nested inside it, so it is a LEAF with
+    its own travel times rather than an aggregate deriving from members it does
+    not have. The unmodelled-channel narrowing applies to AGGREGATES only and
+    must not reach this shape.
+    """
+    from custom_components.zemismart_blinds.models import CoverConfig, Role, derive_role
+
+    for channels in ((1,), (1, 2, 3, 4, 5, 6)):
+        alone = CoverConfig(
+            name="Only shade",
+            channels=channels,
+            travel_up=10.0,
+            travel_down=10.0,
+            cover_id="cover-only",
+        )
+        assert derive_role(alone, [alone]) == Role.LEAF
+
+
 def test_member_covers_are_leaves_only() -> None:
     from custom_components.zemismart_blinds.models import member_covers
 

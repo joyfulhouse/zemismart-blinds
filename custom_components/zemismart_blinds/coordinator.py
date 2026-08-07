@@ -94,6 +94,17 @@ class RemoteCoordinator:
             for cover_id, cover in self.covers.items()
             if self.roles[cover_id] is Role.AGGREGATE
         }
+        # The channels of each aggregate that some CONFIGURED member models.
+        # Derived from entry data, never from live entities: a leaf whose entity
+        # failed to set up is still configured, so its channels stay modelled
+        # and its aggregate still withholds state for them. Reading live
+        # entities here would quietly re-grant the confidence #32 removed.
+        self._modelled_channels: dict[str, frozenset[int]] = {
+            aggregate_id: frozenset(
+                channel for member_id in member_ids for channel in self.covers[member_id].channels
+            )
+            for aggregate_id, member_ids in self.members.items()
+        }
         # Reverse index: leaf cover id -> aggregate cover ids containing it.
         self._containers: dict[str, tuple[str, ...]] = {}
         for aggregate_id, member_ids in self.members.items():
@@ -195,6 +206,24 @@ class RemoteCoordinator:
             for member_id in self.members.get(aggregate_id, ())
             if member_id in self._leaf_entities
         )
+
+    def modelled_channels(self, aggregate_id: str) -> frozenset[int]:
+        """Return the channels of one aggregate that a configured member models.
+
+        The laminar topology does not require an aggregate's members to account
+        for all of its channels: a group over {1..6} whose configured covers are
+        {1,2,3}, {4} and {5} has no cover for channel 6 anywhere on the remote.
+        That channel is UNMODELLED — nothing in Home Assistant describes it, so
+        no derivation can say anything about it and the aggregate's state is
+        derived from the rest.
+
+        This is deliberately the CONFIGURED union, not the live one, which is
+        what separates the two cases an aggregate must tell apart: a channel
+        nobody configured a cover for (unmodelled, disregarded) and a channel
+        whose configured cover has no entity right now (modelled but missing —
+        the aggregate still withholds state for it).
+        """
+        return self._modelled_channels.get(aggregate_id, frozenset())
 
     def _position_invalidation_states(self) -> dict[str, _PositionInvalidationState]:
         """Return shared marker and current-topology state by config entry."""

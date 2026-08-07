@@ -40,6 +40,10 @@ _REDACT_ENTRY = {
 # a single dump. See _Pseudonyms for why a digest is not good enough.
 _COVER_ATTRIBUTES = (
     "channels",
+    # Aggregates only, and worth a dump line of its own: a group deriving state
+    # from fewer channels than it addresses is the first thing to check when a
+    # reported position disagrees with the room.
+    "unmodelled_channels",
     "role",
     "position_confidence",
     "position_suspect",
