@@ -62,25 +62,30 @@ channel_field(chs) = 0xFFFF ^ OR( 1 << ((ch + 7) % 16)  for ch in chs )
 ### Command field (16b)
 
 ```python
-command = (base[button] + remote_id - offset(chs)) & 0xFFFF
+command = (base[button] & 0xFF00) | ((base[button] + remote_id - offset(chs)) & 0xFF)
 offset(chs) = signed8( 2 + SUM( 1 << ((ch-1) % 8)  for ch in chs ) )   # single ch: 2 + 2^((ch-1)%8)
 signed8(o)  = ((o + 128) % 256) - 128
 ```
 
+The **opcode high byte is channel-invariant**: only the command low byte participates in the
+`remote_id - offset` arithmetic, wrapping modulo 256 without ever carrying into the opcode byte.
+Live-validated 2026-08-06 against a carry-straddle remote (its `base_low + remote_id` crosses
+0x100 for small channel groups but not for ALL `[1..6]`): the motor ignored the carried opcode
+the earlier 16-bit formula produced for single channels and moved on the wrapped form, while
+field captures on channels `{1}`, `{3}`, and `{1..6}` all carried the same opcode byte. The
+other 11 surveyed remotes never exposed the difference because their carries are uniform across
+every channel set in use.
+
 The action base is **calibrated per remote** from one labeled captured reference:
 
 ```python
-base[button]  = (captured_cmd + offset(captured_channels) - remote_id) & 0xFFFF
-cmd(channels) = (captured_cmd + offset(captured_channels) - offset(channels)) & 0xFFFF
+base[button] = (captured_cmd & 0xFF00) | ((captured_cmd - remote_id + offset(captured_channels)) & 0xFF)
 ```
 
 Across every remote observed so far, action command opcode bytes are `f4` (UP), `bc` (DOWN), and
 `dc` (STOP), and their low bytes differ from UP by `0x00`, `-0x38`, and `-0x18` modulo 256.
 Therefore **one labeled UP/DOWN/STOP capture derives all three action bases.** Do not apply the
-delta as one 16-bit subtraction: low-byte wrap does not carry into the opcode byte. The codec
-first translates an arbitrary captured channel set to the ALL `[1..6]` offset before applying
-these bytewise action relationships, so references whose raw command crossed into `f3`/`f5`,
-`bb`/`bd`, or `db`/`dd` remain valid.
+delta as one 16-bit subtraction: low-byte wrap does not carry into the opcode byte.
 
 Some remotes additionally transmit an OEM **TRAILER** command after UP/DOWN bursts. A trailer base
 is only used when explicitly calibrated from a capture — the codec never invents an unobserved
@@ -93,15 +98,15 @@ For a fabricated remote `prefix=0xA1B2C3`, `remote_id=0x42` with calibrated UP b
 
 ```
 channel 1 UP:   offset({1}) = signed8(2 + 1) = 3
-                command     = (0xF42A + 0x42 - 3) & 0xFFFF = 0xF469
+                command     = 0xF400 | ((0x2A + 0x42 - 3) & 0xFF) = 0xF469
                 payload     = 0xA1B2C3_42_FEFF_F469
 
 group {1,2} UP: offset({1,2}) = signed8(2 + 1 + 2) = 5
-                command       = (0xF42A + 0x42 - 5) & 0xFFFF = 0xF467
+                command       = 0xF400 | ((0x2A + 0x42 - 5) & 0xFF) = 0xF467
                 payload       = 0xA1B2C3_42_FCFF_F467
 
 ALL {1..6} UP:  offset({1..6}) = signed8(2 + 63) = 65
-                command        = (0xF42A + 0x42 - 65) & 0xFFFF = 0xF42B
+                command        = 0xF400 | ((0x2A + 0x42 - 65) & 0xFF) = 0xF42B
                 payload        = 0xA1B2C3_42_C0FF_F42B
 ```
 

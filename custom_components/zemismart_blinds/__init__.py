@@ -17,7 +17,12 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .air import AirMode
 from .bridge_registry import BridgeRegistry
-from .codec import CommandBases, synthesize_bases
+from .codec import (
+    _ACTION_COMMAND_HIGH,
+    CommandBases,
+    group_offset,
+    synthesize_bases,
+)
 from .config_models import RemoteConfig
 from .const import (
     ATTR_BRIDGE,
@@ -26,6 +31,7 @@ from .const import (
     CONF_AIR_ARBITRATION_MODE,
     CONF_BASE_DOWN,
     CONF_BASE_STOP,
+    CONF_BASE_TRAILER,
     CONF_BASE_UP,
     CONF_CHANNELS,
     CONF_COVER_ID,
@@ -385,59 +391,203 @@ async def _async_entry_updated(hass: HomeAssistant, entry: ZemismartConfigEntry)
     hass.config_entries.async_schedule_reload(entry.entry_id)
 
 
+# The fixed per-action opcode bytes of the codec's empirical table, used ONLY
+# to break a migration ambiguity that at most one real remote per straddle can
+# resolve. Never used to refuse an untabled remote: #26 proved remotes outside
+# the table exist and work. Derived, not copied, so a future table correction
+# cannot leave the migration voting for a stale byte.
+_MIGRATION_TABLED_OPCODES: Final[dict[str, int]] = {
+    CONF_BASE_UP: _ACTION_COMMAND_HIGH["UP"],
+    CONF_BASE_DOWN: _ACTION_COMMAND_HIGH["DOWN"],
+    CONF_BASE_STOP: _ACTION_COMMAND_HIGH["STOP"],
+}
+
+
+def _renormalized_base_field(
+    base: int,
+    remote_id: int,
+    references: tuple[tuple[int, ...], ...],
+    tabled_opcode: int | None,
+) -> int | None:
+    """Re-derive one stored v2 base under the fixed-opcode command model.
+
+    The v2 command formula carried a low-byte overflow into the opcode high
+    byte; the OEM provably does not (PROTOCOL.md, live-validated 2026-08-06).
+    Evaluating the legacy formula at a configured channel set and re-recovering
+    the base under the corrected formula keeps the frames the entry was
+    validated on byte-identical: the low byte round-trips unchanged, and the
+    high byte becomes the opcode the legacy formula put on air for that set.
+
+    Every configured cover's channel set is a candidate reference, because the
+    capture the base was measured from could have used any of them and cover
+    ORDER carries no evidence. When all candidates agree — every remote whose
+    carries are uniform across its configured sets — the choice is exact, and
+    it preserves what the motor experienced even for opcodes outside the table
+    (an untabled #26 remote, or a virtual remote whose motor learned this
+    integration's own legacy frames during pairing). When they disagree, the
+    entry is a carry-straddle: the legacy formula provably transmitted a wrong
+    opcode on one side, so at most one candidate is real, and the one carrying
+    the action's tabled opcode byte is the 10-of-11 prior. Returns None when
+    candidates disagree and no tabled opcode can break the tie (the OEM
+    trailer has no table entry; an untabled straddle has no tabled candidate).
+    """
+    candidates = {
+        ((base + remote_id - group_offset(reference)) & 0xFF00) | (base & 0xFF)
+        for reference in references
+    }
+    if len(candidates) == 1:
+        return candidates.pop()
+    tabled = [value for value in candidates if value >> 8 == tabled_opcode]
+    if len(tabled) != 1:
+        return None
+    return tabled[0]
+
+
+def _renormalize_v2_bases(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate one v2 entry's command bases to the corrected protocol model.
+
+    This never refuses the migration: a v1 entry's subentry folding has
+    already committed by the time this runs, and a refused migration strands
+    the entry in MIGRATION_ERROR where no flow can repair it. A value this
+    step cannot parse is left byte-identical instead — setup reads every field
+    through the same width-validated parsers and surfaces its own actionable
+    error for it. Only genuine renormalization ambiguity changes behavior, and
+    each such resolution is logged.
+    """
+    from .config_models import parse_channels, parse_hex
+
+    data = dict(entry.data)
+    try:
+        remote_id = parse_hex(data.get(CONF_REMOTE_ID), CONF_REMOTE_ID, 8)
+    except ValueError:
+        _LOGGER.warning(
+            "Config entry %s has no parseable remote id; storing its bases "
+            "unchanged for setup to validate",
+            entry.entry_id,
+        )
+        hass.config_entries.async_update_entry(entry, version=3)
+        return True
+    # Ordered dedup: the set of candidates is order-free, but the untabled
+    # straddle fallback below deliberately preserves the FIRST cover's frames.
+    references_list: list[tuple[int, ...]] = []
+    for cover in data.get(CONF_COVERS, ()):
+        try:
+            channels = parse_channels(cover.get(CONF_CHANNELS))
+        except ValueError:
+            continue
+        if channels not in references_list:
+            references_list.append(channels)
+    references = tuple(references_list) or ((1, 2, 3, 4, 5, 6),)
+    for key in (CONF_BASE_UP, CONF_BASE_DOWN, CONF_BASE_STOP, CONF_BASE_TRAILER):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            base = parse_hex(value, key, 16)
+        except ValueError:
+            _LOGGER.warning(
+                "Config entry %s base %s=%r is not parseable; leaving it "
+                "unchanged for setup to validate",
+                entry.entry_id,
+                key,
+                value,
+            )
+            continue
+        renormalized = _renormalized_base_field(
+            base,
+            remote_id,
+            references,
+            _MIGRATION_TABLED_OPCODES.get(key),
+        )
+        if renormalized is None and key == CONF_BASE_TRAILER:
+            # An ambiguous OEM trailer has no tabled opcode to resolve it, and
+            # a wrong trailer is worse than none: repeated action frames are
+            # live-proven to work without one (PROTOCOL.md).
+            _LOGGER.warning(
+                "Config entry %s OEM trailer base %s straddles its covers' "
+                "channel sets ambiguously; dropping the trailer",
+                entry.entry_id,
+                value,
+            )
+            data[key] = ""
+            continue
+        if renormalized is None:
+            # An untabled carry-straddle: never observed in the field. Keep
+            # the first configured cover's frames byte-identical and say so.
+            fallback = _renormalized_base_field(base, remote_id, references[:1], None)
+            _LOGGER.warning(
+                "Config entry %s base %s=%r straddles its covers' channel sets "
+                "with no tabled opcode to resolve it; preserving the frames of "
+                "channels %s — recalibrate this remote if an action stopped "
+                "responding",
+                entry.entry_id,
+                key,
+                value,
+                references[0],
+            )
+            renormalized = fallback
+        if renormalized is not None:
+            data[key] = f"{renormalized:04x}"
+    hass.config_entries.async_update_entry(entry, data=data, version=3)
+    return True
+
+
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Fold cover subentries into entry data (spec 2026-07-24, staged phases)."""
+    """Migrate entry data: v1 folds cover subentries in, v2 renormalizes bases."""
     from homeassistant.helpers import entity_registry as er
 
     # An explicit ladder, not `!= 1: return True`: a version this code has never
-    # seen — a v3 entry written by a newer integration and then downgraded —
+    # seen — a v4 entry written by a newer integration and then downgraded —
     # would otherwise report "migrated successfully" and load with data this
     # code cannot interpret. A downgrade is exactly when refusing cleanly
     # matters most.
-    if entry.version > 2:
+    if entry.version > 3:
         _LOGGER.error(
             "Config entry version %s is newer than this integration supports; "
             "downgrade is not supported",
             entry.version,
         )
         return False
-    if entry.version == 2:
+    if entry.version == 3:
         return True
-    if entry.version != 1:
+    if entry.version not in (1, 2):
         return False
-    # Phase 0: legacy per-blind reference entries pass through byte-for-byte.
-    if CONF_CHANNELS in entry.data:
+    if entry.version == 1 and CONF_CHANNELS not in entry.data:
+        # Phase A: stage the covers list while subentries are still intact.
+        if CONF_COVERS not in entry.data:
+            covers = [
+                {CONF_COVER_ID: subentry_id, CONF_NAME: subentry.title, **subentry.data}
+                for subentry_id, subentry in entry.subentries.items()
+                if subentry.subentry_type == "cover"
+            ]
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_COVERS: covers},
+            )
+        # Phase B: resumable cleanup driven by the STAGED list, never subentries.
+        ent_reg = er.async_get(hass)
+        for row in entry.data[CONF_COVERS]:
+            cover_id = row[CONF_COVER_ID]
+            for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+                if reg_entry.config_subentry_id == cover_id:
+                    ent_reg.async_update_entity(
+                        reg_entry.entity_id,
+                        config_subentry_id=None,
+                    )
+            if cover_id in entry.subentries:
+                hass.config_entries.async_remove_subentry(entry, cover_id)
+        # Phase C: commit.
+        if entry.subentries:
+            msg = f"unstaged subentries survived migration of {entry.entry_id}"
+            raise ValueError(msg)
         hass.config_entries.async_update_entry(entry, version=2)
+    # Shared v2 -> v3 tail. Legacy per-blind reference entries pass through
+    # byte-identical: setup refuses them, so their bases are historical
+    # reference data, never transmitted.
+    if CONF_CHANNELS in entry.data:
+        hass.config_entries.async_update_entry(entry, version=3)
         return True
-    # Phase A: stage the covers list while subentries are still intact.
-    if CONF_COVERS not in entry.data:
-        covers = [
-            {CONF_COVER_ID: subentry_id, CONF_NAME: subentry.title, **subentry.data}
-            for subentry_id, subentry in entry.subentries.items()
-            if subentry.subentry_type == "cover"
-        ]
-        hass.config_entries.async_update_entry(
-            entry,
-            data={**entry.data, CONF_COVERS: covers},
-        )
-    # Phase B: resumable cleanup driven by the STAGED list, never live subentries.
-    ent_reg = er.async_get(hass)
-    for row in entry.data[CONF_COVERS]:
-        cover_id = row[CONF_COVER_ID]
-        for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
-            if reg_entry.config_subentry_id == cover_id:
-                ent_reg.async_update_entity(
-                    reg_entry.entity_id,
-                    config_subentry_id=None,
-                )
-        if cover_id in entry.subentries:
-            hass.config_entries.async_remove_subentry(entry, cover_id)
-    # Phase C: commit.
-    if entry.subentries:
-        msg = f"unstaged subentries survived migration of {entry.entry_id}"
-        raise ValueError(msg)
-    hass.config_entries.async_update_entry(entry, version=2)
-    return True
+    return _renormalize_v2_bases(hass, entry)
 
 
 def _repair_v2_registry_skew(
@@ -608,7 +758,7 @@ async def async_setup_entry(
             translation_domain=DOMAIN,
             translation_key="legacy_entry_format",
         )
-    if entry.version == 2:
+    if entry.version >= 2:
         _repair_v2_registry_skew(hass, entry)
     while True:
         candidate = _create_domain_runtime(hass)
