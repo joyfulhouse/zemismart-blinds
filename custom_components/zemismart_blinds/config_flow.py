@@ -12,10 +12,12 @@ import functools
 import json
 import logging
 import secrets
+import time
 from collections.abc import Iterable as Iterable
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass as dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import voluptuous as vol
@@ -113,6 +115,9 @@ from .const import (
     MQTT_INFO_TOPIC,
     MQTT_ROOT,
     MQTT_RX_FIELD_FRAME,
+    TRAVEL_ARM_TIMEOUT_SECONDS,
+    TRAVEL_REARM_INTERVAL_SECONDS,
+    TRAVEL_RUN_TIMEOUT_SECONDS,
 )
 from .const import (
     DEFAULT_REPEATS as DEFAULT_REPEATS,
@@ -158,6 +163,7 @@ from .models import (
 from .models import (
     parse_channels as parse_channels,
 )
+from .travel_capture import DIRECTIONS, TravelMeasurement, TravelRun
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -424,6 +430,109 @@ def _handle_sniff_message(
         attempt.unrecognized = capture
 
 
+@dataclass(slots=True)
+class _PendingMeasure:
+    """Where a travel measurement came from and where its result must go."""
+
+    origin: Literal["wizard", "add", "edit"]
+    name: str
+    channels: tuple[int, ...]
+    cover_id: str | None = None
+    bridge: str | None = None
+    measured: dict[str, TravelMeasurement] = field(default_factory=dict)
+
+    @property
+    def wanted(self) -> frozenset[str]:
+        """Return the directions still to be measured."""
+        return frozenset(DIRECTIONS) - frozenset(self.measured)
+
+
+@callback
+def _handle_travel_message(
+    flow: ZemismartBlindsConfigFlow,
+    session_id: str,
+    expected_topic: str,
+    run: TravelRun,
+    armed: asyncio.Event,
+    future: asyncio.Future[TravelMeasurement],
+    message: ReceiveMessage,
+) -> None:
+    """Offer one received frame to the open travel run."""
+    if (
+        flow._sniff_session_id != session_id
+        or future.done()
+        or message.retain
+        or message.topic != expected_topic
+    ):
+        return
+    try:
+        text = _payload_text(message.payload)
+        decoded_payload: object = json.loads(text)
+    except _PAYLOAD_ERRORS:
+        return
+    if not isinstance(decoded_payload, Mapping):
+        return
+    frame = decoded_payload.get(MQTT_RX_FIELD_FRAME)
+    # Checked before the run sees it: an automation driving this very cover
+    # mid-measurement echoes back off the sniffing bridge looking exactly like
+    # a human's press.
+    if isinstance(frame, str) and _is_own_emission(flow.hass, frame):
+        return
+    measurement = run.offer_payload(decoded_payload, time.monotonic())
+    if run.started is not None:
+        armed.set()
+    if measurement is not None:
+        future.set_result(measurement)
+
+
+async def _async_hold_sniff_open(hass: HomeAssistant, command_topic: str) -> None:
+    """Keep one bridge's bounded sniff window open for a whole run.
+
+    The firmware's ``start_sniff`` takes the LATER of its current and candidate
+    deadlines rather than replacing it, so re-publishing extends the window.
+    That is the only way to measure a run longer than the command contract's
+    60-second cap.
+    """
+    from homeassistant.components import mqtt
+
+    while True:
+        await mqtt.async_publish(
+            hass,
+            command_topic,
+            json.dumps(
+                {
+                    MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
+                    MQTT_CMD_FIELD_SECONDS: DEFAULT_SNIFF_WINDOW_SECONDS,
+                },
+                separators=(",", ":"),
+            ),
+            qos=1,
+            retain=False,
+        )
+        await asyncio.sleep(TRAVEL_REARM_INTERVAL_SECONDS)
+
+
+async def _async_await_measurement(
+    armed: asyncio.Event,
+    future: asyncio.Future[TravelMeasurement],
+) -> TravelMeasurement | str:
+    """Wait out the arming deadline, then the run deadline.
+
+    Two deadlines because they are two different user situations: nothing was
+    heard at all, or a run started and never finished. Each gets its own copy.
+    """
+    try:
+        async with asyncio.timeout(TRAVEL_ARM_TIMEOUT_SECONDS):
+            await armed.wait()
+    except TimeoutError:
+        return "no_press"
+    try:
+        async with asyncio.timeout(TRAVEL_RUN_TIMEOUT_SECONDS):
+            return await future
+    except TimeoutError:
+        return "no_stop"
+
+
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Add exactly one blind or group device per config entry."""
 
@@ -443,6 +552,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _remote: RemoteConfig | None = None
     _sniff_session_id: str | None = None
     _sniff_task: asyncio.Task[Literal["captured", "timeout"]] | None = None
+    _pending_measure: _PendingMeasure | None = None
+    _measure_task: asyncio.Task[TravelMeasurement | str] | None = None
+    _measure_outcome: str | None = None
+    _measure_error: str | None = None
+    _identity_is_virtual: bool = False
 
     async def async_step_reconfigure(
         self,
@@ -1173,6 +1287,10 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             remote_id=remote_id,
             bases=bases,
         )
+        # Nothing physical transmits a synthesized identity, so travel
+        # measurement can never hear this remote. Entries do not record
+        # provenance, so this in-memory flag is the only place we know.
+        self._identity_is_virtual = True
         return await self.async_step_remote_settings()
 
     async def _async_discover_bridges(self) -> BridgeRegistry | None:
@@ -1313,6 +1431,116 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     retain=False,
                 ),
                 f"{DOMAIN} learn sniff stop",
+            )
+            stop_task.add_done_callback(
+                functools.partial(_release_capture_owner, owner_key, session_id)
+            )
+            try:
+                with suppress(Exception):
+                    await asyncio.shield(stop_task)
+            finally:
+                if stop_task.done():
+                    _release_capture_owner(owner_key, session_id, stop_task)
+
+    def _measure_identity(self) -> RemoteIdentity | None:
+        """Return the calibrated identity a travel capture must match.
+
+        None for a virtual remote: its bases are synthesized, so no physical
+        remote transmits that identity and no press could ever match. Detected
+        in memory rather than from stored data, because an entry does not
+        record whether its identity was learned or synthesized.
+        """
+        if self._identity_is_virtual:
+            return None
+        if self._identity is not None and self._identity.bases is not None:
+            return self._identity
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            return None
+        try:
+            remote = RemoteConfig.from_entry(self._get_reconfigure_entry().data)
+        except _COERCION_ERRORS:
+            return None
+        return remote.remote if remote.remote.bases is not None else None
+
+    async def _async_capture_travel(
+        self,
+        session_id: str,
+        wanted: frozenset[str],
+    ) -> TravelMeasurement | str:
+        """Measure one run, always releasing the bridge sniff session."""
+        from homeassistant.components import mqtt
+
+        pending = self._pending_measure
+        identity = self._measure_identity()
+        if pending is None or pending.bridge is None or identity is None:
+            return "failed"
+        bridge = pending.bridge
+        owner_key = (id(self.hass), bridge)
+        if owner_key in _CAPTURE_OWNERS:
+            if self._sniff_session_id == session_id:
+                self._sniff_session_id = None
+            return "failed"
+        _CAPTURE_OWNERS[owner_key] = session_id
+        rx_topic = f"{MQTT_ROOT}/{bridge}/rx"
+        command_topic = MQTT_CMD_TEMPLATE.format(bridge=bridge)
+        run = TravelRun(identity=identity, channels=pending.channels, wanted=wanted)
+        armed = asyncio.Event()
+        future: asyncio.Future[TravelMeasurement] = self.hass.loop.create_future()
+        unsubscribe: Unsubscriber | None = None
+        holder: asyncio.Task[None] | None = None
+        try:
+            async with asyncio.timeout(_MQTT_BOOTSTRAP_TIMEOUT_SECONDS):
+                if not await mqtt.async_wait_for_mqtt_client(self.hass):
+                    return "failed"
+                unsubscribe = await _async_subscribe_ready(
+                    self.hass,
+                    rx_topic,
+                    functools.partial(
+                        _handle_travel_message,
+                        self,
+                        session_id,
+                        rx_topic,
+                        run,
+                        armed,
+                        future,
+                    ),
+                )
+            holder = self.hass.async_create_task(
+                _async_hold_sniff_open(self.hass, command_topic),
+                f"{DOMAIN} travel sniff hold",
+            )
+            return await _async_await_measurement(armed, future)
+        except TimeoutError:
+            return "failed"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("Flow-local travel capture failed", exc_info=True)
+            return "failed"
+        finally:
+            if self._sniff_session_id == session_id:
+                self._sniff_session_id = None
+            if holder is not None:
+                holder.cancel()
+            if unsubscribe is not None:
+                unsubscribe()
+            if not future.done():
+                future.cancel()
+            stop_task = self.hass.async_create_task(
+                mqtt.async_publish(
+                    self.hass,
+                    command_topic,
+                    json.dumps(
+                        {
+                            MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
+                            MQTT_CMD_FIELD_SECONDS: 0,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    qos=1,
+                    retain=False,
+                ),
+                f"{DOMAIN} travel sniff stop",
             )
             stop_task.add_done_callback(
                 functools.partial(_release_capture_owner, owner_key, session_id)
