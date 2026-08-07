@@ -8,6 +8,7 @@ directly from payload dictionaries.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
@@ -40,6 +41,8 @@ __all__ = [
 
 DIRECTIONS: Final = ("UP", "DOWN")
 BUTTONS: Final = ("UP", "DOWN", "STOP")
+
+_LOGGER = logging.getLogger(__name__)
 
 _DECODE_ERRORS: Final = (KeyError, TypeError, ValueError)
 _UINT32_MODULUS: Final = 1 << 32
@@ -136,8 +139,21 @@ def identify_button(
     except _DECODE_ERRORS:
         return None
     if (decoded["prefix"], decoded["remote_id"]) != (identity.prefix, identity.remote_id):
+        _LOGGER.debug(
+            "travel: ignoring a press from %06x:%02x while measuring %06x:%02x",
+            decoded["prefix"],
+            decoded["remote_id"],
+            identity.prefix,
+            identity.remote_id,
+        )
         return None
     if tuple(decoded["chans"]) != channels:
+        _LOGGER.debug(
+            "travel: ignoring this remote's press on channels %s -- the cover being "
+            "measured stores %s, and the remote's channel selector must match it exactly",
+            decoded["chans"],
+            list(channels),
+        )
         return None
     try:
         base = derive_base(decoded["chans"], "UP", decoded["cmd"], decoded["remote_id"])
@@ -146,6 +162,11 @@ def identify_button(
     for button in BUTTONS:
         if base == bases.base(button):
             return button
+    _LOGGER.debug(
+        "travel: base 0x%04x matches none of this remote's calibrated actions "
+        "(likely the OEM trailer burst)",
+        base,
+    )
     return None
 
 
@@ -200,6 +221,11 @@ class TravelRun:
         if press.button not in self.wanted:
             # The screen has asked for the other direction. Re-pressing the one
             # already measured is not an overwrite -- redo is a menu option.
+            _LOGGER.debug(
+                "travel: ignoring %s -- waiting for %s",
+                press.button,
+                sorted(self.wanted),
+            )
             return
         started = self.started
         if (
@@ -209,19 +235,41 @@ class TravelRun:
             <= TRAVEL_BURST_WINDOW_SECONDS
         ):
             return
+        if started is not None:
+            _LOGGER.debug(
+                "travel: restarting the run on %s (was %s)",
+                press.button,
+                started.button,
+            )
+        else:
+            _LOGGER.debug("travel: run opened on %s", press.button)
         self.started = press
 
     def _close(self, press: TimedPress) -> TravelMeasurement | None:
         """Resolve a STOP against the open run, if there is one."""
         started = self.started
         if started is None:
+            _LOGGER.debug(
+                "travel: STOP heard with no run open -- the direction press "
+                "was never heard, or a previous STOP already closed the run"
+            )
             return None
         self.started = None
         elapsed = interval_seconds(started, press)
         if elapsed is None:
+            _LOGGER.debug(
+                "travel: discarding the %s run -- the two frames' clocks "
+                "cannot be compared (reboot or reordered delivery)",
+                started.button,
+            )
             return None
         stored = stored_value(elapsed)
         if stored is None:
+            _LOGGER.debug(
+                "travel: discarding a %.2fs %s run -- outside the storable range",
+                elapsed,
+                started.button,
+            )
             return None
         return TravelMeasurement(
             direction=started.button,

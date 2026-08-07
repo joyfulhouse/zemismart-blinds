@@ -521,25 +521,26 @@ async def _async_hold_sniff_open(hass: HomeAssistant, command_topic: str) -> Non
         await asyncio.sleep(TRAVEL_REARM_INTERVAL_SECONDS)
 
 
-async def _async_await_measurement(
-    armed: asyncio.Event,
-    future: asyncio.Future[TravelMeasurement],
-) -> TravelMeasurement | str:
-    """Wait out the arming deadline, then the run deadline.
+@dataclass(slots=True)
+class _MeasureSession:
+    """One armed travel-measurement listening session on one bridge.
 
-    Two deadlines because they are two different user situations: nothing was
-    heard at all, or a run started and never finished. Each gets its own copy.
+    Outlives a single progress task deliberately: the RX subscription and the
+    sniff-hold must span both phases of a run (waiting for the direction
+    press, then waiting for its STOP), so their lifetime lives here rather
+    than in either task. ``closed`` makes teardown idempotent -- both phase
+    tasks and every abandon path may try to close it.
     """
-    try:
-        async with asyncio.timeout(TRAVEL_ARM_TIMEOUT_SECONDS):
-            await armed.wait()
-    except TimeoutError:
-        return "no_press"
-    try:
-        async with asyncio.timeout(TRAVEL_RUN_TIMEOUT_SECONDS):
-            return await future
-    except TimeoutError:
-        return "no_stop"
+
+    session_id: str
+    owner_key: tuple[int, str]
+    command_topic: str
+    run: TravelRun
+    armed: asyncio.Event
+    future: asyncio.Future[TravelMeasurement]
+    unsubscribe: Unsubscriber | None = None
+    holder: asyncio.Task[None] | None = None
+    closed: bool = False
 
 
 class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -562,6 +563,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _sniff_session_id: str | None = None
     _sniff_task: asyncio.Task[Literal["captured", "timeout"]] | None = None
     _pending_measure: _PendingMeasure | None = None
+    _measure_session: _MeasureSession | None = None
     _measure_task: asyncio.Task[TravelMeasurement | str] | None = None
     _measure_outcome: str | None = None
     _measure_error: str | None = None
@@ -1413,7 +1415,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Start one measurement task, then report its transition."""
+        """Listen for the direction press; advance the moment one is heard.
+
+        Phase 1 of a run. Its progress task completes as soon as a press of a
+        wanted direction is identified, so the screen visibly reacts to the
+        press instead of spinning silently until the STOP -- the field test
+        in Kaelyn's bedroom showed a single opaque spinner gives the user no
+        way to tell "measuring" from "nothing matched".
+        """
         del user_input
         pending = self._pending_measure
         if pending is None:
@@ -1421,18 +1430,17 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._measure_task is not None and self._measure_task.done():
             outcome = "failed" if self._measure_task.cancelled() else self._measure_task.result()
             self._measure_task = None
-            if isinstance(outcome, TravelMeasurement):
-                pending.measured[outcome.direction] = outcome
-                return self.async_show_progress_done(next_step_id="cover_measure_next")
-            self._measure_outcome = outcome
+            if outcome == "armed":
+                return self.async_show_progress_done(next_step_id="cover_measure_stop")
+            self._measure_outcome = str(outcome)
             return self.async_show_progress_done(next_step_id="cover_measure_timeout")
 
         if self._measure_task is None:
             session_id = secrets.token_hex(16)
             self._sniff_session_id = session_id
             self._measure_task = self.hass.async_create_task(
-                self._async_capture_travel(session_id, pending.wanted),
-                f"{DOMAIN} travel capture",
+                self._async_measure_arm(session_id),
+                f"{DOMAIN} travel arm",
             )
 
         return self.async_show_progress(
@@ -1443,6 +1451,52 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "name": pending.name,
                 "bridge": pending.bridge or "",
                 "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_stop(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Report the direction heard and wait for its STOP.
+
+        Phase 2 of a run. The session (subscription + sniff hold) carries over
+        from phase 1, so a STOP that arrives during the step transition still
+        lands -- the run machine already holds it in the resolved future.
+        """
+        del user_input
+        pending = self._pending_measure
+        if pending is None:
+            return await self._async_measure_abandoned()
+        # Handle a completed task BEFORE consulting the session: the finish
+        # task clears self._measure_session in its own finally, so by the time
+        # this step is re-invoked with a result the session is already gone.
+        if self._measure_task is not None and self._measure_task.done():
+            outcome = "failed" if self._measure_task.cancelled() else self._measure_task.result()
+            self._measure_task = None
+            if isinstance(outcome, TravelMeasurement):
+                pending.measured[outcome.direction] = outcome
+                return self.async_show_progress_done(next_step_id="cover_measure_next")
+            self._measure_outcome = str(outcome)
+            return self.async_show_progress_done(next_step_id="cover_measure_timeout")
+
+        session = self._measure_session
+        if session is None:
+            return await self._async_measure_abandoned()
+        if self._measure_task is None:
+            self._measure_task = self.hass.async_create_task(
+                self._async_measure_finish(session),
+                f"{DOMAIN} travel stop wait",
+            )
+
+        started = session.run.started
+        return self.async_show_progress(
+            step_id="cover_measure_stop",
+            progress_action="measuring_stop",
+            progress_task=self._measure_task,
+            description_placeholders={
+                "name": pending.name,
+                "direction": started.button if started is not None else "",
             },
         )
 
@@ -1494,6 +1548,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return await self._async_measure_abandoned()
         self._measure_task = None
         self._sniff_session_id = None
+        session = self._measure_session
+        self._measure_session = None
+        if session is not None:
+            # Whichever phase task failed already closed it; idempotent.
+            await self._async_measure_session_close(session)
         return self.async_show_menu(
             step_id="cover_measure_timeout",
             menu_options=["cover_measure_run", "cover_measure_manual"],
@@ -1632,8 +1691,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Return to the cover form when measurement cannot continue."""
         pending = self._pending_measure
         self._pending_measure = None
+        if self._measure_task is not None and not self._measure_task.done():
+            self._measure_task.cancel()
         self._measure_task = None
         self._sniff_session_id = None
+        session = self._measure_session
+        self._measure_session = None
+        if session is not None:
+            await self._async_measure_session_close(session)
         self._measure_error = error
         if pending is None or pending.origin == "wizard":
             return await self.async_step_cover()
@@ -1810,12 +1875,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None
         return remote.remote if remote.remote.bases is not None else None
 
-    async def _async_capture_travel(
-        self,
-        session_id: str,
-        wanted: frozenset[str],
-    ) -> TravelMeasurement | str:
-        """Measure one run, always releasing the bridge sniff session."""
+    async def _async_measure_arm(self, session_id: str) -> str:
+        """Open one listening session and wait for a direction press.
+
+        Returns ``armed`` with the session left OPEN for the STOP phase; on
+        any other outcome the session is closed before returning, so the
+        timeout menu never leaves a bridge claimed.
+        """
         from homeassistant.components import mqtt
 
         pending = self._pending_measure
@@ -1830,75 +1896,124 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return "failed"
         _CAPTURE_OWNERS[owner_key] = session_id
         rx_topic = f"{MQTT_ROOT}/{bridge}/rx"
-        command_topic = MQTT_CMD_TEMPLATE.format(bridge=bridge)
-        run = TravelRun(identity=identity, channels=pending.channels, wanted=wanted)
-        armed = asyncio.Event()
-        future: asyncio.Future[TravelMeasurement] = self.hass.loop.create_future()
-        unsubscribe: Unsubscriber | None = None
-        holder: asyncio.Task[None] | None = None
+        session = _MeasureSession(
+            session_id=session_id,
+            owner_key=owner_key,
+            command_topic=MQTT_CMD_TEMPLATE.format(bridge=bridge),
+            run=TravelRun(
+                identity=identity,
+                channels=pending.channels,
+                wanted=pending.wanted,
+            ),
+            armed=asyncio.Event(),
+            future=self.hass.loop.create_future(),
+        )
+        self._measure_session = session
+        armed = False
         try:
-            async with asyncio.timeout(_MQTT_BOOTSTRAP_TIMEOUT_SECONDS):
-                if not await mqtt.async_wait_for_mqtt_client(self.hass):
-                    return "failed"
-                unsubscribe = await _async_subscribe_ready(
-                    self.hass,
-                    rx_topic,
-                    functools.partial(
-                        _handle_travel_message,
-                        self,
-                        session_id,
+            try:
+                async with asyncio.timeout(_MQTT_BOOTSTRAP_TIMEOUT_SECONDS):
+                    if not await mqtt.async_wait_for_mqtt_client(self.hass):
+                        return "failed"
+                    session.unsubscribe = await _async_subscribe_ready(
+                        self.hass,
                         rx_topic,
-                        run,
-                        armed,
-                        future,
-                    ),
-                )
-            holder = self.hass.async_create_task(
-                _async_hold_sniff_open(self.hass, command_topic),
+                        functools.partial(
+                            _handle_travel_message,
+                            self,
+                            session_id,
+                            rx_topic,
+                            session.run,
+                            session.armed,
+                            session.future,
+                        ),
+                    )
+            except TimeoutError:
+                return "failed"
+            # A background task, deliberately: the hold now outlives the arm
+            # phase (the session spans both progress tasks), and a tracked
+            # task sleeping between re-arms would stall every
+            # async_block_till_done for the full re-arm interval.
+            session.holder = self.hass.async_create_background_task(
+                _async_hold_sniff_open(self.hass, session.command_topic),
                 f"{DOMAIN} travel sniff hold",
             )
-            return await _async_await_measurement(armed, future)
-        except TimeoutError:
-            return "failed"
+            try:
+                async with asyncio.timeout(TRAVEL_ARM_TIMEOUT_SECONDS):
+                    await session.armed.wait()
+            except TimeoutError:
+                return "no_press"
+            armed = True
+            return "armed"
         except asyncio.CancelledError:
             raise
         except Exception:
-            _LOGGER.debug("Flow-local travel capture failed", exc_info=True)
+            _LOGGER.debug("Flow-local travel arm failed", exc_info=True)
             return "failed"
         finally:
-            if self._sniff_session_id == session_id:
-                self._sniff_session_id = None
-            if holder is not None:
-                holder.cancel()
-            if unsubscribe is not None:
-                unsubscribe()
-            if not future.done():
-                future.cancel()
-            stop_task = self.hass.async_create_task(
-                mqtt.async_publish(
-                    self.hass,
-                    command_topic,
-                    json.dumps(
-                        {
-                            MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
-                            MQTT_CMD_FIELD_SECONDS: 0,
-                        },
-                        separators=(",", ":"),
-                    ),
-                    qos=1,
-                    retain=False,
+            if not armed:
+                self._measure_session = None
+                await self._async_measure_session_close(session)
+
+    async def _async_measure_finish(
+        self,
+        session: _MeasureSession,
+    ) -> TravelMeasurement | str:
+        """Wait for the armed run's STOP, then always close the session."""
+        try:
+            async with asyncio.timeout(TRAVEL_RUN_TIMEOUT_SECONDS):
+                return await session.future
+        except TimeoutError:
+            return "no_stop"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.debug("Flow-local travel finish failed", exc_info=True)
+            return "failed"
+        finally:
+            self._measure_session = None
+            await self._async_measure_session_close(session)
+
+    async def _async_measure_session_close(self, session: _MeasureSession) -> None:
+        """Tear one listening session down; safe to call more than once."""
+        from homeassistant.components import mqtt
+
+        if session.closed:
+            return
+        session.closed = True
+        if self._sniff_session_id == session.session_id:
+            self._sniff_session_id = None
+        if session.holder is not None:
+            session.holder.cancel()
+        if session.unsubscribe is not None:
+            session.unsubscribe()
+        if not session.future.done():
+            session.future.cancel()
+        stop_task = self.hass.async_create_task(
+            mqtt.async_publish(
+                self.hass,
+                session.command_topic,
+                json.dumps(
+                    {
+                        MQTT_CMD_FIELD_ACTION: MQTT_CMD_ACTION_SNIFF,
+                        MQTT_CMD_FIELD_SECONDS: 0,
+                    },
+                    separators=(",", ":"),
                 ),
-                f"{DOMAIN} travel sniff stop",
-            )
-            stop_task.add_done_callback(
-                functools.partial(_release_capture_owner, owner_key, session_id)
-            )
-            try:
-                with suppress(Exception):
-                    await asyncio.shield(stop_task)
-            finally:
-                if stop_task.done():
-                    _release_capture_owner(owner_key, session_id, stop_task)
+                qos=1,
+                retain=False,
+            ),
+            f"{DOMAIN} travel sniff stop",
+        )
+        stop_task.add_done_callback(
+            functools.partial(_release_capture_owner, session.owner_key, session.session_id)
+        )
+        try:
+            with suppress(Exception):
+                await asyncio.shield(stop_task)
+        finally:
+            if stop_task.done():
+                _release_capture_owner(session.owner_key, session.session_id, stop_task)
 
     @callback
     def async_remove(self) -> None:

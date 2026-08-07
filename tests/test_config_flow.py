@@ -2854,6 +2854,13 @@ async def start_learned_flow_at_cover_step(
     return flow_id
 
 
+def _travel_rx_frame(button: str) -> str:
+    """Synthesize one bridge capture of the calibrated test remote."""
+    return b0_to_b1(
+        encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), button, bases=TEST_BASES))
+    )
+
+
 async def measure_one_direction(
     hass: HomeAssistant,
     fake: FakeMqtt,
@@ -2863,17 +2870,31 @@ async def measure_one_direction(
     start_millis: int,
     stop_millis: int,
 ) -> ConfigFlowResult:
-    """Deliver one direction press and its STOP to an armed measurement."""
+    """Drive one run through both progress phases: press, then STOP.
+
+    Asserts the phase transition the field test asked for: hearing the
+    direction press advances the spinner to a screen that names the heard
+    direction and waits for the STOP.
+    """
     rx = fake.rx_subscriptions()[-1]
-    for button, millis in ((direction, start_millis), ("STOP", stop_millis)):
-        frame = b0_to_b1(
-            encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), button, bases=TEST_BASES))
-        )
-        await fake.emit(
-            rx,
-            "rf433/bridge-a/rx",
-            json.dumps({"frame": frame, "t": millis, "boot": 7}),
-        )
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": _travel_rx_frame(direction), "t": start_millis, "boot": 7}),
+    )
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["step_id"] == "cover_measure_stop"
+    assert result["progress_action"] == "measuring_stop"
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["direction"] == direction
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": _travel_rx_frame("STOP"), "t": stop_millis, "boot": 7}),
+    )
     await hass.async_block_till_done()
     return await hass.config_entries.flow.async_configure(flow_id)
 

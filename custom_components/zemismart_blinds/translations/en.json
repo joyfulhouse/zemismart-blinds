@@ -3,7 +3,8 @@
   "config": {
     "progress": {
       "sniffing": "Capturing on {bridge} for a {action} press on the remote for up to {seconds} seconds",
-      "measuring": "Press {wanted} on the remote for {name}, then press STOP the moment the shade stops moving. Listening on {bridge}."
+      "measuring": "Press {wanted} on the remote for {name} and let the shade run. Listening on {bridge} — this screen advances the moment the press is heard. The remote's channel selector must match this cover's channels exactly.",
+      "measuring_stop": "Heard {direction}. Now press STOP the moment {name} stops moving — that press completes the measurement."
     },
     "step": {
       "user": {
