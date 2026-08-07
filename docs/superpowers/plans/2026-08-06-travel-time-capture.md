@@ -25,9 +25,28 @@
 
 ## Status
 
-Tasks 1-3 are **implemented and committed** (`53feb53`, `a3e208c`, `5b68b9d`), each with the
-full gate green: 27 tests in `tests/test_travel_capture.py`, 938 in the suite,
-ruff and `mypy --strict` clean. Tasks 4-8 remain.
+**All eight tasks are implemented and committed** with the full gate green at
+every commit: `53feb53` (Task 1), `a3e208c` (Task 2), `5b68b9d` (Task 3),
+`841fdda` (Task 4), `748c2df` (Tasks 5-7 together — the steps are only
+reachable through the routing, so they cannot land green separately),
+`e1d1291` (Task 8). Final suite: 944 tests, ruff and `mypy --strict` clean.
+
+Deviations found while executing, beyond the two recorded above:
+
+- The wizard's mid-flight blank-travel probe in
+  `test_wizard_creates_entry_with_data_covers_and_no_subentries` was removed
+  rather than rewritten: routing to measurement leaves that flow with no path
+  back to the cover form short of the 120s arming timeout, and the routing has
+  its own dedicated tests.
+- `test_cover_edit_to_leaf_requires_travel` became
+  `test_cover_edit_to_leaf_with_blank_travel_routes_to_measurement`, and in
+  its bridgeless test environment the observed behavior is the
+  `measure_no_bridge` abandonment back to the edit form — itself a path worth
+  the coverage.
+- `test_cover_edit_merges_and_preserves_unknown_keys_and_cover_id` now submits
+  explicit travel values: it previously leaned on the deleted backfill.
+- A `_consume_measure_error` helper surfaces an abandoned measurement's error
+  exactly once on whichever cover form the flow returns to.
 
 ## File Structure
 
