@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-08-06
+
+### Fixed
+
+- **A group no longer reports nothing because one of its channels has no cover configured.**
+  A group on channels 1–6 — the button the physical remote actually has — with covers for only
+  1–5 published `unknown` position, `unknown` confidence and no open/closed state, permanently.
+  The completeness guard added in 0.7.0 (#32) compared the group's live members against its
+  *full* channel set, and channel 6 was never going to be in that union because nothing on the
+  remote claims it. The result was not caution about the sixth channel; it was silence about the
+  five blinds the group does model. A real kitchen shade group hit this.
+
+  Such a channel is now **unmodelled** and disregarded: the group's position is the
+  channel-weighted mean of the channels its covers do model, `is_closed` is true when those are
+  all closed, and confidence derives from them by the ordinary member ranking. Setting a
+  percentage fans out to the covers that model a channel instead of being refused outright.
+
+  **What is on air does not change.** Open, close and stop still transmit one frame addressed to
+  the group's full configured channel set, so a blind on channel 6 keeps moving with the rest —
+  it simply contributes nothing to what Home Assistant reports about the group, because there is
+  nothing configured to contribute. Each group now publishes an `unmodelled_channels` attribute
+  listing them (empty when there are none), and diagnostics dumps carry it.
+
+  The runtime half of #32 is deliberately untouched: a channel the remote **does** have a cover
+  for, whose entity is not there right now — a cover missing its travel times is skipped at
+  startup — still takes the whole group to no position, no `is_closed` and `unknown`, and still
+  refuses `cover.set_position`. Configured-but-absent and never-configured were treated alike
+  before; only the second is now disregarded. The refusal's message names the channels whose
+  cover is not answering and points at that cover rather than telling you to add one.
+
 ## [0.9.0] - 2026-08-06
 
 ### Fixed

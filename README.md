@@ -144,11 +144,19 @@ Two deliberate boundaries: a travel that completed while Home Assistant was **do
 `anchored` — no listener ran, so a press in that gap was invisible — and `anchored` does not
 survive a restart for the same reason.
 
-A group reports `unknown` whenever any of its members has no position, and whenever its members do
-not between them cover every one of the group's channels — in both cases the group has no position
-at all, and one rule holds throughout: no position means `unknown`. A `suspect` member still
-outranks that, because a blind frozen by a STOP nobody could corroborate says more about the group
-than a sibling merely being blank.
+A group reports `unknown` whenever any of its members has no position, and whenever a cover it is
+configured to contain has no working entity right now (a cover missing its travel times is skipped
+at startup) — in both cases the group has no position at all, and one rule holds throughout: no
+position means `unknown`. A `suspect` member still outranks that, because a blind frozen by a STOP
+nobody could corroborate says more about the group than a sibling merely being blank.
+
+**Channels with no cover configured for them are a different matter.** A group on channels `1,2,3,4,5,6`
+with covers for only `1`–`5` derives its position, its open/closed state and its confidence from
+those five; channel 6 is *unmodelled* and disregarded, because nothing in Home Assistant describes
+it. The group still transmits open, close and stop to all six channels — the physical remote's
+group button always did — so channel 6 keeps moving with the rest; it simply contributes nothing to
+what the group reports. Setting a percentage moves only the covers that model a channel. Each group
+publishes an `unmodelled_channels` attribute listing them, empty when there are none.
 
 `zemismart_blinds.reanchor` drives a cover to a hard endpoint on purpose, which is how you get
 back to `anchored` from `suspect` or `unknown`.
