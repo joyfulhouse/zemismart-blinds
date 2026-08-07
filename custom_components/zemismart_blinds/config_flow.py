@@ -37,6 +37,9 @@ from .codec import (
     infer_action_button,
 )
 from .config_flow_schema import (
+    MEASURE_REQUESTED as MEASURE_REQUESTED,
+)
+from .config_flow_schema import (
     _cover_display_values as _cover_display_values,
 )
 from .config_flow_schema import (
@@ -68,6 +71,12 @@ from .config_flow_schema import (
 )
 from .config_flow_schema import (
     _manual_schema as _manual_schema,
+)
+from .config_flow_schema import (
+    _measure_confirm_schema as _measure_confirm_schema,
+)
+from .config_flow_schema import (
+    _measure_setup_schema as _measure_setup_schema,
 )
 from .config_flow_schema import (
     _reconfigure_edit_schema as _reconfigure_edit_schema,
@@ -596,7 +605,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Append one validated cover row with a fresh identity."""
         entry = self._get_reconfigure_entry()
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         if user_input is not None:
             try:
                 rows = _entry_cover_rows(entry)
@@ -613,6 +622,16 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         }
                     )
                     return self._update_covers_and_abort(rows, "cover_added")
+                if errors.get("base") == MEASURE_REQUESTED:
+                    if self._measure_identity() is None:
+                        errors = {"base": "travel_required"}
+                    else:
+                        self._pending_measure = _PendingMeasure(
+                            origin="add",
+                            name=str(user_input.get(CONF_NAME, "")).strip(),
+                            channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                        )
+                        return await self.async_step_cover_measure_setup()
         return self.async_show_form(
             step_id="cover_add",
             data_schema=self.add_suggested_values_to_schema(
@@ -640,12 +659,50 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_COVER_ID] = "cover_not_found"
             else:
                 self._cover_id = cover_id
-                return await self.async_step_cover_edit()
+                return await self.async_step_cover_edit_menu()
         return self.async_show_form(
             step_id="cover_pick_edit",
             data_schema=_cover_picker_schema(rows),
             errors=errors,
         )
+
+    async def async_step_cover_edit_menu(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer editing this cover's fields or measuring its travel times."""
+        del user_input
+        if self._cover_id is None:
+            return await self.async_step_cover_pick_edit()
+        return self.async_show_menu(
+            step_id="cover_edit_menu",
+            menu_options=["cover_edit", "cover_measure_start"],
+        )
+
+    async def async_step_cover_measure_start(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Begin measuring the already-chosen cover."""
+        del user_input
+        cover_id = self._cover_id
+        if cover_id is None:
+            return await self.async_step_cover_pick_edit()
+        entry = self._get_reconfigure_entry()
+        try:
+            _index, stored = _find_cover_row(_entry_cover_rows(entry), cover_id)
+            cover = CoverConfig.from_stored(cover_id, stored)
+        except _COERCION_ERRORS:
+            return self.async_abort(reason="cover_not_found")
+        if self._measure_identity() is None:
+            return self.async_abort(reason="invalid_config")
+        self._pending_measure = _PendingMeasure(
+            origin="edit",
+            name=cover.name,
+            channels=cover.channels,
+            cover_id=cover_id,
+        )
+        return await self.async_step_cover_measure_setup()
 
     async def async_step_cover_edit(
         self,
@@ -660,18 +717,19 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             index, stored = _find_cover_row(rows, self._cover_id)
         except ValueError:
             return self.async_abort(reason="cover_not_found")
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         suggested: Mapping[str, object] = _cover_display_values(
             self._cover_id,
             stored,
             str(stored.get(CONF_NAME, "")),
         )
         if user_input is not None:
-            merged = dict(user_input)
-            for key in (CONF_TRAVEL_UP, CONF_TRAVEL_DOWN):
-                stored_value = stored.get(key)
-                if key not in merged and stored_value not in (None, ""):
-                    merged[key] = stored_value
+            # No travel backfill from the stored row here, deliberately: this
+            # form arrives pre-filled through _cover_display_values, so an
+            # empty travel field is a user's deliberate clear -- the signal
+            # that requests a measurement -- and restoring the stored value
+            # would make that signal unreachable on the one form where a user
+            # with a wrong travel time actually goes.
             try:
                 existing = _sibling_channel_sets(
                     entry,
@@ -680,7 +738,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ValueError:
                 errors = {"base": "invalid_config"}
             else:
-                cover, errors = _validate_cover_input(merged, existing)
+                cover, errors = _validate_cover_input(user_input, existing)
                 if cover is not None:
                     rows[index] = {
                         **stored,
@@ -688,6 +746,17 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_COVER_ID: self._cover_id,
                     }
                     return self._update_covers_and_abort(rows, "cover_updated")
+                if errors.get("base") == MEASURE_REQUESTED:
+                    if self._measure_identity() is None:
+                        errors = {"base": "travel_required"}
+                    else:
+                        self._pending_measure = _PendingMeasure(
+                            origin="edit",
+                            name=str(user_input.get(CONF_NAME, "")).strip(),
+                            channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                            cover_id=self._cover_id,
+                        )
+                        return await self.async_step_cover_measure_setup()
             suggested = user_input
         return self.async_show_form(
             step_id="cover_edit",
@@ -1209,7 +1278,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Collect one cover: name, channels, and leaf travel times."""
         if self._remote is None or self._covers is None:
             return await self.async_step_user()
-        errors: dict[str, str] = {}
+        errors: dict[str, str] = self._consume_measure_error()
         if user_input is not None:
             cover, errors = _validate_cover_input(
                 user_input,
@@ -1218,6 +1287,16 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if cover is not None:
                 self._covers.append(cover)
                 return await self.async_step_cover_menu()
+            if errors.get("base") == MEASURE_REQUESTED:
+                if self._measure_identity() is None:
+                    errors = {"base": "travel_required"}
+                else:
+                    self._pending_measure = _PendingMeasure(
+                        origin="wizard",
+                        name=str(user_input.get(CONF_NAME, "")).strip(),
+                        channels=parse_channels(user_input.get(CONF_CHANNELS, "")),
+                    )
+                    return await self.async_step_cover_measure_setup()
         suggested: dict[str, object] = {}
         if not self._covers and self._captures:
             reference = next(iter(self._captures.values()))
@@ -1292,6 +1371,275 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # provenance, so this in-memory flag is the only place we know.
         self._identity_is_virtual = True
         return await self.async_step_remote_settings()
+
+    async def async_step_cover_measure_setup(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Choose the bridge that will listen for this cover's run."""
+        pending = self._pending_measure
+        if pending is None or self._measure_identity() is None:
+            return await self._async_measure_abandoned()
+        if self._learn_registry is None:
+            self._learn_registry = await self._async_discover_bridges()
+        if self._learn_registry is None:
+            # Flow-local MQTT discovery failed outright, so no bridge can
+            # listen. Retrying cannot help inside this step; the cover form
+            # still accepts typed times.
+            return await self._async_measure_abandoned(error="measure_no_bridge")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            bridge_id = str(user_input.get(CONF_BRIDGE, "")).strip()
+            try:
+                if bridge_id == _AUTOMATIC_BRIDGE:
+                    bridge_id = self._learn_registry.resolve(self._measure_area_id()).bridge_id
+                else:
+                    self._learn_registry.online_bridge(bridge_id)
+            except NoOnlineBridgeError:
+                errors[CONF_BRIDGE] = "bridge_unavailable"
+            else:
+                pending.bridge = bridge_id
+                return await self.async_step_cover_measure_run()
+
+        return self.async_show_form(
+            step_id="cover_measure_setup",
+            data_schema=_measure_setup_schema(self._learn_registry, user_input),
+            errors=errors,
+            description_placeholders={"name": pending.name},
+        )
+
+    async def async_step_cover_measure_run(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Start one measurement task, then report its transition."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None:
+            return await self._async_measure_abandoned()
+        if self._measure_task is not None and self._measure_task.done():
+            outcome = "failed" if self._measure_task.cancelled() else self._measure_task.result()
+            self._measure_task = None
+            if isinstance(outcome, TravelMeasurement):
+                pending.measured[outcome.direction] = outcome
+                return self.async_show_progress_done(next_step_id="cover_measure_next")
+            self._measure_outcome = outcome
+            return self.async_show_progress_done(next_step_id="cover_measure_timeout")
+
+        if self._measure_task is None:
+            session_id = secrets.token_hex(16)
+            self._sniff_session_id = session_id
+            self._measure_task = self.hass.async_create_task(
+                self._async_capture_travel(session_id, pending.wanted),
+                f"{DOMAIN} travel capture",
+            )
+
+        return self.async_show_progress(
+            step_id="cover_measure_run",
+            progress_action="measuring",
+            progress_task=self._measure_task,
+            description_placeholders={
+                "name": pending.name,
+                "bridge": pending.bridge or "",
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_next(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Report the direction just measured and ask for the other one."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None or not pending.measured:
+            return await self._async_measure_abandoned()
+        if not pending.wanted:
+            return await self.async_step_cover_measure_confirm()
+        last = next(reversed(list(pending.measured.values())))
+        return self.async_show_menu(
+            step_id="cover_measure_next",
+            menu_options=["cover_measure_run", "cover_measure_redo"],
+            description_placeholders={
+                "measured": last.direction,
+                "seconds": f"{last.measured_seconds:.2f}",
+                "stored": str(last.stored_seconds),
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_redo(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Discard the direction just measured and run it again."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None or not pending.measured:
+            return await self._async_measure_abandoned()
+        pending.measured.pop(next(reversed(list(pending.measured))), None)
+        self._measure_task = None
+        self._sniff_session_id = None
+        return await self.async_step_cover_measure_run()
+
+    async def async_step_cover_measure_timeout(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Offer another attempt or typing the times by hand."""
+        del user_input
+        pending = self._pending_measure
+        if pending is None:
+            return await self._async_measure_abandoned()
+        self._measure_task = None
+        self._sniff_session_id = None
+        return self.async_show_menu(
+            step_id="cover_measure_timeout",
+            menu_options=["cover_measure_run", "cover_measure_manual"],
+            description_placeholders={
+                "reason": self._measure_outcome or "failed",
+                "wanted": " or ".join(sorted(pending.wanted)),
+            },
+        )
+
+    async def async_step_cover_measure_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Show what was measured, let it be corrected, then store it.
+
+        A form, not a menu: a config-flow form has one submit, so there is no
+        second "measure again" button here. Correcting a mistimed run is done
+        by typing the right value, and a full redo lives on cover_measure_next.
+        """
+        pending = self._pending_measure
+        if pending is None or pending.wanted:
+            return await self._async_measure_abandoned()
+        measured = {
+            direction: measurement.stored_seconds
+            for direction, measurement in pending.measured.items()
+        }
+        if user_input is not None:
+            return await self._async_store_measured_cover(pending, user_input)
+        return self.async_show_form(
+            step_id="cover_measure_confirm",
+            data_schema=_measure_confirm_schema(measured),
+            description_placeholders={
+                "name": pending.name,
+                "up": f"{pending.measured['UP'].measured_seconds:.2f}",
+                "down": f"{pending.measured['DOWN'].measured_seconds:.2f}",
+            },
+        )
+
+    async def async_step_cover_measure_manual(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Abandon measurement and return to the cover form."""
+        del user_input
+        return await self._async_measure_abandoned()
+
+    async def _async_store_measured_cover(
+        self,
+        pending: _PendingMeasure,
+        user_input: Mapping[str, Any],
+    ) -> ConfigFlowResult:
+        """Write the confirmed cover back where the measurement came from.
+
+        Dispatches on the recorded origin rather than on ``self.source``: the
+        wizard and the reconfigure add path both persist differently, and
+        inferring the destination would let a new entry point silently reuse
+        the wrong one.
+        """
+        fields = {
+            CONF_NAME: pending.name,
+            CONF_CHANNELS: ",".join(str(channel) for channel in pending.channels),
+            CONF_TRAVEL_UP: user_input.get(CONF_TRAVEL_UP),
+            CONF_TRAVEL_DOWN: user_input.get(CONF_TRAVEL_DOWN),
+        }
+        self._pending_measure = None
+        if pending.origin == "wizard":
+            covers = self._covers
+            if covers is None:
+                return await self.async_step_user()
+            cover, errors = _validate_cover_input(
+                fields, [existing.channels for existing in covers]
+            )
+            if cover is None:
+                self._measure_error = errors.get("base", "invalid_config")
+                return await self.async_step_cover()
+            covers.append(cover)
+            return await self.async_step_cover_menu()
+
+        entry = self._get_reconfigure_entry()
+        try:
+            rows = _entry_cover_rows(entry)
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        if pending.origin == "add":
+            try:
+                existing = _sibling_channel_sets(entry)
+            except ValueError:
+                return self.async_abort(reason="invalid_config")
+            cover, errors = _validate_cover_input(fields, existing)
+            if cover is None:
+                self._measure_error = errors.get("base", "invalid_config")
+                return await self.async_step_cover_add()
+            rows.append({CONF_COVER_ID: ulid_now(), **cover.as_dict()})
+            return self._update_covers_and_abort(rows, "cover_added")
+
+        cover_id = pending.cover_id
+        if cover_id is None:
+            return self.async_abort(reason="cover_not_found")
+        try:
+            index, stored = _find_cover_row(rows, cover_id)
+        except ValueError:
+            return self.async_abort(reason="cover_not_found")
+        try:
+            existing = _sibling_channel_sets(entry, exclude_cover_id=cover_id)
+        except ValueError:
+            return self.async_abort(reason="invalid_config")
+        cover, errors = _validate_cover_input(fields, existing)
+        if cover is None:
+            self._measure_error = errors.get("base", "invalid_config")
+            self._cover_id = cover_id
+            return await self.async_step_cover_edit()
+        rows[index] = {**stored, **cover.as_dict(), CONF_COVER_ID: cover_id}
+        return self._update_covers_and_abort(rows, "cover_updated")
+
+    def _consume_measure_error(self) -> dict[str, str]:
+        """Surface an abandoned measurement's error on the cover form, once."""
+        error = self._measure_error
+        self._measure_error = None
+        return {"base": error} if error else {}
+
+    def _measure_area_id(self) -> str:
+        """Return the area whose bridge should listen for this measurement."""
+        if self._learn_area_id is not None:
+            return self._learn_area_id
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            return ""
+        try:
+            return RemoteConfig.from_entry(self._get_reconfigure_entry().data).area_id
+        except _COERCION_ERRORS:
+            return ""
+
+    async def _async_measure_abandoned(
+        self,
+        error: str | None = None,
+    ) -> ConfigFlowResult:
+        """Return to the cover form when measurement cannot continue."""
+        pending = self._pending_measure
+        self._pending_measure = None
+        self._measure_task = None
+        self._sniff_session_id = None
+        self._measure_error = error
+        if pending is None or pending.origin == "wizard":
+            return await self.async_step_cover()
+        if pending.origin == "add":
+            return await self.async_step_cover_add()
+        return await self.async_step_cover_edit()
 
     async def _async_discover_bridges(self) -> BridgeRegistry | None:
         """Collect retained discovery state without relying on a loaded hub."""

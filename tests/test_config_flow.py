@@ -592,14 +592,18 @@ def test_manual_identity_rejects_wrong_identity_reference() -> None:
         )
 
 
-def test_validate_cover_input_travel_required_for_born_leaf() -> None:
-    """A cover that contains no collected cover must supply both travel times."""
+def test_validate_cover_input_blank_travel_requests_measurement() -> None:
+    """Blank travel on a born leaf is the measurement-request sentinel.
+
+    Callers route it to the capture flow, and only a caller that cannot
+    measure (no calibrated physical identity) renders it as travel_required.
+    """
     cover, errors = config_flow_module._validate_cover_input(
         {CONF_NAME: "Sink", CONF_CHANNELS: "5"},
         [],
     )
     assert cover is None
-    assert errors == {"base": "travel_required"}
+    assert errors == {"base": config_flow_module.MEASURE_REQUESTED}
 
 
 def test_validate_cover_input_laminar_errors() -> None:
@@ -914,11 +918,8 @@ async def test_wizard_creates_entry_with_data_covers_and_no_subentries(
     assert error_suggestions[CONF_TRAVEL_DOWN] == 9
     assert CONF_TRAVEL_UP not in error_schema({})
     assert CONF_TRAVEL_DOWN not in error_schema({})
-    result = await hass.config_entries.flow.async_configure(
-        flow_id,
-        {CONF_NAME: "Sink", CONF_CHANNELS: "5"},
-    )
-    assert result["errors"] == {"base": "travel_required"}
+    # Blank travel on this calibrated wizard now routes to measurement
+    # rather than erroring in place; that path has its own tests.
     result = await hass.config_entries.flow.async_configure(
         flow_id,
         {CONF_NAME: "Kitchen shades", CONF_CHANNELS: "1,2,3"},
@@ -1677,6 +1678,11 @@ async def test_cover_edit_prefills_display_values(
         result["flow_id"],
         {CONF_COVER_ID: slider[CONF_COVER_ID]},
     )
+    assert result["step_id"] == "cover_edit_menu"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_edit"},
+    )
     schema = result["data_schema"]
     assert schema is not None
     suggested = schema_suggested_values(schema)
@@ -1737,9 +1743,19 @@ async def test_cover_edit_merges_and_preserves_unknown_keys_and_cover_id(
         result["flow_id"],
         {CONF_COVER_ID: cover_id},
     )
+    assert result["step_id"] == "cover_edit_menu"
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        {CONF_NAME: "Renamed slider", CONF_CHANNELS: "1,2,3"},
+        {"next_step_id": "cover_edit"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_NAME: "Renamed slider",
+            CONF_CHANNELS: "1,2,3",
+            CONF_TRAVEL_UP: 12,
+            CONF_TRAVEL_DOWN: 12,
+        },
     )
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "cover_updated"
@@ -1753,11 +1769,11 @@ async def test_cover_edit_merges_and_preserves_unknown_keys_and_cover_id(
 
 
 @pytest.mark.asyncio
-async def test_cover_edit_to_leaf_requires_travel(
+async def test_cover_edit_to_leaf_with_blank_travel_routes_to_measurement(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reconfigured leaf needs submitted or previously stored travel times."""
+    """A reconfigured leaf with blank travel is asked which bridge to measure on."""
     entry = await create_remote_entry(
         hass,
         monkeypatch,
@@ -1781,12 +1797,21 @@ async def test_cover_edit_to_leaf_requires_travel(
         result["flow_id"],
         {CONF_COVER_ID: aggregate[CONF_COVER_ID]},
     )
+    assert result["step_id"] == "cover_edit_menu"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"next_step_id": "cover_edit"},
+    )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
         {CONF_NAME: "Solo", CONF_CHANNELS: "6"},
     )
-    assert result["type"] is FlowResultType.FORM
-    assert result["errors"] == {"base": "travel_required"}
+    # Becoming a leaf with blank travel is now a measurement request. This
+    # test environment has no reachable bridge (flow-local MQTT discovery
+    # fails), so the flow lands back on the edit form explaining that typed
+    # times are the only option -- not on the old travel_required error.
+    assert result["step_id"] == "cover_edit"
+    assert result["errors"] == {"base": "measure_no_bridge"}
 
 
 @pytest.mark.parametrize("registry_state", ("enabled", "disabled", "missing"))
@@ -2782,3 +2807,335 @@ def test_derivation_falls_back_to_a_later_usable_capture() -> None:
     # Measured values are kept verbatim; only STOP comes from the fallback.
     assert identity.bases.up == untabled_up.base
     assert identity.bases.down == tabled_down.base
+
+
+async def start_learned_flow_at_cover_step(
+    hass: HomeAssistant,
+    fake: FakeMqtt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Walk one Learn wizard to the cover form and return its flow id.
+
+    Extracted from the Learn happy-path tests: arm on bridge-a, capture all
+    three actions, accept the calibration, and submit remote settings.
+    """
+    prepare_config_flow(hass, monkeypatch)
+    install_mqtt(monkeypatch, fake)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Sunroom remote",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: "bridge-a",
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    result = await learn_all_three_actions(hass, fake, flow_id)
+    assert result["step_id"] == "learn_confirm"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "remote_settings"},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Sunroom remote",
+            CONF_AREA_ID: "living_room",
+            ADVANCED_SECTION: {
+                CONF_REPEATS: 5,
+                CONF_COALESCE_WINDOW_MS: 150,
+            },
+        },
+    )
+    assert result["step_id"] == "cover"
+    return flow_id
+
+
+async def measure_one_direction(
+    hass: HomeAssistant,
+    fake: FakeMqtt,
+    flow_id: str,
+    direction: str,
+    *,
+    start_millis: int,
+    stop_millis: int,
+) -> ConfigFlowResult:
+    """Deliver one direction press and its STOP to an armed measurement."""
+    rx = fake.rx_subscriptions()[-1]
+    for button, millis in ((direction, start_millis), ("STOP", stop_millis)):
+        frame = b0_to_b1(
+            encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), button, bases=TEST_BASES))
+        )
+        await fake.emit(
+            rx,
+            "rf433/bridge-a/rx",
+            json.dumps({"frame": frame, "t": millis, "boot": 7}),
+        )
+    await hass.async_block_till_done()
+    return await hass.config_entries.flow.async_configure(flow_id)
+
+
+@pytest.mark.asyncio
+async def test_blank_travel_measures_both_directions(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cover submitted with no travel times is measured from the remote."""
+    fake = FakeMqtt()
+    flow_id = await start_learned_flow_at_cover_step(hass, fake, monkeypatch)
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {CONF_NAME: "Sunroom shade", CONF_CHANNELS: "1,2"},
+    )
+    assert result["step_id"] == "cover_measure_setup"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {CONF_BRIDGE: config_flow_module._AUTOMATIC_BRIDGE}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["progress_action"] == "measuring"
+    await fake.wait_for_publications(7)
+
+    result = await measure_one_direction(
+        hass,
+        fake,
+        flow_id,
+        "DOWN",
+        start_millis=1_000,
+        stop_millis=15_310,
+    )
+    assert result["step_id"] == "cover_measure_next"
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["measured"] == "DOWN"
+    assert placeholders["stored"] == "15"
+    assert placeholders["wanted"] == "UP"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "cover_measure_run"}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(9)
+    result = await measure_one_direction(
+        hass,
+        fake,
+        flow_id,
+        "UP",
+        start_millis=20_000,
+        stop_millis=36_080,
+    )
+    assert result["step_id"] == "cover_measure_confirm"
+    schema = result["data_schema"]
+    assert schema is not None
+    defaults = schema({})
+    assert defaults[CONF_TRAVEL_DOWN] == 15
+    assert defaults[CONF_TRAVEL_UP] == 17
+
+    result = await hass.config_entries.flow.async_configure(flow_id, dict(defaults))
+    assert result["step_id"] == "cover_menu"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {"next_step_id": "finish"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    row = stored_cover_rows(result["result"])[0]
+    restored = CoverConfig.from_stored(str(row[CONF_COVER_ID]), row)
+    assert restored.travel_down == 15.0
+    assert restored.travel_up == 17.0
+
+
+@pytest.mark.asyncio
+async def test_no_press_reaches_the_timeout_menu(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hearing nothing at all is reported as its own failure, not a bad run."""
+    monkeypatch.setattr(config_flow_module, "TRAVEL_ARM_TIMEOUT_SECONDS", 0.001)
+    fake = FakeMqtt()
+    flow_id = await start_learned_flow_at_cover_step(hass, fake, monkeypatch)
+    await hass.config_entries.flow.async_configure(
+        flow_id, {CONF_NAME: "Sunroom shade", CONF_CHANNELS: "1,2"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {CONF_BRIDGE: config_flow_module._AUTOMATIC_BRIDGE}
+    )
+    while result["type"] is FlowResultType.SHOW_PROGRESS:
+        await hass.async_block_till_done()
+        result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["step_id"] == "cover_measure_timeout"
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["reason"] == "no_press"
+
+
+@pytest.mark.asyncio
+async def test_remeasure_menu_updates_a_stored_cover(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The edit menu's re-measure path writes new travel into the stored row."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 10,
+                CONF_TRAVEL_DOWN: 10,
+            }
+        ],
+    )
+    slider = stored_cover_rows(entry)[0]
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_reconfigure_flow(hass, entry)
+    flow_id = result["flow_id"]
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "cover_pick_edit"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {CONF_COVER_ID: slider[CONF_COVER_ID]}
+    )
+    assert result["step_id"] == "cover_edit_menu"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "cover_measure_start"}
+    )
+    assert result["step_id"] == "cover_measure_setup"
+    result = await hass.config_entries.flow.async_configure(flow_id, {CONF_BRIDGE: "bridge-a"})
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    result = await measure_one_direction(
+        hass, fake, flow_id, "DOWN", start_millis=1_000, stop_millis=13_500
+    )
+    assert result["step_id"] == "cover_measure_next"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "cover_measure_run"}
+    )
+    await fake.wait_for_publications(3)
+    result = await measure_one_direction(
+        hass, fake, flow_id, "UP", start_millis=20_000, stop_millis=34_100
+    )
+    assert result["step_id"] == "cover_measure_confirm"
+    schema = result["data_schema"]
+    assert schema is not None
+    result = await hass.config_entries.flow.async_configure(flow_id, dict(schema({})))
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cover_updated"
+    updated = stored_cover_rows(entry)[0]
+    assert updated[CONF_COVER_ID] == slider[CONF_COVER_ID]
+    restored = CoverConfig.from_stored(str(updated[CONF_COVER_ID]), updated)
+    assert restored.travel_down == 13.0
+    assert restored.travel_up == 15.0
+
+
+@pytest.mark.asyncio
+async def test_an_aggregate_cover_is_never_measured(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cover that aggregates its siblings carries no travel by design."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Left",
+                CONF_CHANNELS: "1",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 13,
+            }
+        ],
+    )
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cover_add"}
+    )
+    # Channels 1,2 strictly contain the stored leaf on channel 1, so this row
+    # is born_aggregate: blank travel is correct there, not a measurement
+    # request.
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_NAME: "Both", CONF_CHANNELS: "1,2"}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "cover_added"
+    added = next(row for row in stored_cover_rows(entry) if row[CONF_CHANNELS] == [1, 2])
+    assert CoverConfig.from_stored(str(added[CONF_COVER_ID]), added).travel_up is None
+
+
+@pytest.mark.asyncio
+async def test_clearing_travel_on_edit_routes_to_measurement(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The edit form's backfill must not resurrect the stored value.
+
+    The form arrives pre-filled, so an empty field there is a deliberate
+    clear. Restoring it made re-measurement unreachable from the one screen
+    where a user with a wrong travel time actually goes.
+    """
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 12,
+                CONF_TRAVEL_DOWN: 13,
+            }
+        ],
+    )
+    slider = stored_cover_rows(entry)[0]
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_reconfigure_flow(hass, entry)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cover_pick_edit"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_COVER_ID: slider[CONF_COVER_ID]}
+    )
+    assert result["step_id"] == "cover_edit_menu"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "cover_edit"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_NAME: "Slider", CONF_CHANNELS: "1,2"}
+    )
+    assert result["step_id"] == "cover_measure_setup"
+
+
+@pytest.mark.asyncio
+async def test_a_virtual_remote_still_refuses_blank_travel(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthesized identity cannot be measured, so blank travel stays an error.
+
+    Nothing physical transmits a virtual remote's identity, so every press
+    would fail to match and the user would wait out the arming deadline to
+    learn that. The wizard knows in memory that it allocated this identity.
+    """
+    prepare_config_flow(hass, monkeypatch)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "advanced"})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "virtual"})
+    await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Virtual remote",
+            CONF_AREA_ID: "kitchen",
+            ADVANCED_SECTION: {CONF_REPEATS: 5, CONF_COALESCE_WINDOW_MS: 150},
+        },
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {CONF_NAME: "Shade", CONF_CHANNELS: "1"}
+    )
+    assert result["step_id"] == "cover"
+    assert result["errors"] == {"base": "travel_required"}

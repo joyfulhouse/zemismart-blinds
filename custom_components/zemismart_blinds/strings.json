@@ -2,7 +2,8 @@
   "title": "Zemismart Blinds",
   "config": {
     "progress": {
-      "sniffing": "Capturing on {bridge} for a {action} press on the remote for up to {seconds} seconds"
+      "sniffing": "Capturing on {bridge} for a {action} press on the remote for up to {seconds} seconds",
+      "measuring": "Press {wanted} on the remote for {name}, then press STOP the moment the shade stops moving. Listening on {bridge}."
     },
     "step": {
       "user": {
@@ -208,6 +209,44 @@
       "cover_remove_confirm": {
         "title": "Remove cover",
         "description": "Remove {name} ({cover_id})? Its entity registry row and stored configuration will be deleted."
+      },
+      "cover_measure_setup": {
+        "title": "Measure travel time",
+        "description": "Pick the bridge that will listen while you run {name} with its remote. Automatic uses the bridge for this device's area.",
+        "data": {
+          "bridge": "Bridge"
+        }
+      },
+      "cover_measure_next": {
+        "title": "{measured} measured",
+        "description": "{measured} took {seconds} s, which will be stored as {stored} s.\n\nNow press {wanted} on the remote, then press STOP the moment the shade stops moving.",
+        "menu_options": {
+          "cover_measure_run": "I'm ready, listen for {wanted}",
+          "cover_measure_redo": "Redo {measured}"
+        }
+      },
+      "cover_measure_timeout": {
+        "title": "Nothing measured",
+        "description": "The run did not complete ({reason}). Check that the remote drives this shade's channels, that you are in range of the bridge, and that you press STOP after the shade stops moving.\n\nA remote created by the new_virtual_remote service cannot be measured this way, because no physical remote transmits its identity.",
+        "menu_options": {
+          "cover_measure_run": "Try {wanted} again",
+          "cover_measure_manual": "Type the times instead"
+        }
+      },
+      "cover_measure_confirm": {
+        "title": "Confirm travel times for {name}",
+        "description": "Measured: down {down} s, up {up} s. Stored values are rounded up, because pressing STOP after the shade arrives always measures a little long and a generous time simply stalls the motor at its own limit.\n\nCorrect either value before saving.",
+        "data": {
+          "travel_up": "Travel up",
+          "travel_down": "Travel down"
+        }
+      },
+      "cover_edit_menu": {
+        "title": "Edit cover",
+        "menu_options": {
+          "cover_edit": "Edit name, channels and travel times",
+          "cover_measure_start": "Measure travel times with the remote"
+        }
       }
     },
     "error": {
@@ -217,7 +256,8 @@
       "travel_required": "Enter both travel times — only a group containing existing covers can omit them.",
       "duplicate_channels": "Another cover of this remote already uses exactly these channels.",
       "overlapping_channels": "Channels may be fully inside, fully containing, or separate from another cover — never partially overlapping.",
-      "cover_not_found": "Choose a cover that still exists."
+      "cover_not_found": "Choose a cover that still exists.",
+      "measure_no_bridge": "No bridge could be reached to listen for the remote. Enter the travel times manually."
     },
     "abort": {
       "already_configured": "This remote is already configured.",
