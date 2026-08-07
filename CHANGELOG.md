@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Travel measurement now reacts visibly to each press.** The single spinner that ran from
+  arming to STOP is split into two phases: the first screen advances the moment a direction
+  press is heard, and a second screen names the heard direction ("Heard DOWN — press STOP the
+  moment the shade stops moving") and completes on the STOP. Field-tested feedback: one opaque
+  spinner made "measuring" indistinguishable from "nothing matched".
+- **Rejected frames are now logged.** Every press the capture discards says why at debug level —
+  wrong remote, wrong channel set (the remote's channel selector must match the cover's stored
+  channels exactly), unmatched base, a STOP with no run open, or a run whose clocks could not be
+  compared. Previously all of these were silent, which made a stuck measurement undiagnosable.
+
 ## [0.9.3] - 2026-08-06
 
 ### Changed
