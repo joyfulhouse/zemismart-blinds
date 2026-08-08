@@ -75,12 +75,18 @@ class HeardPress:
 
 @dataclass(frozen=True, slots=True)
 class TimedPress:
-    """One accepted press: which button, and when the bridge heard it."""
+    """One accepted press: which button, when, and which bridge heard it.
+
+    ``bridge_id`` is ``None`` only for payloads with no attribution (the pure
+    unit tests, or a caller that listens on a single known bridge); fleet
+    listening always attributes, because two bridges' clocks share no epoch.
+    """
 
     button: str
     boot: int | None
     bridge_millis: int | None
     received_at_monotonic: float
+    bridge_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,8 +109,17 @@ def interval_seconds(start: TimedPress, stop: TimedPress) -> float | None:
     A bridge that rebooted mid-run restarted ``t`` near zero, which reads as a
     backwards delta and is rejected by the half-modulus guard even when the
     payload carries no ``boot`` to compare.
+
+    Two DIFFERENT bridges' ``t`` counters share no epoch, and their ``boot``
+    counters can collide by coincidence, so the bridge clock is used only when
+    both frames were heard by the same bridge; a cross-bridge pair falls back
+    to the monotonic receive times like a frame with no ``t`` at all.
     """
-    if start.bridge_millis is not None and stop.bridge_millis is not None:
+    if (
+        start.bridge_millis is not None
+        and stop.bridge_millis is not None
+        and start.bridge_id == stop.bridge_id
+    ):
         if start.boot is not None and stop.boot is not None and start.boot != stop.boot:
             return None
         delta = (stop.bridge_millis - start.bridge_millis) % _UINT32_MODULUS
@@ -246,12 +261,17 @@ class TravelRun:
     channels: tuple[int, ...]
     wanted: frozenset[str]
     started: TimedPress | None = None
+    # The first copy of the CURRENT press each bridge heard. Fleet listening
+    # delivers one physical press from several bridges; timing a run on one
+    # bridge's clock requires knowing when THAT bridge heard the start.
+    starts: dict[str, TimedPress] = field(default_factory=dict)
     heard: list[HeardPress] = field(default_factory=list)
 
     def offer_payload(
         self,
         payload: Mapping[str, object],
         received_at_monotonic: float,
+        bridge_id: str | None = None,
     ) -> TravelMeasurement | None:
         """Feed one RX payload in; return a measurement when a run closes."""
         frame = payload.get(MQTT_RX_FIELD_FRAME)
@@ -270,6 +290,7 @@ class TravelRun:
             boot=_uint32(payload.get(MQTT_RX_FIELD_BOOT)),
             bridge_millis=_uint32(payload.get(MQTT_RX_FIELD_T)),
             received_at_monotonic=received_at_monotonic,
+            bridge_id=bridge_id,
         )
         if button in DIRECTIONS:
             self._open(press)
@@ -294,6 +315,12 @@ class TravelRun:
             and press.received_at_monotonic - started.received_at_monotonic
             <= TRAVEL_BURST_WINDOW_SECONDS
         ):
+            # Another copy of the SAME press: a repeat of the burst on the
+            # bridge that opened the run, or a different bridge hearing it.
+            # Stamp that bridge's first copy so a STOP heard there can be
+            # timed on one clock, but never re-anchor the run itself.
+            if press.bridge_id is not None:
+                self.starts.setdefault(press.bridge_id, press)
             return
         if started is not None:
             _LOGGER.debug(
@@ -304,9 +331,16 @@ class TravelRun:
         else:
             _LOGGER.debug("travel: run opened on %s", press.button)
         self.started = press
+        self.starts = {press.bridge_id: press} if press.bridge_id is not None else {}
 
     def _close(self, press: TimedPress) -> TravelMeasurement | None:
-        """Resolve a STOP against the open run, if there is one."""
+        """Resolve a STOP against the open run, if there is one.
+
+        Timed on the STOP bridge's own start stamp when that bridge heard the
+        press too; otherwise against the earliest start, which
+        ``interval_seconds`` then times on the monotonic receive clocks --
+        cross-bridge ``t`` subtraction is never meaningful.
+        """
         started = self.started
         if started is None:
             _LOGGER.debug(
@@ -314,7 +348,10 @@ class TravelRun:
                 "was never heard, or a previous STOP already closed the run"
             )
             return None
+        if press.bridge_id is not None:
+            started = self.starts.get(press.bridge_id, started)
         self.started = None
+        self.starts = {}
         elapsed = interval_seconds(started, press)
         if elapsed is None:
             _LOGGER.debug(

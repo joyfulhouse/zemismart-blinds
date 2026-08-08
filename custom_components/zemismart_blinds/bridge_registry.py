@@ -150,6 +150,19 @@ class BridgeRegistry:
         msg = "no RF433 bridge is online"
         raise NoOnlineBridgeError(msg)
 
+    def online_bridge_ids(self) -> tuple[str, ...]:
+        """Return every online bridge, for a fleet-wide listening session.
+
+        A single bridge hears a remote only ~30% of the time while its peers
+        hear nearly every press (#57), so capture flows listen on all of
+        them; TX still resolves exactly one bridge through ``resolve``.
+        """
+        online = tuple(bridge.bridge_id for bridge in self.bridges if bridge.online)
+        if not online:
+            msg = "no RF433 bridge is online"
+            raise NoOnlineBridgeError(msg)
+        return online
+
     def is_known_offline(self, bridge_id: str) -> bool:
         """Return whether this bridge has EXPLICITLY reported itself offline.
 

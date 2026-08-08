@@ -1,7 +1,7 @@
 # Fleet-wide capture listening: every online bridge hears the remote
 
 Date: 2026-08-07
-Status: approved design
+Status: implemented as designed
 Branch: `feat/fleet-wide-capture-listen`
 Issue: #57
 
@@ -216,3 +216,19 @@ Flow (`tests/test_config_flow.py`):
 Frames are synthesized through the codec; never pasted from house captures.
 Every new test must fail with the fleet-wide change reverted (mutation
 check).
+
+### As built
+
+Everything above landed as designed, with one testing-shape change worth
+recording:
+
+- The own-emission check is covered by driving `_handle_travel_message`
+  directly on two bridge ids rather than through a full measure flow. Proving
+  a negative through the flow means waiting out `TRAVEL_ARM_TIMEOUT_SECONDS`
+  (30 s) to distinguish "the echo was ignored" from "the run has not armed
+  yet"; the handler-level test is deterministic and is the shape the Learn
+  wizard's equivalent echo test already uses.
+- Two mutation-check targets fall outside a whole-feature revert, because
+  pre-#57 code also satisfies them: "an explicit pick must not widen to the
+  fleet" and the burst/close guards the run machine already had. Those are
+  covered by targeted mutations instead (see the PR).

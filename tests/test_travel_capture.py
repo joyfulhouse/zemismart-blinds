@@ -374,3 +374,80 @@ def test_the_own_trailer_burst_is_not_recorded() -> None:
     }
     assert run.offer_payload(trailer, 100.0) is None
     assert run.heard == []
+
+
+def test_a_second_bridge_copy_of_the_press_does_not_reanchor_the_run() -> None:
+    """The same physical press heard by two bridges opens ONE run.
+
+    Fleet listening delivers a press once per bridge that heard it. A later
+    copy from another bridge lands inside the burst window and must be
+    absorbed exactly like the burst's own repeats -- re-anchoring on it would
+    silently shorten the measurement by the inter-bridge delivery skew.
+    """
+    run = run_for()
+    assert run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a") is None
+    assert run.offer_payload(rx("DOWN", 40_500), 100.04, bridge_id="bridge-b") is None
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, "bridge-a's own clock must time the run"
+
+
+def test_a_stop_heard_only_by_another_bridge_falls_back_to_monotonic() -> None:
+    """The Kaelyn case: the opening bridge never hears the STOP.
+
+    The STOP bridge carries a ``t`` and even the same ``boot`` number, but its
+    clock shares no epoch with the bridge that heard the press, so the run
+    must be timed on the monotonic receive times instead.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    measurement = run.offer_payload(rx("STOP", 900_000), 114.5, bridge_id="bridge-b")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.5, "cross-bridge t subtraction is meaningless"
+
+
+def test_a_stop_prefers_its_own_bridges_start_stamp() -> None:
+    """A bridge that heard both frames times the run on its own clock.
+
+    The run was opened by bridge-a's copy, but the STOP arrives on bridge-b,
+    which also heard the press 80 ms later. bridge-b's own stamp pair is the
+    precise measurement; the earliest-start monotonic fallback is not needed.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    run.offer_payload(rx("DOWN", 50_080), 100.08, bridge_id="bridge-b")
+    measurement = run.offer_payload(rx("STOP", 64_390), 114.4, bridge_id="bridge-b")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31
+
+
+def test_a_restart_clears_the_other_bridges_start_stamps() -> None:
+    """A restarted run must not time its STOP against a stale first press.
+
+    bridge-b heard the ABANDONED press and not the restart. Its stale stamp
+    would time the run from 30 s ago; only clearing the map on restart leaves
+    the monotonic fallback to bound it from the press that actually opened
+    the run. The two answers are deliberately far apart -- a stale stamp that
+    happened to agree would prove nothing.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    run.offer_payload(rx("DOWN", 50_000), 100.05, bridge_id="bridge-b")
+    # Outside the burst window: the user started over.
+    run.offer_payload(rx("DOWN", 5_000), 104.0, bridge_id="bridge-a")
+    measurement = run.offer_payload(rx("STOP", 80_000), 118.5, bridge_id="bridge-b")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.5, (
+        "bridge-b never heard the restart, so its stale stamp must be gone "
+        "and the run timed monotonically from the restart press -- keeping it "
+        "would have read 30.0s off bridge-b's own clock"
+    )
+
+
+def test_a_second_bridges_stop_copy_after_the_close_is_ignored() -> None:
+    """One physical STOP heard twice closes the run exactly once."""
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    first = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert first is not None
+    assert run.offer_payload(rx("STOP", 55_400), 114.35, bridge_id="bridge-b") is None

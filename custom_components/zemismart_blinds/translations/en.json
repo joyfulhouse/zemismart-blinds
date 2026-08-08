@@ -24,7 +24,7 @@
           "bridge": "RF bridge"
         },
         "data_description": {
-          "bridge": "Automatic matches the selected area, then the configured default, then the first online bridge. Choose a named online bridge to override it."
+          "bridge": "Automatic listens on every online bridge at once — a single bridge hears a remote only part of the time. Choose a named online bridge to listen on that bridge alone."
         }
       },
       "learn_unavailable": {
@@ -213,7 +213,7 @@
       },
       "cover_measure_setup": {
         "title": "Measure travel time",
-        "description": "Pick the bridge that will listen while you run {name} with its remote. Automatic uses the bridge for this device's area.",
+        "description": "Pick which bridges will listen while you run {name} with its remote. Automatic listens on every online bridge at once; choosing a named bridge listens on that bridge alone.",
         "data": {
           "bridge": "Bridge"
         }
