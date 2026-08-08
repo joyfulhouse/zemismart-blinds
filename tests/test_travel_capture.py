@@ -8,6 +8,7 @@ real remote's replayable command material entering the repository.
 from __future__ import annotations
 
 from custom_components.zemismart_blinds.codec import (
+    DEFAULT_BUCKETS,
     CommandBases,
     encode_b0,
     infer_action_button,
@@ -16,6 +17,7 @@ from custom_components.zemismart_blinds.codec import (
 from custom_components.zemismart_blinds.config_models import MAX_TRAVEL_SECONDS, RemoteIdentity
 from custom_components.zemismart_blinds.const import TRAVEL_BURST_WINDOW_SECONDS
 from custom_components.zemismart_blinds.travel_capture import (
+    _HEARD_CAP,
     TimedPress,
     TravelRun,
     identify_button,
@@ -39,10 +41,28 @@ def b1_frame(
     channels: tuple[int, ...],
     button: str,
     bases: CommandBases,
+    *,
+    buckets: str = DEFAULT_BUCKETS,
 ) -> str:
-    """Synthesize one bridge RX capture for a press we choose."""
-    body = encode_b0(make_payload(prefix, remote_id, channels, button, bases=bases))[6:-2]
+    """Synthesize one bridge RX capture for a press we choose.
+
+    ``buckets`` are the pulse widths the receiving bridge MEASURED, so two
+    bridges' captures of one physical press differ here and nowhere else --
+    which is the whole reason a raw-frame comparison cannot deduplicate them.
+    """
+    payload = make_payload(prefix, remote_id, channels, button, bases=bases)
+    body = encode_b0(payload, buckets)[6:-2]
     return f"AAB1{body[:2]}{body[4:]}3855"
+
+
+def as_measured_by(index: int) -> str:
+    """Return one bridge's own reading of the standard OEM pulse widths.
+
+    Real captures of one burst differ by a few microseconds per bridge; only
+    the long-bit bucket is varied here, well inside the codec's short/long
+    thresholds, so every variant decodes to the same press.
+    """
+    return f"1414{0x0264 + index:04X}01181414"
 
 
 def test_identify_button_matches_each_calibrated_base() -> None:
@@ -549,10 +569,123 @@ def test_a_signature_separates_remotes_and_channels_not_just_buttons() -> None:
     assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP") != base
 
 
-def test_a_second_bridges_stop_copy_after_the_close_is_ignored() -> None:
-    """One physical STOP heard twice closes the run exactly once."""
+def test_a_stale_stop_copy_cannot_close_a_newly_reopened_run() -> None:
+    """A lagging copy of an OLD stop must not close the run that replaced it.
+
+    After the close, ``started`` is None, so a duplicate STOP arriving with
+    nothing open is refused by the run machine whatever the repeat filter says.
+    The filter's real job is this: a run too fast to store closes, the user
+    presses again, and a bridge under backpressure then delivers its copy of
+    the FIRST stop into the second run -- which would end it after the fraction
+    of a second between the two presses and hand the wizard nothing again.
+    """
     run = run_for()
     run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
-    first = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
-    assert first is not None
-    assert run.offer_payload(rx("STOP", 55_400), 114.35, bridge_id="bridge-b") is None
+    assert run.offer_payload(rx("STOP", 1_500), 100.5, bridge_id="bridge-a") is None, (
+        "half a second is too fast to store, so the run closes with no measurement"
+    )
+    assert run.offer_payload(rx("DOWN", 2_000), 101.0, bridge_id="bridge-a") is None
+    assert run.started is not None, "the re-press must open a second run"
+    assert run.offer_payload(rx("STOP", 900_000), 101.6, bridge_id="bridge-b") is None
+    assert run.started is not None, "the lagging copy of the FIRST stop closes nothing"
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.0, "the second run is timed from its own press"
+
+
+def test_a_superseded_directions_late_copy_never_reanchors_the_run() -> None:
+    """A direction the run has ALREADY been anchored on cannot anchor it again.
+
+    The user starts the shade DOWN, changes their mind and presses UP, and a
+    bridge lagging by seconds -- the observed envelope -- then delivers its copy
+    of the DOWN burst that UP replaced. Nothing in the frames separates that
+    copy from a fresh press, so re-anchoring on it times a run the shade never
+    made and stores it under the WRONG DIRECTION (#57).
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    assert run.offer_payload(rx("UP", 3_000), 102.0, bridge_id="bridge-a") is None
+    assert run.started is not None
+    assert run.started.button == "UP", "the mind-change restart is the one the wizard needs"
+    assert run.offer_payload(rx("DOWN", 600_000), 102.5, bridge_id="bridge-b") is None
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "UP", "the shade ran UP; the stale DOWN copy is not a run"
+    assert measurement.measured_seconds == 13.0
+
+
+def test_both_directions_bursts_arriving_interleaved_keep_the_second_press() -> None:
+    """The fleet delivers both bursts mixed together; the run stays on the last.
+
+    Every bridge that heard the abandoned DOWN press and the UP press that
+    replaced it delivers its own copies, so the two bursts arrive interleaved
+    and the last frame in is a DOWN. The run must still be the UP one, anchored
+    at the FIRST copy of that press.
+    """
+    run = run_for()
+    arrivals = (
+        ("DOWN", "bridge-a", 100.0),
+        ("DOWN", "bridge-b", 100.1),
+        ("UP", "bridge-a", 100.6),
+        ("DOWN", "bridge-c", 100.7),
+        ("UP", "bridge-b", 100.8),
+        ("DOWN", "bridge-b", 101.4),
+        ("UP", "bridge-c", 102.2),
+        ("DOWN", "bridge-c", 103.9),
+    )
+    for button, bridge, received_at in arrivals:
+        assert (
+            run.offer_payload(
+                rx(button, round(received_at * 1_000)),
+                received_at,
+                bridge_id=bridge,
+            )
+            is None
+        )
+    assert run.started is not None
+    assert run.started.button == "UP"
+    assert run.started.received_at_monotonic == 100.6, "anchored at the first UP copy"
+    measurement = run.offer_payload(rx("STOP", 115_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "UP"
+    assert measurement.measured_seconds == 14.4
+
+
+def test_one_foreign_press_heard_by_the_fleet_leaves_room_for_the_next() -> None:
+    """Fleet copies of ONE press must not fill the mismatch list (#57).
+
+    Each bridge reports the pulse widths it measured, so their captures of one
+    press differ byte for byte while decoding identically. Deduplicating on the
+    raw frame therefore counted every bridge's copy as a new press: nine copies
+    exhausted the cap, the NEXT remote to press was dropped, and the timeout
+    screen offered one-click adoption of the only remote it could still see.
+    """
+    run = run_for()
+    for index in range(_HEARD_CAP + 1):
+        heard_by_one_bridge = {
+            "frame": b1_frame(
+                UNTABLED_PREFIX,
+                UNTABLED_REMOTE_ID,
+                (1, 2),
+                "DOWN",
+                UNTABLED_BASES,
+                buckets=as_measured_by(index),
+            ),
+            "t": 1_000 + index,
+            "boot": 7,
+        }
+        assert (
+            run.offer_payload(heard_by_one_bridge, 100.0 + index * 0.05, f"bridge-{index}") is None
+        )
+    assert len(run.heard) == 1, "one press, however many bridges measured it"
+
+    second_remote = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", TEST_BASES),
+        "t": 2_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(second_remote, 101.0, "bridge-0") is None
+    assert [(press.prefix, press.remote_id) for press in run.heard] == [
+        (UNTABLED_PREFIX, UNTABLED_REMOTE_ID),
+        (TEST_PREFIX, TEST_REMOTE_ID),
+    ], "the remote that pressed next is still there to be named"

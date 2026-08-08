@@ -11,6 +11,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import secrets
 import time
 from collections.abc import Iterable as Iterable
@@ -219,8 +220,16 @@ _CAPTURE_TIMEOUT_SECONDS = float(DEFAULT_SNIFF_WINDOW_SECONDS)
 # ours shows up within it; anything further out is ordinary house traffic, and
 # vetoing on that would make a legitimate learn impossible to complete.
 _LEARN_SETTLE_SECONDS = TRAVEL_BURST_WINDOW_SECONDS
+# How long each learn bridge is told to sniff. Longer than the capture window
+# by the settle, deliberately: the learn path arms every bridge exactly ONCE
+# (only the measure path has re-arming holder tasks), so a winner arriving in
+# the window's final moment would otherwise settle on bridges that had already
+# stopped sniffing -- and a competing press nobody could hear reads as proof
+# there was none (#57). Asserted against the firmware's cap in the tests.
+_LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_LEARN_SETTLE_SECONDS)
 # Bounds the competing-press set against a busy bus. Two is already ambiguous,
-# so the cap only limits how many a screen can name.
+# so the cap only limits how many a screen can NAME -- never whether the
+# capture was ambiguous, which `_SniffAttempt.overflowed` keeps honest.
 _LEARN_CANDIDATE_CAP: Final = 8
 # How many bridges are armed at once. The fleet is single digits today, but the
 # bootstrap budget is fixed, so the work must not grow with it.
@@ -408,6 +417,64 @@ def _capture_belongs_to_this_action(
     return True
 
 
+def _stamp_candidate(
+    attempt: _SniffAttempt,
+    signature: FrameSignature,
+    heard_at: float,
+) -> None:
+    """Record one distinct press, keeping the cap from evicting a live rival.
+
+    One entry per distinct PRESS: the burst's own repeats and every other
+    bridge's copy of one press share a signature, so they re-stamp rather than
+    read as competing remotes.
+
+    The cap is applied across a 30-second listen while candidates are CONSUMED
+    within one settle window, so applying it at insert time alone let eight
+    long-expired presses fill it and discard the press competing with the
+    winner -- the capture then qualified as unambiguous because the rival had
+    nowhere to be recorded (#57). Presses that can no longer compete with the
+    current or any future winner are dropped first, and only when the cap is
+    still full does anything get discarded -- which forces ambiguity rather
+    than being lost silently, because refusing is the recoverable direction.
+    """
+    if signature in attempt.candidates:
+        attempt.candidates[signature] = heard_at
+        return
+    for stale in [
+        candidate
+        for candidate, last_heard in attempt.candidates.items()
+        if _cannot_compete(attempt, last_heard, heard_at)
+    ]:
+        del attempt.candidates[stale]
+    if len(attempt.candidates) >= _LEARN_CANDIDATE_CAP:
+        # Every entry is still in play, so there is nothing safe to evict. A
+        # press we cannot even name is still a press that was heard.
+        attempt.overflowed = True
+        _LOGGER.debug(
+            "Learn: more than %d presses in play at once -- %s cannot be named",
+            _LEARN_CANDIDATE_CAP,
+            _press_name(signature),
+        )
+        return
+    attempt.candidates[signature] = heard_at
+
+
+def _cannot_compete(attempt: _SniffAttempt, last_heard: float, now: float) -> bool:
+    """Report whether a tracked press can no longer compete with any winner.
+
+    A press competes with a winner anchored within ``_LEARN_SETTLE_SECONDS`` of
+    it, and the winner is either the one already stamped on the attempt or a
+    later capture that resolves it -- which cannot anchor earlier than ``now``.
+    So a press is finished only when it is out of window for BOTH: the stamped
+    winner (which the timeout path may still adopt, however long ago it was
+    held) and every winner still to come.
+    """
+    if now - last_heard <= _LEARN_SETTLE_SECONDS:
+        return False
+    resolved_at = attempt.resolved_at
+    return resolved_at is None or abs(last_heard - resolved_at) > _LEARN_SETTLE_SECONDS
+
+
 @callback
 def _handle_sniff_message(
     flow: ZemismartBlindsConfigFlow,
@@ -470,14 +537,20 @@ def _handle_sniff_message(
     )
     if not _capture_belongs_to_this_action(attempt, capture):
         return
-    signature = press_signature(capture.prefix, capture.remote_id, channels, attempt.action)
+    # Keyed on what was actually PRESSED where the opcode says so: a recognised
+    # press of another button collapsed into the requested action's signature,
+    # so one remote's UP and DOWN read as a single press (#57). An untabled
+    # opcode has nothing to say, and falls back to the action being solicited --
+    # which is what keeps a remote's own untabled trailer burst from competing
+    # with the press it trails.
+    signature = press_signature(
+        capture.prefix,
+        capture.remote_id,
+        channels,
+        inferred or attempt.action,
+    )
     heard_at = flow.hass.loop.time()
-    if signature in attempt.candidates or len(attempt.candidates) < _LEARN_CANDIDATE_CAP:
-        # One entry per distinct PRESS -- the burst's own repeats and every
-        # other bridge's copy of one press share a signature, so they re-stamp
-        # rather than read as competing remotes. An already-tracked press keeps
-        # being re-stamped once the cap is reached; only new ones are dropped.
-        attempt.candidates[signature] = heard_at
+    _stamp_candidate(attempt, signature, heard_at)
     if attempt.future.done():
         return
     if inferred == attempt.action:
@@ -725,7 +798,13 @@ async def _async_arm_sniff_channels(
     limiter = asyncio.Semaphore(_SNIFF_FANOUT_LIMIT)
 
     async def _arm_one(channel: _SniffChannel) -> _SniffChannel | None:
-        async with limiter, asyncio.timeout_at(deadline):
+        # The deadline wraps the semaphore too, deliberately: a bridge queued
+        # behind a saturated fan-out spends the SAME absolute budget as one that
+        # started immediately. Acquiring first would let a queued bridge begin --
+        # or finish -- arming after the bootstrap budget it was supposed to share
+        # had already expired, pushing the advertised window out on a fleet big
+        # enough to queue (#57).
+        async with asyncio.timeout_at(deadline), limiter:
             await arm(channel)
         return channel
 
@@ -2298,6 +2377,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         In that order per bridge: the window must never be open on a bridge
         whose captures nothing is listening for.
+
+        The window is armed once and covers the whole capture timeout PLUS the
+        settle that can follow a winner arriving in its last moment -- unlike
+        the measure path, nothing re-arms it, and a settle spent on bridges that
+        stopped sniffing would mistake deafness for an absence of rivals (#57).
         """
         from homeassistant.components import mqtt
 
@@ -2317,7 +2401,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         await mqtt.async_publish(
             self.hass,
             channel.command_topic,
-            _sniff_command(DEFAULT_SNIFF_WINDOW_SECONDS),
+            _sniff_command(_LEARN_SNIFF_WINDOW_SECONDS),
             qos=1,
             retain=False,
         )
@@ -2346,9 +2430,16 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         recoverable direction and adopting the wrong remote is not.
 
         Listening continues for the rest of the settle window first. The
-        subscriptions stay live until the caller's ``finally``, and a winner
-        adopted at the very end of the listen has had no settle at all yet,
-        while one held for twenty seconds already outlasted its window.
+        subscriptions stay live until the caller's ``finally``, the bridges are
+        armed for ``_LEARN_SNIFF_WINDOW_SECONDS`` so the settle always falls
+        inside a window they are still sniffing, and a winner adopted at the
+        very end of the listen has had no settle at all yet, while one held for
+        twenty seconds already outlasted its window.
+
+        A press the candidate cap had no room for refuses the capture too. The
+        cap exists to bound what a SCREEN can name; letting it decide whether
+        anything competed would mean a busy bus could buy the silence that
+        reads as "only one remote was heard".
         """
         anchor = attempt.resolved_at
         if anchor is None:
@@ -2365,12 +2456,20 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             winner.channels,
             attempt.action,
         )
+        # Compared on the remote and the channel set -- what would be ADOPTED --
+        # rather than on the full signature: another button from the same remote
+        # on the same selector is the same answer to "which blind is this", and
+        # refusing on it would veto the remote for agreeing with itself.
+        winner_press = winner_signature[:2]
         competing = sorted(
-            _press_name(signature)
-            for signature, last_heard in attempt.candidates.items()
-            if signature != winner_signature and abs(last_heard - anchor) <= _LEARN_SETTLE_SECONDS
+            {
+                _press_name(signature)
+                for signature, last_heard in attempt.candidates.items()
+                if signature[:2] != winner_press
+                and abs(last_heard - anchor) <= _LEARN_SETTLE_SECONDS
+            }
         )
-        if not competing:
+        if not competing and not attempt.overflowed:
             return True
         self._learn_candidates = (_press_name(winner_signature), *competing)
         _LOGGER.debug(

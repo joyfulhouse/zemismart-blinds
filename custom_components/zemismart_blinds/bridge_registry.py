@@ -156,8 +156,14 @@ class BridgeRegistry:
         A single bridge hears a remote only ~30% of the time while its peers
         hear nearly every press (#57), so capture flows listen on all of
         them; TX still resolves exactly one bridge through ``resolve``.
+
+        Sorted here rather than only by ``bridges``, whose snapshot is already
+        ordered: the set is joined into the screens that name which bridges are
+        listening, and a text that reorders itself between two visits to the
+        same form reads as a changed fleet, so the order is this method's own
+        promise rather than a property inherited from how it happens to read.
         """
-        online = tuple(bridge.bridge_id for bridge in self.bridges if bridge.online)
+        online = tuple(sorted(bridge.bridge_id for bridge in self.bridges if bridge.online))
         if not online:
             msg = "no RF433 bridge is online"
             raise NoOnlineBridgeError(msg)

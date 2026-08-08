@@ -83,18 +83,30 @@ width. So the run's anchor is protected by the signature itself rather than by
 a clock —
 
 - `_open` refuses to replace an open run's start when the incoming press
-  carries the signature that opened it. Always, however late it arrives.
-  Re-anchoring stores a travel time short by the delivery spread, the unsafe
-  direction, since a short time leaves "closed" visibly open.
+  carries a signature that has **already anchored this run** — the current one
+  or any it replaced. Always, however late it arrives. Re-anchoring stores a
+  travel time short by the delivery spread, the unsafe direction, since a short
+  time leaves "closed" visibly open. Remembering only the CURRENT anchor was
+  the third review round's blocker: a run restarted on UP still had DOWN
+  anchoring it moments earlier, and a bridge lagging by seconds then delivered
+  its copy of that superseded DOWN burst, re-anchoring the run and storing the
+  interval under the wrong DIRECTION as well as the wrong length.
 - Nothing in the protocol identifies one physical press: there is no sequence
   number and no per-press nonce, so a late copy and a genuine re-press of the
   same button on the same channels are the same bytes. A restart keyed on
   "same button, long enough after" is therefore a guess, and it guesses in the
   unsafe direction. Keeping the first anchor errs long, and it is *right*
   whenever the shade started moving on the first press.
-- A press of the **other** direction has its own signature and still restarts
-  the run. That is the user changing their mind, and it is the restart the
-  wizard actually needs.
+- The **first** press of the other direction has its own signature and still
+  restarts the run. That is the user changing their mind, and it is the restart
+  the wizard actually needs. Changing it *back* — DOWN, UP, DOWN again inside
+  one measurement — is refused, and the measurement then times the UP the user
+  abandoned; the wizard's redo is the remedy. That is the same trade the
+  same-signature rule already makes and in the same direction: a lagging copy
+  is a routine event on this fleet, three direction presses inside one
+  measurement is not, and only re-anchoring can silently store a SHORT time.
+- The set of anchors is cleared when a run closes, so a user re-pressing the
+  same direction after a run too fast to store is heard as a new run.
 
 The window's remaining job is to keep a duplicate STOP from closing a run
 twice. It deliberately does **not** gate `_open`: a press with no run open
@@ -107,9 +119,13 @@ the channel set before a signature exists, so one run can only ever see UP,
 DOWN and STOP; an earlier draft's `_RECENT_CAP` eviction path was unreachable
 by construction and is gone.
 
-The `heard` mismatch list still dedups by value (`mismatch not in self.heard`)
-— identical frames decoded on different bridges produce equal `HeardPress`
-records — so fleet listening adds no duplicate mismatch rows.
+The `heard` mismatch list dedups **by signature too**, which the third review
+round corrected. Value equality on `HeardPress` includes the raw frame, and two
+bridges report the pulse widths *they* measured — so the fleet's copies of one
+press are not equal records at all. Each copy took a row, nine of them
+exhausted `_HEARD_CAP`, and the next remote to press had nowhere to be listed:
+the timeout screen then named one remote and offered to adopt it, which is the
+same silent guess the trust boundary below exists to refuse.
 
 **Learn.** `_SniffAttempt.future` still resolves on the first acceptable
 capture; later copies from any bridge return at the `future.done()` gate. What
@@ -190,6 +206,37 @@ choice to make".
      prefills the first cover with it), so one remote heard on two selectors
      at once is two different answers to "which blind is this".
 
+     The action in that key is the button the frame *is* where its opcode says
+     so, and the solicited action only when the opcode is untabled (round
+     three). Keying everything on the solicited action collapsed one remote's
+     DOWN into the UP beside it, so two presses were tracked as one. What
+     *competes*, though, is compared on the remote and the channel set alone —
+     what would actually be ADOPTED — because another button from the very
+     remote being adopted is the same answer to "which blind is this", and
+     refusing on it would veto a capture for agreeing with itself. An untabled
+     trailer burst keeps falling back to the solicited action for the same
+     reason, so it stays a copy of the press it trails.
+
+   - **The settle must land inside the armed window** (round three). Learn arms
+     each bridge exactly ONCE — only the measure path has re-arming holder
+     tasks — so a winner arriving in the capture window's final moment settled
+     past the end of what the bridges were sniffing. Subscriptions staying live
+     is not enough: a bridge that stopped sniffing reports no competitor, and
+     that silence reads as proof there was none. The learn sniff window is
+     therefore armed for the capture window PLUS the settle
+     (`_LEARN_SNIFF_WINDOW_SECONDS`, asserted against the firmware's 60-second
+     cap), which keeps the whole advertised press window live rather than
+     spending its last seconds deaf.
+
+   - **The candidate cap bounds naming, not the verdict** (round three). It is
+     applied while inserting across a 30-second listen, but candidates are
+     consumed within one settle window — so eight long-expired presses filled
+     it and the press competing with the winner had nowhere to be recorded. The
+     capture then qualified as unambiguous *because* the bus was busy. Presses
+     that can no longer compete with the stamped winner or any later one are
+     dropped first; if the cap is still full, the press that found no room sets
+     `overflowed`, which refuses the capture it could not be listed in.
+
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
    listening, `heard` can hold several unrelated remotes, so adoption is now
@@ -255,7 +302,11 @@ Fleet-sized work needs fleet-independent limits:
   `_SNIFF_FANOUT_LIMIT`, sharing ONE absolute deadline with the
   wait-for-client that precedes it: the MQTT bootstrap budget is a fixed 5 s
   however many bridges exist, so neither serial batches nor a bigger house may
-  push the advertised capture window out. Per bridge it stays ordered —
+  push the advertised capture window out. The deadline wraps the **semaphore
+  acquisition** as well (round three): a fleet bigger than the bound queues,
+  the queue drains exactly when the bridges ahead of it are cancelled at the
+  deadline, and a bridge acquiring its slot outside the deadline would then
+  begin — or finish — arming on a budget that had already expired. Per bridge it stays ordered —
   subscribe, then open the window — so no bridge's window is ever open with
   nothing listening to it.
 
@@ -276,7 +327,10 @@ Fleet-sized work needs fleet-independent limits:
   kill that bridge's hold and drop it out of the sniff for the rest of the run
   with nothing said. The bounded retry is what stops a dead bridge being
   republished to forever, so breadth costs nothing.
-- **Caches**: `_LEARN_CANDIDATE_CAP` competing presses per attempt. The repeat
+- **Caches**: `_LEARN_CANDIDATE_CAP` competing presses per attempt, pruned of
+  presses that can no longer compete before the cap is enforced, and with an
+  overflow flag so the cap never decides ambiguity. `_HEARD_CAP` mismatch rows
+  per travel run, keyed by signature so one press cannot fill it. The repeat
   filter needs no cap — see the dedup section.
 
 ## Session shape
@@ -370,6 +424,14 @@ Pure machine (`tests/test_travel_capture.py`):
   round closed.
 - A same-direction press seconds later does not restart the run either, and
   says so: the frames are identical, so erring long is the only safe rule.
+- A run restarted on UP is not re-anchored by a lagging copy of the DOWN burst
+  it replaced — the direction and the length both survive it — with an
+  interleaved-fleet variant where copies of both bursts arrive mixed together
+  and the LAST frame in is a stale one.
+- A stale STOP copy arriving in a run the user re-opened after a too-fast run
+  closes nothing.
+- One press measured by several bridges, whose captures therefore differ byte
+  for byte, takes ONE mismatch row and leaves room for the next remote.
 - A re-press after a run closed too fast to store still opens a run — the
   filter must not swallow a press that has nothing to shorten.
 - A STOP 1.4 s after the direction press closes the run rather than being
@@ -412,6 +474,17 @@ Flow (`tests/test_config_flow.py`):
   to re-arm gives up, and a success clears the failure count.
 - The confirm screen names the bridges that HEARD the remote, not the armed
   set.
+- A competitor arriving after the capture window closed but inside the settle is
+  still heard and still refuses, and the armed learn window is asserted to cover
+  the capture window plus the settle (and to stay under the firmware's cap).
+- A rival press the candidate cap had no room for refuses the capture anyway,
+  while a press that can no longer compete is what the cap spends its room on.
+- One remote's OTHER button is counted as its own press and does not veto the
+  capture it agrees with.
+- A bridge queued behind a saturated arm fan-out is cancelled where it waits
+  rather than arming after the shared deadline.
+- An arm cancelled while waiting for its SUBACK leaves no live subscription.
+- Automatic names its listening set in a stable, sorted order.
 
 `tests/test_config_flow.py` asserts at teardown that every test released its
 bridge claims, so a leak fails the test that caused it rather than some later
@@ -478,3 +551,57 @@ remote id; the arm fan-out gathers with `return_exceptions` and skips a bridge
 that misses the shared deadline; the mismatch screen's identity diagnosis no
 longer depends on which bridge delivered first; `_RECENT_CAP` is deleted as
 unreachable.
+
+### Revised after review round 3
+
+Two blockers, both a guard that protected ONE instance of something the code
+kept several of:
+
+- **The run remembered only its CURRENT anchor.** A run restarted on UP had
+  DOWN anchoring it moments earlier, and `_open` — deliberately not gated on
+  the repeat window — accepted a lagging bridge's copy of that superseded DOWN
+  burst as a fresh press. The run re-anchored on a press the shade had stopped
+  obeying, and the STOP then stored that interval as the DOWN time for a shade
+  that ran UP: wrong direction and wrong length at once. Every signature that
+  has anchored the run is now remembered until the run closes.
+- **The learn settle ran past the window the bridges were armed for.** The
+  capture timeout equalled the sniff window exactly and nothing re-arms a learn
+  bridge, so a winner arriving in the final moment settled on bridges that had
+  already stopped sniffing — and heard no competitor because nothing was
+  listening, not because nobody pressed. The window is now armed for the
+  capture timeout plus the settle.
+
+In the same shape as those, and corrected with them:
+
+- The candidate cap decided ambiguity as well as naming (see the trust
+  boundary).
+- Mismatch rows deduplicated on the raw frame, which is per-bridge (see the
+  dedup section).
+- The arm fan-out's semaphore was acquired outside the shared deadline (see
+  Bounds).
+- Candidate signatures always used the solicited action (see the trust
+  boundary).
+- The post-close STOP test could not fail: after a close there is no run left
+  to close, so the repeat filter it was written for was unreachable from it. It
+  now tests what that filter is for — a stale copy of an old STOP arriving in a
+  run the user has just re-opened.
+
+Three findings from the same round were examined and **not** changed, because
+the behaviour they asked for was already in place. Each now has a test that
+fails when it is removed, so the question need not be re-argued from a diff:
+
+- The held (untabled) candidate was already first-wins (`if
+  attempt.unrecognized is None`), matching the resolved path's single
+  `set_result`. The residual is real and now locked: a distinct press arriving
+  outside the settle window neither competes with the held capture nor replaces
+  it.
+- `_async_subscribe_ready` already unsubscribes whatever it created when it is
+  cancelled before readiness — `completed` is set only after the SUBACK, and
+  the `finally` closes the subscription otherwise — so a bridge that misses the
+  arm deadline leaks nothing. Storing the callable through a sink instead would
+  leave the sink and that `finally` both owning it, and unsubscribing twice is
+  not idempotent here.
+- `online_bridge_ids` already returned a sorted tuple: it reads `bridges`,
+  whose snapshot is ordered by bridge id. The sort is now explicit at the point
+  that promises it rather than inherited, and the order the screens show is
+  asserted.

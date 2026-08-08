@@ -45,6 +45,11 @@ __all__ = [
 ]
 
 _HEARD_CAP: Final = 8
+# Stands in for the button in a REJECTED press's dedup key when the opcode byte
+# is outside the codec's table. It is not a button name and never reaches a
+# screen; it only has to be distinct from one, so two untabled presses of one
+# remote collapse while a tabled press of the same remote stays its own row.
+_UNTABLED_BUTTON: Final = "?"
 
 DIRECTIONS: Final = ("UP", "DOWN")
 BUTTONS: Final = ("UP", "DOWN", "STOP")
@@ -253,6 +258,22 @@ def classify_frame(
     return None, None, None
 
 
+def _mismatch_signature(press: HeardPress) -> FrameSignature:
+    """Key one REJECTED press the way the run keys an accepted one.
+
+    ``HeardPress`` equality includes the raw frame, and two bridges' captures
+    of one press differ in their bucket timings, so value equality alone let a
+    single press fill the whole list once the fleet was listening -- crowding
+    out the later, DISTINCT remote the timeout screen exists to name (#57).
+    """
+    return press_signature(
+        press.prefix,
+        press.remote_id,
+        press.channels,
+        press.button or _UNTABLED_BUTTON,
+    )
+
+
 def _heard(
     frame: str,
     decoded: DecodedFrame,
@@ -291,10 +312,16 @@ class TravelRun:
     channels: tuple[int, ...]
     wanted: frozenset[str]
     started: TimedPress | None = None
-    # Which press opened the run, so a later copy of that SAME press can never
-    # re-anchor it -- see `_open`.
-    started_signature: FrameSignature | None = None
+    # Every press that has anchored THIS run, so a later copy of any of them can
+    # never re-anchor it -- see `_open`. Tracking only the CURRENT anchor left
+    # the superseded one open to a late copy: a run restarted UP would re-anchor
+    # on a lagging bridge's copy of the DOWN burst it replaced, and then store
+    # that interval as the UP time for a shade that ran UP (#57).
+    anchored: set[FrameSignature] = field(default_factory=set)
     heard: list[HeardPress] = field(default_factory=list)
+    # Which rejected presses `heard` already lists, keyed by signature so the
+    # fleet's copies of one press collapse into its single row.
+    heard_signatures: set[FrameSignature] = field(default_factory=set)
     # When each signature was last heard, for the repeat filter below. Bounded
     # by construction: `classify_frame` pins the remote and the channel set
     # before a signature exists, so one run can only ever see UP, DOWN, STOP.
@@ -311,11 +338,8 @@ class TravelRun:
         if not isinstance(frame, str):
             return None
         button, mismatch, signature = classify_frame(self.identity, self.channels, frame)
-        if mismatch is not None and len(self.heard) < _HEARD_CAP and mismatch not in self.heard:
-            # A repeat burst is 8 copies of one press; keeping distinct
-            # presses only is what lets the timeout screen name the remote
-            # actually in the user's hand instead of a wall of duplicates.
-            self.heard.append(mismatch)
+        if mismatch is not None:
+            self._record_mismatch(mismatch)
         if button is None or signature is None:
             return None
         repeat = self._is_repeat(signature, received_at_monotonic)
@@ -337,6 +361,21 @@ class TravelRun:
         if repeat:
             return None
         return self._close(press)
+
+    def _record_mismatch(self, mismatch: HeardPress) -> None:
+        """List one rejected press per DISTINCT press, not per delivered copy.
+
+        A repeat burst is 8 copies of one press, times every bridge that heard
+        it. Keeping distinct presses only is what lets the timeout screen name
+        the remote actually in the user's hand: deduplicating on the raw frame
+        instead let one remote's copies -- whose bucket timings differ per
+        bridge -- exhaust the cap and hide every other remote.
+        """
+        signature = _mismatch_signature(mismatch)
+        if signature in self.heard_signatures or len(self.heard) >= _HEARD_CAP:
+            return
+        self.heard_signatures.add(signature)
+        self.heard.append(mismatch)
 
     def _is_repeat(self, signature: FrameSignature, received_at_monotonic: float) -> bool:
         """Report whether this is another copy of a press already counted.
@@ -364,19 +403,36 @@ class TravelRun:
         return 0.0 <= received_at_monotonic - previous <= TRAVEL_BURST_WINDOW_SECONDS
 
     def _open(self, press: TimedPress, signature: FrameSignature) -> None:
-        """Start a run, unless this is another copy of the press that opened it.
+        """Start a run, unless this press has already anchored it once.
 
-        The same signature while a run is open is a duplicate, ALWAYS -- no
-        window, however late it arrives. Nothing in the protocol identifies one
-        physical press (there is no sequence number and no per-press nonce), so
-        a second copy of one press and a genuine re-press of the same button on
-        the same channels are indistinguishable here. Re-anchoring on the wrong
-        one stores a travel time short by the delivery spread -- the unsafe
-        direction, since a short time leaves "closed" visibly open -- while
-        keeping the first anchor is at worst long, and is exactly right when
-        the shade started moving on the first press.
+        A signature that anchored this run is a duplicate for the rest of it,
+        ALWAYS -- no window, however late it arrives. Nothing in the protocol
+        identifies one physical press (there is no sequence number and no
+        per-press nonce), so a second copy of one press and a genuine re-press
+        of the same button on the same channels are indistinguishable here.
+        Re-anchoring on the wrong one stores a travel time short by the
+        delivery spread -- the unsafe direction, since a short time leaves
+        "closed" visibly open -- while keeping the first anchor is at worst
+        long, and is exactly right when the shade started moving on the first
+        press.
 
-        A press of the OTHER direction has its own signature and still
+        Every anchor is remembered, not just the current one. A run restarted
+        on UP still had DOWN anchoring it a moment earlier, and a bridge
+        lagging by seconds -- the observed envelope -- then delivers its copy
+        of that superseded DOWN burst. Re-anchoring on it would time a run the
+        shade never made and store it under the WRONG DIRECTION, which no
+        window can separate from a genuine re-press (#57).
+
+        The cost is that changing your mind BACK -- DOWN, then UP, then DOWN
+        again -- leaves the run anchored on the UP press rather than the last
+        DOWN, so the wizard measures the interval the user did not intend and
+        the screen's redo is the remedy. That is the same trade the
+        same-signature rule already makes, in the same direction: a late copy
+        is common (a bridge under backpressure) where pressing three directions
+        inside one measurement is not, and refusing to re-anchor is the choice
+        that cannot silently produce a SHORT time.
+
+        The FIRST press of the other direction has its own signature and still
         restarts the run: that is the user changing their mind, and it is the
         restart the wizard actually needs.
         """
@@ -389,14 +445,14 @@ class TravelRun:
                 sorted(self.wanted),
             )
             return
+        if signature in self.anchored:
+            _LOGGER.debug(
+                "travel: absorbing another copy of a %s press that already anchored this run",
+                press.button,
+            )
+            return
         started = self.started
         if started is not None:
-            if signature == self.started_signature:
-                _LOGGER.debug(
-                    "travel: absorbing another copy of the %s press that opened this run",
-                    press.button,
-                )
-                return
             _LOGGER.debug(
                 "travel: restarting the run on %s (was %s)",
                 press.button,
@@ -405,7 +461,7 @@ class TravelRun:
         else:
             _LOGGER.debug("travel: run opened on %s", press.button)
         self.started = press
-        self.started_signature = signature
+        self.anchored.add(signature)
 
     def _close(self, press: TimedPress) -> TravelMeasurement | None:
         """Resolve a STOP against the open run, if there is one.
@@ -423,7 +479,10 @@ class TravelRun:
             )
             return None
         self.started = None
-        self.started_signature = None
+        # The next run is a new one: a press that anchored the run just closed
+        # must be able to open the next, or a user re-pressing the same
+        # direction after a run too fast to store would never be heard again.
+        self.anchored.clear()
         elapsed = interval_seconds(started, press)
         if elapsed is None:
             _LOGGER.debug(

@@ -134,6 +134,37 @@ Each round-6 fix had a second code path it did not cover:
 - The claim-release teardown fixture moves from `tests/conftest.py` into
   `tests/test_config_flow.py` (write scope).
 
+### Task 8: Third review round
+
+Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`,
+`bridge_registry.py`, `tests/test_travel_capture.py`,
+`tests/test_config_flow.py`, spec
+
+Each round-7 guard protected one instance of something there were several of:
+
+- `TravelRun` remembers EVERY signature that has anchored the run, not just the
+  current one, and clears them on close. A run restarted on UP was otherwise
+  re-anchored by a lagging copy of the DOWN burst it replaced — wrong direction
+  and wrong length.
+- The learn sniff window is armed for the capture timeout PLUS the settle
+  (`_LEARN_SNIFF_WINDOW_SECONDS`); the learn path arms each bridge once, so a
+  settle past the window listened on bridges that had stopped sniffing.
+- `_stamp_candidate` prunes presses that can no longer compete before applying
+  `_LEARN_CANDIDATE_CAP`, and a press it still had no room for sets
+  `overflowed`, which refuses the capture. The cap bounds naming only.
+- Mismatch rows dedup by signature, not by raw frame: bridges report their own
+  pulse widths, so one press was filling `_HEARD_CAP`.
+- The arm fan-out's shared deadline wraps the semaphore acquisition too.
+- Candidate signatures use the button the frame IS (untabled falls back to the
+  solicited action); what COMPETES is compared on remote and channel set, so a
+  remote's other button does not veto its own capture.
+- The post-close STOP test is replaced with one that exercises the gate it was
+  written for: a stale STOP copy arriving in a re-opened run.
+- Not changed, but now locked by test: the held candidate is already first-wins;
+  `_async_subscribe_ready` already unsubscribes on cancellation before
+  readiness; `online_bridge_ids` already returned sorted order (now promised
+  locally rather than inherited from `bridges`).
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and
