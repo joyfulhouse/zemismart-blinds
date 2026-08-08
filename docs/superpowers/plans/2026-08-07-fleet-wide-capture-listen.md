@@ -219,6 +219,36 @@ of capped evidence was not carried to the other.
   1.5 s of an earlier STOP's stamp → measures LONG, the safe direction) recorded
   beside the existing under-catch.
 
+### Task 10: Fifth review round — simplify instead of patching
+
+Files: `learn_session.py`, `config_flow.py`, `strings.json`,
+`translations/en.json`, both test modules, spec
+
+The first-capture ambiguity decision had produced a corroborated HIGH three
+rounds running, each a deeper timestamp interleaving around an anchor that
+moves. The round's instruction was to look for a structural invariant first, and
+one exists, so the prescribed dual-timestamp patch was NOT written:
+
+- `_ContestedWindow` per candidate winner. The half of the window before the
+  anchor is judged out of the recently-heard presses as the window opens; the
+  half after, as each press arrives. The settle sleeps and reads the verdict.
+  `_decisive_occurrence`, `_cannot_compete` and `overflowed_at` are deleted, and
+  no cap can decide a verdict any more (the remembered-press bound drops the
+  oldest, which no window can reach; the name cap only shortens a screen).
+- The stop teardown owns its deadline and its release inside one independent
+  task: a deadline on the caller's await vanishes when the caller is cancelled,
+  which left hung publications untimed and their bridges claimed for the life of
+  the process.
+- `_SNIFF_FANOUT_LIMIT` deleted from the arm fan-out, and with it the ordering
+  hazard round three had to fix inside it. The shared absolute deadline is what
+  protects the advertised window.
+- A real arm-timeout test drives nine distinct mismatches and asserts the screen
+  offers no adopt, covering the `heard_overflowed` wiring line that every other
+  test straddled.
+- The mode-neutral busy/ambiguous copy is locked in the existing copy-sync test
+  (withdrawing a round-four pushback: this repo does assert string bodies).
+- `_SniffAttempt.candidates` → `recent`, with a comment that matches the rule.
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and

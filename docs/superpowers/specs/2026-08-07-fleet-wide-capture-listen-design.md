@@ -187,8 +187,7 @@ exhausted `_HEARD_CAP`, and the next remote to press had nowhere to be listed:
 the timeout screen then named one remote and offered to adopt it, which is the
 same silent guess the trust boundary below exists to refuse.
 
-That cap **reports what it turns away** (`heard_overflowed`), which round four
-added for the same reason round three gave the learn cap `overflowed_at`. What
+That cap **reports what it turns away** (`heard_overflowed`, round four). What
 reads this list decides whether to rewrite the device's stored identity, on two
 claims that are only ever true *of the list*: that one foreign remote was heard,
 and that this device's own was not. One stranger's remote worked across enough
@@ -197,6 +196,12 @@ room is then the user's own — so a full list would have offered to replace a
 correct identity with a stranger's, from evidence that proves neither claim. A
 capped list therefore refuses the one-click adopt (at the screen AND at the step
 that performs the swap), and says it heard "more remotes than can be listed".
+
+This cap cannot be structured away the way the learn-side one was (below): the
+`heard` list is not a window's worth of recent presses but the whole timeout
+screen's evidence, gathered across a 30-second arm and read once at the end. So
+it keeps an explicit overflow report, and the one thing it must never do is
+answer a uniqueness question from a list that overflowed.
 
 **Learn.** `_SniffAttempt.future` still resolves on the first acceptable
 capture; later copies from any bridge return at the `future.done()` gate. What
@@ -299,35 +304,40 @@ choice to make".
      cap), which keeps the whole advertised press window live rather than
      spending its last seconds deaf.
 
-   - **The candidate cap bounds naming, not the verdict** (round three). It is
-     applied while inserting across a 30-second listen, but candidates are
-     consumed within one settle window — so eight long-expired presses filled
-     it and the press competing with the winner had nowhere to be recorded. The
-     capture then qualified as unambiguous *because* the bus was busy. Presses
-     that can no longer compete with the stamped winner or any later one are
-     dropped first; if the cap is still full, the press that found no room is
-     recorded in `overflowed_at`, which refuses the capture it could not be
-     listed in.
+   - **The verdict is taken as it happens, never re-derived** (round five, and
+     it replaced three rounds of arithmetic). Each candidate winner opens a
+     `_ContestedWindow` at the moment it is stamped: the half of the window
+     BEFORE the anchor is read out of the recently-heard presses right then, and
+     the half after is filled in as each later press arrives. The settle sleeps
+     out the window and reads the verdict.
 
-     Round four made that record a **list of timestamps rather than a flag**,
-     judged by the same window as the candidates. A flag could only ever be
-     set, so an unrelated burst early in the listen refused every capture for
-     the remaining twenty-odd seconds — including winners arriving long after
-     every press involved had aged out of competing with anything. A refusal the
-     user cannot comply with is its own defect, the same one the settle window
-     exists to prevent, arriving by another door.
+     What this replaced was one timestamp per press, re-measured against the
+     anchor at settle time — and `resolved_at` MOVES, because the held
+     unrecognised path stamps it and a recognised winner supersedes it. Three
+     consecutive reviews each found another interleaving where a single float
+     ended up measured against the wrong one of those two anchors: a cap that
+     evicted a live rival (round three), a re-stamp that moved a rival's only
+     occurrence out of the window (round four), and finally a press pinned to
+     the abandoned anchor and then judged against the final one (round five),
+     which adopted a capture with a second remote plainly on air. Judging each
+     window while its anchor is the current one leaves nothing to rebase, so the
+     whole class is gone rather than patched again.
 
-   - **One press keeps the occurrence that DECIDES, not the newest** (round
-     four). Each candidate holds a single timestamp, re-stamped by every later
-     copy. That is right while no winner exists — a winner still to come cannot
-     anchor earlier than now, so the newest occurrence is the closest this press
-     can come to it. Once a winner is stamped it is wrong: a rival heard
-     *inside* the winner's settle window and then pressed again seconds later
-     moved its only timestamp out of that window, and the settle found nothing
-     competing. Somebody using their own remote twice was enough to erase the
-     evidence that two remotes had claimed one capture, so the occurrence
-     nearest the anchor is the one that survives.
+     Two consequences worth stating, because they are what earlier rounds had to
+     add machinery for:
 
+     - **No cap can decide a verdict any more.** Remembered presses are pruned
+       to one settle window and bounded by dropping the OLDEST — and a window
+       looks BACK from its anchor, which is never earlier than the presses
+       recorded before it, so the oldest entry is precisely the one no window can
+       reach. The rival NAMES a screen shows are capped separately, and the
+       verdict is whether that set is empty, so dropping the ninth name cannot
+       make a contested window look clean. `overflowed_at` and its aging existed
+       only to compensate for a cap that sat in front of the evidence; both are
+       deleted.
+     - **A rival cannot un-compete.** It is counted against the open window when
+       it arrives, so pressing the same remote again seconds later has nothing to
+       move.
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
    listening, `heard` can hold several unrelated remotes, so adoption is now
@@ -389,29 +399,23 @@ window fixes.
 
 Fleet-sized work needs fleet-independent limits:
 
-- **Arming** is concurrent across bridges under a semaphore of
-  `_SNIFF_FANOUT_LIMIT`, sharing ONE absolute deadline with the
-  wait-for-client that precedes it: the MQTT bootstrap budget is a fixed 5 s
-  however many bridges exist, so neither serial batches nor a bigger house may
-  push the advertised capture window out. The deadline wraps the **semaphore
-  acquisition** as well (round three): a fleet bigger than the bound queues,
-  the queue drains exactly when the bridges ahead of it are cancelled at the
-  deadline, and a bridge acquiring its slot outside the deadline would then
-  begin — or finish — arming on a budget that had already expired. Per bridge it
-  stays ordered — subscribe, then open the window — so no bridge's window is
-  ever open with nothing listening to it.
+- **Arming** is concurrent across bridges under ONE shared absolute deadline
+  with the wait-for-client that precedes it: the MQTT bootstrap budget is a fixed
+  5 s however many bridges exist, so neither serial batches nor a bigger house
+  may push the advertised capture window out. Per bridge it stays ordered —
+  subscribe, then open the window — so no bridge's window is ever open with
+  nothing listening to it.
 
-  **The semaphore is KEPT rather than dropped** (asked and answered in round
-  three: for a single-digit fleet a bare `gather` under the shared deadline
-  would behave identically, and the ordering bug above could not have existed).
-  The width of this fan-out is not set by how many bridges the house has,
-  though — it is set by how many the flow-local discovery snapshot accepted,
-  and that snapshot is built from retained `rf433/+/availability` topics with a
-  cap of `_BRIDGE_MAX_ENTRIES` (256). A stale or mistakenly-published retained
-  beacon is enough to widen it, and that is precisely the input the fixed 5 s
-  bootstrap budget must survive. With the deadline now wrapping the
-  acquisition, the bound costs one `async with` clause, cannot reorder
-  anything, and is covered by its own saturation test.
+  **There is deliberately no concurrency bound on top of that deadline** (round
+  five removed the one round three added and round three's own fix patched). The
+  reasoning that removed it: the deadline is what protects the user-visible
+  window, and a semaphore in front of it only decides WHICH bridges miss out when
+  the broker is slow — while adding an ordering hazard of its own, since a slot
+  acquired outside the deadline can start arming after the budget has expired.
+  That hazard was a real defect (round three, finding G) introduced purely by the
+  bound, and it is the second time a reviewer asked why the bound existed at all
+  for a single-digit fleet. Deleting it removes the defect class and the question
+  together.
 
   A bridge that raises, or that has not finished by the deadline, is **skipped
   rather than fatal**; zero armed bridges is what fails. The fan-out gathers
@@ -430,11 +434,12 @@ Fleet-sized work needs fleet-independent limits:
   kill that bridge's hold and drop it out of the sniff for the rest of the run
   with nothing said. The bounded retry is what stops a dead bridge being
   republished to forever, so breadth costs nothing.
-- **Caches**: `_LEARN_CANDIDATE_CAP` competing presses per attempt, pruned of
-  presses that can no longer compete before the cap is enforced, and with an
-  overflow flag so the cap never decides ambiguity. `_HEARD_CAP` mismatch rows
-  per travel run, keyed by signature so one press cannot fill it. The repeat
-  filter needs no cap — see the dedup section.
+- **Caches**: `_LEARN_CANDIDATE_CAP` bounds two things, neither of them a
+  verdict — how many recently-heard presses one attempt remembers (oldest
+  dropped, and a window can only reach the newest) and how many rivals a screen
+  NAMES. `_HEARD_CAP` mismatch rows per travel run, keyed by signature so one
+  press cannot fill it, and reporting what it turns away. The repeat filter needs
+  no cap — see the dedup section.
 
 ## Session shape
 
@@ -477,30 +482,25 @@ holder, unsubscribe, publish `{"action":"sniff","seconds":0}`, and release
 that bridge's owner key through the existing stop-task done-callback
 discipline (release only after the stop publication finished).
 
-The stop fan-out is **bounded and deadlined** like the arm fan-out (round
-four), under the same reasoning: the channel list is as wide as the discovery
-snapshot allows, so an unbounded burst of QoS-1 publications is the teardown's
-own version of the problem arming already solved. Teardown also runs in a
-`finally` on the flow's own task, which makes an unbounded WAIT the more
-serious half — one broker publish that never settles pinned that task and held
-every bridge's claim for the life of the process, so no later wizard could
-listen anywhere in the house without a restart.
+The stop fan-out carries **its own absolute deadline and its own release**,
+inside one independent task the caller merely waits on (rounds four and five).
+The channel list is as wide as the discovery snapshot allows, and teardown runs
+in a `finally` on the flow's own task — which is exactly why the deadline cannot
+live on the caller's await. Round four put it there and round five found the
+hole: cancel that caller before the timeout fires and the stop publications keep
+running with nobody left to time them out, so a publication that never settles
+holds its bridge's claim for the life of the process. The task owns the deadline,
+and every exit path it has releases every claim.
 
-At the deadline the outstanding publications are cancelled and their claims
-released *there*, rather than by waiting for the cancellation to land. Two
-properties are kept apart deliberately:
+Releasing at the deadline rather than waiting for the publication is the
+deliberate trade. A bridge that never receives its stop keeps sniffing until the
+window it was already given expires on its own; a bridge nobody releases needs a
+Home Assistant restart before any wizard can listen on it again. Permanently
+claimed is the worse failure and the only one the user cannot recover from.
 
-- **Deadline expiry** cancels and releases: this teardown has already given the
-  publication up, and a bridge that never receives its stop merely keeps
-  sniffing until the window it was given expires on its own. Permanently
-  claimed is worse than briefly deaf, and only one of the two needs a restart.
-- **Teardown itself being cancelled** leaves the publications running, exactly
-  as the previous shielded gather did. They are independent tasks and release
-  their own claims when they finish.
-
-`asyncio.wait` replaces the shielded gather to express that: it neither cancels
-what it waits on nor leaves an orphaned shield logging a cancellation nobody is
-left to retrieve.
+There is no concurrency bound here either, for the reason given under Bounds: one
+shared deadline is what protects the window, and `return_exceptions` is what
+keeps one broker error from abandoning the siblings.
 
 Bounding that wait exposed a **latent race one tick wide** in
 `cover_measure_stop`, fixed with it: `_async_measure_finish` clears
@@ -627,17 +627,25 @@ Flow (`tests/test_config_flow.py`):
 - A competitor arriving after the capture window closed but inside the settle is
   still heard and still refuses, and the armed learn window is asserted to cover
   the capture window plus the settle (and to stay under the firmware's cap).
-- A rival press the candidate cap had no room for refuses the capture anyway,
-  while a press that can no longer compete is what the cap spends its room on.
-- A crowd-out ages out with the presses that caused it, and the settle judges it
-  by the same window it judges a named rival by.
+- A rival press the candidate cap had no room for refuses the capture anyway.
+- Each half of a window is judged where it happens: a press already on air when
+  the window opens, and a press arriving while it is open.
+- A superseded anchor never decides the final winner, and its rival does not veto
+  one that nothing competed with (the transition, in both directions), including
+  through the settle itself.
+- The remembered-press bound drops the oldest, which no window can reach, and
+  more rivals than can be NAMED still refuse.
 - A rival pressed again outside the settle window still refuses the capture it
   competed with — at the handler and through the whole flow.
 - A capped mismatch list refuses the one-click adopt at the screen and at the
   swap step, while an uncapped list with the same shape still offers it (the
   control that keeps the refusal from being a silent feature removal).
-- A hung stop publication is bounded, cancelled, and its bridge released rather
-  than left claimed by a session that is gone.
+- A hung stop publication is deadlined and its bridge released rather than left
+  claimed by a session that is gone — including when the teardown's own caller
+  was cancelled first.
+- A real measurement that times out with more distinct mismatches than the list
+  can hold does not offer to adopt any of them (the producer-to-consumer wiring,
+  end to end).
 - The stop phase keeps waiting on a running task after teardown has cleared the
   session, instead of discarding the run it is about to report.
 - One remote's OTHER button is counted as its own press and does not veto the
@@ -801,6 +809,36 @@ withdrew its own blocker as a misread of the hunk rather than the file. The
 tests added in round three for both are what settled it, which is the argument
 for pinning a *contested but correct* behaviour with a test rather than only
 replying to the review.
+
+### Revised after review round 5
+
+The first-capture ambiguity decision had produced a corroborated HIGH in three
+consecutive rounds — each a deeper interleaving of timestamps around an anchor
+that moves. Round five's instruction was to look for a structural invariant
+before patching the arithmetic again, and there is one, so the patch was not
+written:
+
+- **Judge each candidate winner's window as it happens** (`_ContestedWindow`),
+  instead of storing one float per press and re-deriving the verdict at settle
+  time against whichever anchor is current by then. `_decisive_occurrence`,
+  `_cannot_compete` and `overflowed_at` are all deleted. See the trust boundary
+  above for what that removes and why the caps can no longer decide anything.
+- **The stop teardown owns its deadline and its release**, in an independent
+  task, because a deadline enforced by a caller that is itself cancellable is no
+  deadline at all.
+- **The arm fan-out's concurrency bound is gone**, and with it the ordering
+  hazard round three had to fix inside it.
+- **The `heard_overflowed` wiring is covered end to end.** Everything about the
+  capped mismatch list was tested on either side of one assignment, so deleting
+  that line left every test green while a real arm timeout could still offer to
+  rewrite a correct identity. A test now drives nine distinct mismatches through
+  a genuine measurement timeout and asks the screen what it offers.
+- **The mode-neutral failure copy is locked** by the existing copy-sync test,
+  which withdraws a round-four pushback: this repo *does* assert string bodies,
+  so unlocked wording silently regresses.
+- The `candidates` field comment described "last-heard rather than first" long
+  after that stopped being the rule; the field is now `recent` and says what it
+  is for.
 
 Three low-severity addenda from round three closed without code changes:
 

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     ]
 
 __all__ = [
+    "_ContestedWindow",
     "_DiscoverySession",
     "_LearnCapture",
     "_SniffAttempt",
@@ -117,40 +118,64 @@ class _LearnCapture:
 
 
 @dataclass(slots=True)
+class _ContestedWindow:
+    """What ELSE was on air within one settle window of one candidate winner.
+
+    A capture becomes a candidate winner the moment it resolves the attempt or
+    is held as the unrecognised fallback, and that is when its window opens.
+    Rivals are recorded into the window they actually fall in: the half BEFORE
+    the anchor is read out of ``recent`` as the window opens, the half AFTER as
+    each later press arrives. So a press is only ever compared with an anchor
+    that exists at the time of the comparison, and the verdict is never
+    re-derived afterwards.
+
+    That is the whole point of this type. ``resolved_at`` MOVES -- the
+    held-unrecognised path stamps it and a recognised winner supersedes it --
+    and three review rounds each found another way for a single stored float per
+    press to be measured against the wrong one of those two anchors (#57).
+    Deciding per window, as it happens, leaves nothing to rebase.
+    """
+
+    # When this candidate winner arrived, on the event-loop clock.
+    anchor: float
+    # Remote and channel set: what would be ADOPTED. A rival is a press that
+    # answers "which blind is this" differently, so the same remote's other
+    # button on the same selector is not one -- it agrees with the winner.
+    press: tuple[str, frozenset[int]]
+    # Names of the rivals heard in this window, for the screen that refuses.
+    # Capped for display only: the verdict is whether this set is EMPTY, and a
+    # name is dropped only once the cap's worth are already in it, so no cap can
+    # turn a contested window into an uncontested one.
+    rivals: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class _SniffAttempt:
     """Mutable state for one prompted action's capture window."""
 
     action: str
     measured: dict[str, _LearnCapture]
     future: asyncio.Future[_LearnCapture]
-    # Every distinct press heard for this action, mapped to when its LAST copy
-    # arrived. The first capture of a wizard run has no calibrated identity to
-    # gate on, so with the whole fleet listening ANY remote pressed anywhere in
-    # the house lands here; adopting one while another was pressed alongside it
-    # would be a silent guess (#57).
+    # Every distinct press heard RECENTLY, mapped to when its last copy arrived,
+    # pruned to one settle window and capped by dropping the oldest. It exists
+    # only to answer, at the moment a window opens, "what else was on air just
+    # before this". A window looks BACK at most one settle window from its
+    # anchor, so the newest entries are the only ones that can fall inside it
+    # and dropping the oldest can never hide a rival.
     #
-    # Keyed by the FULL press signature -- remote, channel set and action --
-    # the same key `state_sync` and the travel run dedup on: two channel sets
-    # from one remote are two different presses, and collapsing them by remote
-    # id would hide the second. Last-heard rather than first, because a remote
-    # that was also pressed minutes earlier still competes if it is pressed
-    # again alongside ours.
-    candidates: dict[FrameSignature, float] = field(default_factory=dict)
-    # When each press the candidate cap had no room for was heard. The cap
-    # bounds how many presses a SCREEN can name; it must never decide whether
-    # the capture was ambiguous, or a busy bus would buy silence -- so a press
-    # dropped for room forces the refusal it could not be listed in (#57).
-    #
-    # Timestamps rather than a flag, because a flag could only ever be set: an
-    # unrelated burst early in the 30-second listen then refused a capture
-    # whose winner arrived twenty seconds after every press involved had aged
-    # out. These age by the same window rule the candidates do.
-    overflowed_at: list[float] = field(default_factory=list)
+    # Keyed by the FULL press signature -- remote, channel set and action -- the
+    # same key `state_sync` and the travel run dedup on: two channel sets from
+    # one remote are two different presses, and collapsing them by remote id
+    # would hide the second. Last copy rather than first, because within a
+    # window that is the copy nearest anything that can still open one.
+    recent: dict[FrameSignature, float] = field(default_factory=dict)
+    # One window per candidate winner, in the order they were stamped. At most
+    # two exist: the held-unrecognised fallback and the recognised winner that
+    # can supersede it. The LAST is always the one that would be adopted.
+    contested: list[_ContestedWindow] = field(default_factory=list)
     # When the capture that WON this attempt arrived, on the event loop clock.
-    # The competing-press window is measured from here, not from the start of
-    # the 30-second listen: a press heard 20 seconds before ours is ordinary
-    # house traffic, and vetoing on it would make a legitimate learn
-    # impossible to complete in a house with more than one remote.
+    # The settle sleeps to the end of this window; which presses COMPETED with
+    # it is already recorded in `contested`, not measured from here afterwards.
     resolved_at: float | None = None
     # A structurally valid capture whose opcode byte is not in the codec's
     # action table. That table is a 10-sample empirical fit, not protocol, so

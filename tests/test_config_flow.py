@@ -58,7 +58,7 @@ from custom_components.zemismart_blinds.models import (
     RemoteConfig,
     RemoteIdentity,
 )
-from custom_components.zemismart_blinds.travel_capture import TravelRun
+from custom_components.zemismart_blinds.travel_capture import _HEARD_CAP, TravelRun
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_ACTION_BASES,
@@ -828,6 +828,28 @@ def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
     assert strings["config"]["step"]["cover_add"]["data"][CONF_NAME] == "Cover name"
     assert "this blind" not in strings["config"]["step"]["learn_setup"]["description"]
 
+    # Fleet listening made "the bridge" plural, but a user who picked ONE bridge
+    # as an override still sees these screens -- and they are the users who are
+    # diagnosing something, so copy describing a fleet they opted out of is
+    # exactly the wrong thing to tell them (#57). The failure screens therefore
+    # say what is true in BOTH modes, and that has to be locked or it regresses
+    # to "every online bridge" the next time someone edits nearby.
+    for step in ("learn_busy", "cover_measure_busy"):
+        description = strings["config"]["step"][step]["description"]
+        assert "every bridge it listens on" in description
+        assert "every online bridge" not in description, (
+            f"{step} must not describe a fleet to a user who picked one bridge"
+        )
+    ambiguous = strings["config"]["step"]["learn_ambiguous"]["description"]
+    assert "within range of the listening bridges" in ambiguous
+    assert "every online bridge" not in ambiguous
+    # The picker and its setup screens DO describe the modes, so they keep saying
+    # what Automatic does -- the phrase is only wrong where the mode is unknown.
+    assert (
+        "every online bridge"
+        in strings["config"]["step"]["learn_setup"]["data_description"][CONF_BRIDGE]
+    )
+
 
 @pytest.mark.asyncio
 async def test_user_starts_with_learn_and_advanced_menu(hass: Any) -> None:
@@ -1218,17 +1240,16 @@ def sniff_channels(count: int) -> list[Any]:
 
 
 @pytest.mark.asyncio
-async def test_the_arm_fanout_is_bounded_and_loses_nobody(hass: HomeAssistant) -> None:
-    """A bigger fleet arms concurrently, never in one unbounded burst.
+async def test_the_arm_fanout_is_concurrent_and_loses_nobody(hass: HomeAssistant) -> None:
+    """A bigger fleet arms concurrently, and every bridge is armed exactly once.
 
     Arming happens inside a fixed 5-second bootstrap budget, so it cannot be
     serial per bridge -- a house that grows a bridge would spend another SUBACK
-    round trip of the budget. An unbounded burst would put a whole house's
-    round trips in flight at once instead. Every bridge must still be armed
-    exactly once.
+    round trip of the budget. The shared deadline is what bounds this, not a
+    concurrency limit: a limit in front of the deadline only decides WHICH
+    bridges miss out when the broker is slow.
     """
     channels = sniff_channels(19)
-    limit = config_flow_module._SNIFF_FANOUT_LIMIT
     in_flight = 0
     peak = 0
     armed_order: list[str] = []
@@ -1237,8 +1258,8 @@ async def test_the_arm_fanout_is_bounded_and_loses_nobody(hass: HomeAssistant) -
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
-        # Two suspension points, so a serial implementation cannot reach the
-        # limit by accident and an unbounded one exceeds it.
+        # Two suspension points, so a serial implementation cannot look
+        # concurrent by accident.
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         in_flight -= 1
@@ -1252,7 +1273,7 @@ async def test_the_arm_fanout_is_bounded_and_loses_nobody(hass: HomeAssistant) -
 
     assert armed == channels, "every bridge armed, and the caller sees them all"
     assert sorted(armed_order) == sorted(channel.bridge_id for channel in channels)
-    assert peak == limit, "the fan-out saturates the bound without exceeding it"
+    assert peak == len(channels), "all of them are in flight together"
     assert await config_flow_module._async_arm_sniff_channels([], hass.loop.time() + 5.0, arm) == []
 
 
@@ -1314,40 +1335,6 @@ async def test_a_bridge_that_misses_the_arm_deadline_is_skipped_not_fatal(
     )
 
     assert [channel.bridge_id for channel in armed] == ["bridge-0"]
-
-
-@pytest.mark.asyncio
-async def test_a_queued_bridge_never_arms_after_the_shared_deadline(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Waiting for a fan-out slot spends the same budget as using one.
-
-    A fleet larger than the bound queues, and the queue drains exactly when the
-    bridges ahead of it are cancelled at the deadline. Acquiring the slot
-    OUTSIDE the deadline let those bridges then start arming -- subscribing a
-    topic and opening a sniff window -- on a bootstrap budget that had already
-    expired, which is the one thing the shared absolute deadline exists to
-    prevent (#57).
-    """
-    monkeypatch.setattr(config_flow_module, "_SNIFF_FANOUT_LIMIT", 2)
-    channels = sniff_channels(4)
-    started: list[str] = []
-
-    async def arm(channel: Any) -> None:
-        started.append(channel.bridge_id)
-        await asyncio.Event().wait()
-
-    armed = await config_flow_module._async_arm_sniff_channels(
-        channels,
-        hass.loop.time() + 0.05,
-        arm,
-    )
-
-    assert armed == []
-    assert started == ["bridge-0", "bridge-1"], (
-        "a queued bridge is cancelled where it waits, never armed past the deadline"
-    )
 
 
 @pytest.mark.asyncio
@@ -1892,44 +1879,79 @@ async def test_a_hung_sniff_stop_releases_the_bridge_instead_of_holding_it(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Teardown is bounded, and a claim outlives no publish that never settles.
+    """Teardown is deadlined, and a claim outlives no publish that never settles.
 
     The stop fan-out runs in a `finally` on the flow's own task, once per bridge
-    in a list as wide as the discovery snapshot allows. Unbounded, one broker
+    in a list as wide as the discovery snapshot allows. Undeadlined, one broker
     publish that never returns pins that task and every bridge's claim with it,
     so no later wizard can listen anywhere in the house until Home Assistant is
     restarted -- while a bridge that never receives its stop merely keeps
     sniffing until the window it was already given expires.
     """
     monkeypatch.setattr(config_flow_module, "_SNIFF_STOP_TIMEOUT_SECONDS", 0.05, raising=False)
-    monkeypatch.setattr(config_flow_module, "_SNIFF_FANOUT_LIMIT", 2)
     channels = sniff_channels(6)
     session_id = "stop-fanout"
     for channel in channels:
         config_flow_module._CAPTURE_OWNERS[channel.owner_key] = session_id
-    in_flight = 0
-    peak = 0
 
     async def publish(*_args: object, **_kwargs: object) -> None:
-        nonlocal in_flight, peak
-        in_flight += 1
-        peak = max(peak, in_flight)
-        try:
-            await asyncio.Event().wait()
-        finally:
-            in_flight -= 1
+        await asyncio.Event().wait()
 
     monkeypatch.setattr(mqtt, "async_publish", publish)
 
     async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
         await config_flow_module._async_stop_sniff_channels(hass, session_id, channels)
 
-    assert peak <= 2, "the stop fan-out is bounded like the arm fan-out"
     assert config_flow_module._CAPTURE_OWNERS == {}, (
-        "the claim is given up with the publication, not once a cancellation lands: "
-        "a fleet claimed by a session that is gone needs a restart to clear"
+        "the claim is given up with the publication: a fleet claimed by a session that "
+        "is gone needs a restart to clear"
     )
     await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_teardown_still_deadlines_and_releases_the_fleet(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline cannot live on the caller's await, because the caller dies.
+
+    Teardown runs in a `finally`, so it is itself liable to be cancelled -- and a
+    timeout enforced by the awaiting task vanishes with it. That left the stop
+    publications running with nobody to time them out, and a publication that
+    never settles then held its bridge's claim for the life of the process (#57).
+    Both the deadline and the release belong to an independent task.
+    """
+    monkeypatch.setattr(config_flow_module, "_SNIFF_STOP_TIMEOUT_SECONDS", 0.05, raising=False)
+    channels = sniff_channels(3)
+    session_id = "cancelled-teardown"
+    for channel in channels:
+        config_flow_module._CAPTURE_OWNERS[channel.owner_key] = session_id
+
+    async def publish(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(mqtt, "async_publish", publish)
+
+    tearing_down = hass.async_create_task(
+        config_flow_module._async_stop_sniff_channels(hass, session_id, channels),
+        f"{DOMAIN} test teardown",
+    )
+    await asyncio.sleep(0)
+    tearing_down.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tearing_down
+
+    assert config_flow_module._CAPTURE_OWNERS, "the publications have not been given up yet"
+    # The deadline belongs to the cleanup task, which the cancellation above did
+    # not touch, so waiting for that task is enough: it expires on its own and
+    # releases every bridge on the way out.
+    async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
+        await hass.async_block_till_done()
+
+    assert config_flow_module._CAPTURE_OWNERS == {}, (
+        "a teardown that was cancelled still has to hand every bridge back"
+    )
 
 
 @pytest.mark.asyncio
@@ -1970,113 +1992,156 @@ async def test_a_competitor_the_candidate_cap_could_not_name_still_refuses(
     await hass.async_block_till_done()
 
 
-@pytest.mark.asyncio
-async def test_a_stale_press_never_crowds_out_a_live_rival(hass: HomeAssistant) -> None:
-    """The cap has to spend its room on presses that can still compete.
-
-    Candidates are inserted across a 30-second listen and consumed within one
-    settle window, so a cap applied only at insert time filled with presses that
-    had long expired -- and then discarded the one press competing with the
-    winner. Presses that can no longer compete are dropped first; presses that
-    still can are never dropped silently.
-    """
+def _sniff_attempt(hass: HomeAssistant, action: str = "UP") -> Any:
+    """Build one bare attempt for the ambiguity bookkeeping tests."""
     attempt = config_flow_module._SniffAttempt(
-        action="UP",
+        action=action,
         measured={},
         future=hass.loop.create_future(),
     )
-    cap = config_flow_module._LEARN_CANDIDATE_CAP
-
-    def stamp(remote: str, heard_at: float) -> None:
-        config_flow_module._stamp_candidate(attempt, (remote, frozenset({1}), "UP"), heard_at)
-
-    for index in range(cap):
-        stamp(f"expired-{index:02x}", 0.0)
-    assert len(attempt.candidates) == cap
-
-    stamp("live", 20.0)
-    assert {remote for remote, _channels, _button in attempt.candidates} == {"live"}, (
-        "a press arriving a whole listen later displaces what can no longer compete"
-    )
-    assert attempt.overflowed_at == []
-
-    for index in range(cap - 1):
-        stamp(f"busy-{index:02x}", 20.0)
-    assert len(attempt.candidates) == cap
-    stamp("crowded-out", 20.1)
-    assert "crowded-out" not in {remote for remote, _channels, _button in attempt.candidates}
-    assert attempt.overflowed_at == [20.1], (
-        "a press with no room to be named is remembered by WHEN it was dropped"
-    )
-
     attempt.future.cancel()
+    return attempt
+
+
+def _press(remote: str, channel: int = 1, button: str = "UP") -> Any:
+    """Build one press signature the way the sniff handler keys them."""
+    return (remote, frozenset({channel}), button)
 
 
 @pytest.mark.asyncio
-async def test_a_crowded_out_press_stops_counting_once_it_ages_out(hass: HomeAssistant) -> None:
-    """Overflow is a moment, not a mode the whole listen stays in.
+async def test_a_press_heard_before_a_winner_is_judged_as_the_window_opens(
+    hass: HomeAssistant,
+) -> None:
+    """The verdict is taken when the anchor exists, not re-derived afterwards.
 
-    Recording it as a flag meant it could only ever be set: a burst of unrelated
-    remotes early in a 30-second listen refused every capture for the rest of it,
-    including a winner arriving twenty seconds after each press involved had
-    aged out of competing with anything. The drop is judged by the same window
-    its candidates are.
+    A window opening looks back exactly one settle window through what was
+    recently heard. Deciding it here -- rather than storing a float per press and
+    measuring it later -- is what removes the whole class of defect three review
+    rounds found in that arithmetic (#57).
     """
-    attempt = config_flow_module._SniffAttempt(
-        action="UP",
-        measured={},
-        future=hass.loop.create_future(),
+    attempt = _sniff_attempt(hass)
+    config_flow_module._record_press(attempt, _press("rival"), 10.0)
+    config_flow_module._record_press(attempt, _press("stale"), 1.0)
+
+    config_flow_module._open_contest_window(attempt, _press("winner"), 10.5)
+
+    assert [sorted(window.rivals) for window in attempt.contested] == [["rival on channels 1"]], (
+        "the press beside the winner competes; the one nine seconds earlier does not"
     )
-    cap = config_flow_module._LEARN_CANDIDATE_CAP
-
-    def stamp(remote: str, heard_at: float) -> None:
-        config_flow_module._stamp_candidate(attempt, (remote, frozenset({1}), "UP"), heard_at)
-
-    for index in range(cap):
-        stamp(f"early-{index:02x}", 0.0)
-    stamp("crowded-out", 0.1)
-    assert attempt.overflowed_at == [0.1], "the drop happened"
-
-    # A press twenty seconds later: nothing from that early burst can compete
-    # with a winner now, and neither can the press they crowded out.
-    stamp("much-later", 20.0)
-    assert attempt.overflowed_at == [], "the drop aged out with the presses that caused it"
-
-    attempt.future.cancel()
 
 
 @pytest.mark.asyncio
-async def test_a_rivals_later_repress_never_erases_that_it_competed(hass: HomeAssistant) -> None:
-    """A press is remembered by the occurrence that DECIDES, not the newest one.
+async def test_a_press_heard_after_a_winner_is_counted_as_it_arrives(
+    hass: HomeAssistant,
+) -> None:
+    """The other half of the window needs no stored timestamp either."""
+    attempt = _sniff_attempt(hass)
+    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
+    assert attempt.contested[-1].rivals == set()
 
-    Each candidate keeps one timestamp. Overwriting it with every later copy is
-    right while no winner exists -- a winner still to come cannot anchor before
-    now -- but once one is stamped, the same remote pressed again seconds later
-    moved its only timestamp out of the winner's settle window and erased the
-    evidence that it had been pressed alongside it (#57).
+    config_flow_module._record_press(attempt, _press("rival"), 11.0)
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}
+
+    config_flow_module._record_press(attempt, _press("late"), 20.0)
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+        "a press a whole listen later did not overlap this winner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_winners_own_other_button_is_not_a_rival(hass: HomeAssistant) -> None:
+    """Same remote, same selector: it agrees with the winner rather than rivalling it."""
+    attempt = _sniff_attempt(hass)
+    config_flow_module._open_contest_window(attempt, _press("winner", button="UP"), 10.0)
+
+    config_flow_module._record_press(attempt, _press("winner", button="DOWN"), 10.2)
+    assert attempt.contested[-1].rivals == set()
+
+    config_flow_module._record_press(attempt, _press("winner", channel=3), 10.3)
+    assert attempt.contested[-1].rivals == {"winner on channels 3"}, (
+        "the same remote on ANOTHER selector is a different answer to which blind this is"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rivals_later_repress_cannot_erase_that_it_competed(
+    hass: HomeAssistant,
+) -> None:
+    """Counting a rival when it arrives is what makes this unloseable.
+
+    While the verdict was re-derived from one timestamp per press, the same
+    remote pressed again seconds later moved its only timestamp out of the
+    winner's window and erased the evidence. There is now nothing to move.
     """
-    attempt = config_flow_module._SniffAttempt(
-        action="UP",
-        measured={},
-        future=hass.loop.create_future(),
-    )
-    rival = ("rival", frozenset({1}), "UP")
+    attempt = _sniff_attempt(hass)
+    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
+    config_flow_module._record_press(attempt, _press("rival"), 10.1)
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}
 
-    config_flow_module._stamp_candidate(attempt, rival, 10.0)
-    config_flow_module._stamp_candidate(attempt, rival, 10.2)
-    assert attempt.candidates[rival] == 10.2, (
-        "with no winner yet the newest copy is the nearest any future winner can be"
+    config_flow_module._record_press(attempt, _press("rival"), 25.0)
+
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+        "the rival was judged against this winner when it arrived, once and for all"
     )
 
-    attempt.resolved_at = 10.4
-    config_flow_module._stamp_candidate(attempt, rival, 25.0)
-    assert attempt.candidates[rival] == 10.2, (
-        "the occurrence beside the winner is what the settle has to judge"
-    )
-    config_flow_module._stamp_candidate(attempt, rival, 10.35)
-    assert attempt.candidates[rival] == 10.35, "a NEARER occurrence does replace it"
 
-    attempt.future.cancel()
+@pytest.mark.asyncio
+async def test_a_superseded_anchor_never_decides_the_final_winner(
+    hass: HomeAssistant,
+) -> None:
+    """The anchor MOVES, and each anchor is judged on its own (#57, round 5).
+
+    A held unrecognised capture stamps an anchor that a recognised winner then
+    supersedes. The reachable sequence: the held capture at t=1.0, a rival beside
+    it at t=1.1, that rival pressed again at t=25.0, and a THIRD remote resolving
+    the attempt at t=25.1. Pinning a press to whichever anchor happened to exist
+    when its copy arrived let the rival be kept for its proximity to the
+    ABANDONED anchor and then measured against the final one -- 24 seconds away,
+    so 'unambiguous', with a second remote plainly on air.
+    """
+    attempt = _sniff_attempt(hass)
+    held = _press("held")
+    rival = _press("rival")
+    recognised = _press("recognised")
+
+    config_flow_module._record_press(attempt, held, 1.0)
+    config_flow_module._open_contest_window(attempt, held, 1.0)
+    config_flow_module._record_press(attempt, rival, 1.1)
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}, "the held anchor is contested"
+
+    config_flow_module._record_press(attempt, rival, 25.0)
+    config_flow_module._record_press(attempt, recognised, 25.1)
+    config_flow_module._open_contest_window(attempt, recognised, 25.1)
+
+    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+        "the FINAL winner had the rival on air 0.1s before it, whatever the old anchor saw"
+    )
+    assert len(attempt.contested) == 2, "each anchor keeps its own verdict"
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_anchors_rival_does_not_veto_a_later_winner(
+    hass: HomeAssistant,
+) -> None:
+    """The control for the transition above: refusals must stay compliable.
+
+    If the rival is NOT pressed again, the final winner had nothing beside it and
+    must be adopted -- otherwise one stray press early in a 30-second listen
+    would refuse every capture for the rest of it, which is a refusal the user
+    cannot act on.
+    """
+    attempt = _sniff_attempt(hass)
+    config_flow_module._record_press(attempt, _press("held"), 1.0)
+    config_flow_module._open_contest_window(attempt, _press("held"), 1.0)
+    config_flow_module._record_press(attempt, _press("rival"), 1.1)
+
+    config_flow_module._record_press(attempt, _press("recognised"), 25.1)
+    config_flow_module._open_contest_window(attempt, _press("recognised"), 25.1)
+
+    assert attempt.contested[-1].rivals == set()
+    assert attempt.contested[0].rivals == {"rival on channels 1"}, (
+        "the abandoned window keeps its own verdict; it just is not the one read"
+    )
 
 
 def _held_capture(frame: str, prefix: int, remote_id: int) -> Any:
@@ -2097,40 +2162,94 @@ def _held_capture(frame: str, prefix: int, remote_id: int) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_the_settle_judges_a_crowd_out_by_the_same_window_as_a_rival(
+async def test_the_settle_reads_the_window_of_the_winner_it_was_given(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A press dropped for room refuses only if it was dropped NEAR this winner.
+    """Two anchors, two verdicts, and only the FINAL one decides.
 
-    Overflow has to count exactly like a named rival, which means it is subject
-    to the same question: did it happen alongside the press being adopted? A
-    burst early in the listen refusing a winner twenty seconds later is the
-    unusable-wizard failure the settle window exists to prevent, arriving by
-    another door.
+    A held unrecognised capture opens a window that a recognised winner then
+    supersedes. Reading the wrong one is wrong in both directions: the abandoned
+    window's rival would refuse a capture nothing competed with -- a refusal the
+    user cannot comply with -- and its silence would adopt one that two remotes
+    claimed.
     """
     monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
     flow = config_flow_module.ZemismartBlindsConfigFlow()
     flow.hass = hass
     winner = _held_capture(UNTABLED_UP_B1, UNTABLED_PREFIX, UNTABLED_REMOTE_ID)
 
-    def attempt_with(dropped_at: list[float]) -> Any:
-        attempt = config_flow_module._SniffAttempt(
-            action="UP",
-            measured={},
-            future=hass.loop.create_future(),
-        )
-        attempt.resolved_at = hass.loop.time()
-        attempt.overflowed_at = [attempt.resolved_at + offset for offset in dropped_at]
-        attempt.future.cancel()
+    def attempt_with(*verdicts: bool) -> Any:
+        attempt = _sniff_attempt(hass)
+        anchor = hass.loop.time()
+        for index, contested in enumerate(verdicts):
+            window = config_flow_module._ContestedWindow(
+                anchor=anchor + index,
+                press=("winner", frozenset({1})),
+            )
+            if contested:
+                window.rivals.add("rival on channels 1")
+            attempt.contested.append(window)
+        attempt.resolved_at = anchor + len(verdicts) - 1
         return attempt
 
-    assert await flow._async_settle_first_capture(attempt_with([-20.0]), winner) is True, (
-        "a drop from twenty seconds ago competes with nothing"
+    assert await flow._async_settle_first_capture(attempt_with(True, False), winner) is True, (
+        "the abandoned anchor's rival must not veto the winner that replaced it"
     )
-    assert await flow._async_settle_first_capture(attempt_with([0.005]), winner) is False, (
-        "a drop beside the winner is a press that was heard and could not be named"
+    assert await flow._async_settle_first_capture(attempt_with(False, True), winner) is False, (
+        "the winner that was actually adopted had a rival beside it"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_recent_bound_drops_the_oldest_and_can_hide_no_rival(
+    hass: HomeAssistant,
+) -> None:
+    """A bound on remembered presses must not be able to decide a verdict.
+
+    This is what the earlier `overflowed_at` bookkeeping existed to compensate
+    for, and why it is gone: a window looks BACK from its anchor, and its anchor
+    is never earlier than the presses recorded before it, so the oldest entry is
+    the one no window can reach. Dropping it is structurally unable to hide a
+    rival.
+    """
+    attempt = _sniff_attempt(hass)
+    cap = config_flow_module._LEARN_CANDIDATE_CAP
+    for index in range(cap + 4):
+        config_flow_module._record_press(attempt, _press(f"press-{index:02x}"), 10.0 + index * 0.01)
+
+    assert len(attempt.recent) == cap, "the bound holds"
+    remembered = {remote for remote, _channels, _button in attempt.recent}
+    assert "press-00" not in remembered, "the oldest went first"
+    assert f"press-{cap + 3:02x}" in remembered, "the newest is always kept"
+
+    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0 + (cap + 3) * 0.01)
+    assert len(attempt.contested[-1].rivals) == cap, "every press it can still reach is named"
+
+
+@pytest.mark.asyncio
+async def test_more_rivals_than_can_be_named_still_refuse(hass: HomeAssistant) -> None:
+    """The name cap bounds the SCREEN, and cannot make a contested window clean."""
+    attempt = _sniff_attempt(hass)
+    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
+    for index in range(config_flow_module._LEARN_CANDIDATE_CAP + 3):
+        config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 10.1)
+
+    window = attempt.contested[-1]
+    assert len(window.rivals) == config_flow_module._LEARN_CANDIDATE_CAP
+    assert window.rivals, "however many are dropped, the window is still contested"
+
+
+@pytest.mark.asyncio
+async def test_a_press_that_aged_out_is_never_a_rival(hass: HomeAssistant) -> None:
+    """Presses no window can reach are forgotten, so they cannot veto anything."""
+    attempt = _sniff_attempt(hass)
+    config_flow_module._record_press(attempt, _press("early"), 1.0)
+    config_flow_module._record_press(
+        attempt, _press("later"), 1.0 + TRAVEL_BURST_WINDOW_SECONDS * 2
+    )
+
+    assert {remote for remote, _channels, _button in attempt.recent} == {"later"}
 
 
 @pytest.mark.asyncio
@@ -3884,8 +4003,10 @@ async def test_sniff_handler_keys_a_press_on_the_button_it_actually_is(
     _deliver_sniff_frame(hass, flow, session_id, attempt, REFERENCE_UP_B1)
 
     assert attempt.future.done(), "the requested action still resolves the attempt"
-    assert sorted(button for _remote, _channels, button in attempt.candidates) == ["DOWN", "UP"]
-    assert attempt.overflowed_at == []
+    assert sorted(button for _remote, _channels, button in attempt.recent) == ["DOWN", "UP"]
+    assert attempt.contested[-1].rivals == set(), (
+        "one remote's two buttons on one selector are the same answer, not rivals"
+    )
 
     held = config_flow_module._SniffAttempt(
         action="UP",
@@ -3893,7 +4014,7 @@ async def test_sniff_handler_keys_a_press_on_the_button_it_actually_is(
         future=hass.loop.create_future(),
     )
     _deliver_sniff_frame(hass, flow, session_id, held, UNTABLED_UP_B1)
-    assert [button for _remote, _channels, button in held.candidates] == ["UP"], (
+    assert [button for _remote, _channels, button in held.recent] == ["UP"], (
         "an untabled opcode is keyed by the action being solicited"
     )
     held.future.cancel()
@@ -4958,6 +5079,56 @@ async def test_an_uncapped_heard_list_still_offers_the_adopt(hass: HomeAssistant
     result = await flow.async_step_cover_measure_mismatch()
 
     assert result["menu_options"][0] == "cover_measure_use_heard"
+
+
+@pytest.mark.asyncio
+async def test_a_real_capped_measurement_refuses_the_adopt_end_to_end(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The producer and the consumer of the overflow are wired together (#57).
+
+    Everything else about the capped list is tested on either side of one
+    assignment: the run sets ``heard_overflowed``, the screen refuses on
+    ``_measure_heard_overflowed``. Neither notices if the line carrying the first
+    into the second is deleted -- and then a real arm timeout can still offer to
+    rewrite this device's identity off a list that overflowed. So this drives the
+    whole path: one foreign remote worked across more selector positions than the
+    list can hold, through a genuine measurement that times out, and asks the
+    screen what it offers.
+    """
+    monkeypatch.setattr(config_flow_module, "TRAVEL_ARM_TIMEOUT_SECONDS", 0.5)
+    entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    rx = fake.rx_subscriptions()[-1]
+    # One remote, one distinct press per selector position: enough of them that
+    # the cap has to turn the last one away.
+    for selector in range(1, _HEARD_CAP + 2):
+        await fake.emit(
+            rx,
+            "rf433/bridge-a/rx",
+            json.dumps(
+                {
+                    "frame": _foreign_rx_frame("UP", channels=(selector,)),
+                    "t": 1_000 + selector,
+                    "boot": 7,
+                }
+            ),
+        )
+    await hass.async_block_till_done()
+
+    result = await advance_to_step(hass, flow_id, "cover_measure_mismatch")
+
+    assert "cover_measure_use_heard" not in result["menu_options"], (
+        "the list overflowed, so 'one foreign remote and ours never heard' is unprovable"
+    )
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert "more remotes than can be listed" in placeholders["detail"]
+    unchanged = RemoteConfig.from_entry(entry.data).remote
+    assert (unchanged.prefix, unchanged.remote_id) == (TEST_PREFIX, TEST_REMOTE_ID)
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
 
 
 @pytest.mark.asyncio

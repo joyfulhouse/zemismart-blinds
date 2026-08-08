@@ -140,6 +140,9 @@ from .learn_session import (
     _bridge_id as _bridge_id,
 )
 from .learn_session import (
+    _ContestedWindow as _ContestedWindow,
+)
+from .learn_session import (
     _DiscoverySession as _DiscoverySession,
 )
 from .learn_session import (
@@ -227,16 +230,14 @@ _LEARN_SETTLE_SECONDS = TRAVEL_BURST_WINDOW_SECONDS
 # stopped sniffing -- and a competing press nobody could hear reads as proof
 # there was none (#57). Asserted against the firmware's cap in the tests.
 _LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_LEARN_SETTLE_SECONDS)
-# Bounds the competing-press set against a busy bus. Two is already ambiguous,
-# so the cap only limits how many a screen can NAME -- never whether the
-# capture was ambiguous, which `_SniffAttempt.overflowed_at` keeps honest.
+# Bounds two things against a busy bus, neither of them the VERDICT: how many
+# recently-heard presses are remembered (the oldest go first, and a window can
+# only reach the newest), and how many rivals one screen NAMES. Two is already
+# ambiguous, so nothing this cap drops can make a contested capture look clean.
 _LEARN_CANDIDATE_CAP: Final = 8
-# How many bridges are armed at once. The fleet is single digits today, but the
-# bootstrap budget is fixed, so the work must not grow with it.
-_SNIFF_FANOUT_LIMIT: Final = 8
-# How long teardown waits for every bridge's sniff stop before cancelling what
-# is left. Teardown runs in a `finally` on the flow's own task, so an unbounded
-# wait here is a hung flow AND a fleet of bridges nobody can claim again.
+# How long teardown gives every bridge's sniff stop before giving them up.
+# Teardown runs in a `finally` on the flow's own task, so an unbounded wait here
+# is a hung flow AND a fleet of bridges nobody can claim again.
 _SNIFF_STOP_TIMEOUT_SECONDS: Final = _MQTT_BOOTSTRAP_TIMEOUT_SECONDS
 # Consecutive failed re-arm publications before a bridge's hold gives up. The
 # window outlives several misses, and a bridge that is simply gone must not be
@@ -268,25 +269,13 @@ _PENDING_COVER_ID = "pending"
 
 
 @callback
-def _release_capture_owner(
-    owner_key: tuple[int, str],
-    session_id: str,
-    stop_task: asyncio.Future[None],
-) -> None:
-    """Release bridge ownership only after its stop publication finishes."""
-    if not stop_task.cancelled():
-        with suppress(Exception):
-            stop_task.result()
-    _release_capture_claim(owner_key, session_id)
-
-
-@callback
 def _release_capture_claim(owner_key: tuple[int, str], session_id: str) -> None:
     """Drop one bridge's claim, if this session is still the holder.
 
-    Separate from the done-callback above so a teardown that has decided to
-    abandon a stop publication can give the bridge up THERE, rather than leaving
-    it claimed until a cancellation it can no longer wait for lands.
+    Called from the teardown that publishes the bridge's sniff stop, on every
+    exit path it has: after the publication succeeds, after it fails, and after
+    the shared deadline gives it up. Ownership outliving the session that took
+    it is the one outcome no user can recover from without a restart.
     """
     if _CAPTURE_OWNERS.get(owner_key) == session_id:
         del _CAPTURE_OWNERS[owner_key]
@@ -432,95 +421,82 @@ def _capture_belongs_to_this_action(
     return True
 
 
-def _stamp_candidate(
+def _record_press(
     attempt: _SniffAttempt,
     signature: FrameSignature,
     heard_at: float,
 ) -> None:
-    """Record one distinct press, keeping the cap from evicting a live rival.
+    """Note one distinct press, and count it against every open window.
 
     One entry per distinct PRESS: the burst's own repeats and every other
     bridge's copy of one press share a signature, so they re-stamp rather than
     read as competing remotes.
 
-    The cap is applied across a 30-second listen while candidates are CONSUMED
-    within one settle window, so applying it at insert time alone let eight
-    long-expired presses fill it and discard the press competing with the
-    winner -- the capture then qualified as unambiguous because the rival had
-    nowhere to be recorded (#57). Presses that can no longer compete with the
-    current or any future winner are dropped first, and only when the cap is
-    still full does anything get discarded -- which forces ambiguity rather
-    than being lost silently, because refusing is the recoverable direction.
+    Two jobs, both decided HERE rather than remembered for later. The press
+    becomes the newest thing "just heard", so a window opening in the next
+    settle window can see it; and it is counted immediately against every
+    window already open, so a rival arriving after a winner needs no stored
+    timestamp to be judged. What earlier rounds stored and re-derived at settle
+    time -- one float per press, measured against an anchor that had since moved
+    -- is what produced a corroborated defect in three consecutive reviews
+    (#57).
     """
-    if signature in attempt.candidates:
-        attempt.candidates[signature] = _decisive_occurrence(
-            attempt,
-            attempt.candidates[signature],
-            heard_at,
-        )
-        return
+    attempt.recent[signature] = heard_at
     for stale in [
-        candidate
-        for candidate, last_heard in attempt.candidates.items()
-        if _cannot_compete(attempt, last_heard, heard_at)
+        press
+        for press, last_heard in attempt.recent.items()
+        if heard_at - last_heard > _LEARN_SETTLE_SECONDS
     ]:
-        del attempt.candidates[stale]
-    attempt.overflowed_at = [
-        dropped
-        for dropped in attempt.overflowed_at
-        if not _cannot_compete(attempt, dropped, heard_at)
-    ]
-    if len(attempt.candidates) >= _LEARN_CANDIDATE_CAP:
-        # Every entry is still in play, so there is nothing safe to evict. A
-        # press we cannot even name is still a press that was heard.
-        if len(attempt.overflowed_at) < _LEARN_CANDIDATE_CAP:
-            # Bounded like the candidates themselves. Being at this cap too
-            # means a whole cap's worth of drops are still in play, which the
-            # settle already refuses on -- one more timestamp changes nothing.
-            attempt.overflowed_at.append(heard_at)
-        _LOGGER.debug(
-            "Learn: more than %d presses in play at once -- %s cannot be named",
-            _LEARN_CANDIDATE_CAP,
-            _press_name(signature),
-        )
+        # Older than any window that can still open could look back to.
+        del attempt.recent[stale]
+    while len(attempt.recent) > _LEARN_CANDIDATE_CAP:
+        # Drop the OLDEST, which no window can reach that the newest cannot: a
+        # window looks back one settle window from its anchor, and its anchor is
+        # never earlier than the presses recorded before it. So this bound is
+        # unable to hide a rival, where a cap applied to the VERDICT would be --
+        # which is exactly the shape the earlier `overflowed_at` bookkeeping
+        # existed to compensate for, and why it is gone.
+        del attempt.recent[min(attempt.recent, key=attempt.recent.__getitem__)]
+    for window in attempt.contested:
+        if signature[:2] != window.press and abs(heard_at - window.anchor) <= _LEARN_SETTLE_SECONDS:
+            _name_rival(window, signature)
+
+
+def _open_contest_window(
+    attempt: _SniffAttempt,
+    signature: FrameSignature,
+    heard_at: float,
+) -> None:
+    """Open one candidate winner's window, judging what was already on air.
+
+    Called at each of the two places that stamp ``resolved_at``, so the half of
+    the window BEFORE the anchor is settled while that anchor is the current
+    one. Nothing here is revisited: a later winner opens its own window and is
+    judged against ``recent`` as it stands then.
+    """
+    window = _ContestedWindow(anchor=heard_at, press=signature[:2])
+    for press, last_heard in attempt.recent.items():
+        if press[:2] != window.press and abs(last_heard - heard_at) <= _LEARN_SETTLE_SECONDS:
+            _name_rival(window, press)
+    attempt.contested.append(window)
+
+
+def _name_rival(window: _ContestedWindow, signature: FrameSignature) -> None:
+    """Record a competing press by name, bounding only how many are NAMED.
+
+    The verdict is whether the window has any rival at all, so the cap can only
+    ever drop the ninth NAME off a screen that already refuses -- it cannot make
+    a contested window look clean. That is the property the cap never had while
+    it bounded the evidence the verdict was computed from.
+    """
+    if len(window.rivals) < _LEARN_CANDIDATE_CAP:
+        window.rivals.add(_press_name(signature))
         return
-    attempt.candidates[signature] = heard_at
-
-
-def _decisive_occurrence(attempt: _SniffAttempt, tracked: float, heard_at: float) -> float:
-    """Return which occurrence of one press the ambiguity check must remember.
-
-    Re-stamping with the newest copy is right while no winner exists: a winner
-    still to come cannot anchor earlier than now, so the newest occurrence is
-    the closest this press can possibly come to it.
-
-    Once a winner IS stamped, overwriting destroys evidence. A rival heard
-    INSIDE the winner's settle window and then pressed AGAIN twenty seconds
-    later kept only the later stamp, which is out of window -- so the settle
-    found nothing competing and adopted a capture two remotes had claimed
-    (#57). The occurrence nearest the anchor is the one that decides, so it is
-    the one that survives.
-    """
-    anchor = attempt.resolved_at
-    if anchor is None:
-        return heard_at
-    return min(tracked, heard_at, key=lambda occurrence: abs(occurrence - anchor))
-
-
-def _cannot_compete(attempt: _SniffAttempt, last_heard: float, now: float) -> bool:
-    """Report whether a tracked press can no longer compete with any winner.
-
-    A press competes with a winner anchored within ``_LEARN_SETTLE_SECONDS`` of
-    it, and the winner is either the one already stamped on the attempt or a
-    later capture that resolves it -- which cannot anchor earlier than ``now``.
-    So a press is finished only when it is out of window for BOTH: the stamped
-    winner (which the timeout path may still adopt, however long ago it was
-    held) and every winner still to come.
-    """
-    if now - last_heard <= _LEARN_SETTLE_SECONDS:
-        return False
-    resolved_at = attempt.resolved_at
-    return resolved_at is None or abs(last_heard - resolved_at) > _LEARN_SETTLE_SECONDS
+    _LOGGER.debug(
+        "Learn: more than %d rivals heard beside this capture -- %s cannot be named",
+        _LEARN_CANDIDATE_CAP,
+        _press_name(signature),
+    )
 
 
 @callback
@@ -598,11 +574,12 @@ def _handle_sniff_message(
         inferred or attempt.action,
     )
     heard_at = flow.hass.loop.time()
-    _stamp_candidate(attempt, signature, heard_at)
+    _record_press(attempt, signature, heard_at)
     if attempt.future.done():
         return
     if inferred == attempt.action:
         attempt.resolved_at = heard_at
+        _open_contest_window(attempt, signature, heard_at)
         attempt.future.set_result(capture)
         return
     if inferred is not None:
@@ -621,8 +598,11 @@ def _handle_sniff_message(
         # Stamped like a resolved winner: if the window closes with nothing
         # recognised, THIS is the capture that would be adopted, so it is the
         # one a competing press has to be judged against. A later recognised
-        # frame overwrites the stamp when it resolves the future above.
+        # frame stamps its own anchor and opens its own window above, and THAT
+        # one is what the settle reads -- this window is simply abandoned with
+        # whatever it had judged, never re-measured against the new anchor.
         attempt.resolved_at = heard_at
+        _open_contest_window(attempt, signature, heard_at)
         attempt.unrecognized = capture
 
 
@@ -790,79 +770,68 @@ async def _async_stop_sniff_channels(
     existing single-bridge discipline, per channel): releasing earlier would
     let a new session arm a window this one is still about to close.
 
-    Bounded and deadlined like the arm fan-out, and for the same reason: the
-    channel list is as wide as the discovery snapshot allows, so an unbounded
-    burst of QoS-1 publications is the teardown's own version of the problem
-    arming already solved.
+    The deadline is absolute and taken on ENTRY, and both it and the release run
+    inside ONE independent task that the caller merely waits on. That structure
+    is what makes the guarantee hold in the case the caller cannot cover: this
+    runs in a `finally`, so the caller is itself liable to be cancelled, and a
+    deadline enforced by the caller's await would vanish with it -- leaving a
+    hung publication with nobody to time it out and a bridge claimed for the
+    life of the process. Every exit path of that task releases every claim.
 
-    At the deadline the outstanding publications are CANCELLED rather than left
-    running, which releases their claims through the same done-callback. That is
-    the deliberate trade: a broker publish that never settles would otherwise
-    pin this flow task and hold every bridge's claim for the life of the
-    process, so no wizard could listen on them again without a restart -- while
-    a bridge that never receives its stop merely keeps sniffing until the window
-    it was given expires on its own. Permanently claimed is worse than briefly
-    deaf, and only one of the two is recoverable without a restart.
+    Releasing at the deadline rather than waiting for the publication is a
+    deliberate trade. A bridge that never receives its stop keeps sniffing until
+    the window it was already given expires on its own; a bridge nobody releases
+    needs a Home Assistant restart before any wizard can listen on it again.
+    Permanently claimed is the worse failure, and the only one the user cannot
+    recover from.
     """
     from homeassistant.components import mqtt
 
-    limiter = asyncio.Semaphore(_SNIFF_FANOUT_LIMIT)
-
-    async def _stop_one(channel: _SniffChannel) -> None:
-        async with limiter:
-            await mqtt.async_publish(
-                hass,
-                channel.command_topic,
-                _sniff_command(0),
-                qos=1,
-                retain=False,
-            )
-
-    stops: list[tuple[_SniffChannel, asyncio.Task[None]]] = []
-    for channel in channels:
-        stop_task = hass.async_create_task(
-            _stop_one(channel),
-            f"{DOMAIN} sniff stop",
-        )
-        stop_task.add_done_callback(
-            functools.partial(_release_capture_owner, channel.owner_key, session_id)
-        )
-        stops.append((channel, stop_task))
-    if not stops:
+    targets = list(channels)
+    if not targets:
         return
-    expired = False
-    try:
-        # `asyncio.wait` rather than a shielded gather: it does not cancel what
-        # it waits on, so a teardown that is itself cancelled still leaves every
-        # stop publication running exactly as the shield did -- and it reports a
-        # deadline by returning rather than by cancelling a future nobody is
-        # left to retrieve.
-        settled, _outstanding = await asyncio.wait(
-            [task for _channel, task in stops],
-            timeout=_SNIFF_STOP_TIMEOUT_SECONDS,
-        )
-        expired = len(settled) != len(stops)
-    finally:
-        for channel, stop_task in stops:
-            if stop_task.done():
-                _release_capture_owner(channel.owner_key, session_id, stop_task)
-                continue
-            if not expired:
-                # Teardown was cancelled rather than slow. The publication is an
-                # independent task and finishes on its own, releasing its claim
-                # through the done-callback above.
-                continue
+    # Taken before the first await, so the budget covers the whole fan-out
+    # rather than starting when some scheduler gets round to it.
+    deadline = hass.loop.time() + _SNIFF_STOP_TIMEOUT_SECONDS
+
+    async def _stop_every_bridge() -> None:
+        try:
+            async with asyncio.timeout_at(deadline):
+                # `return_exceptions` so one broker error cannot abandon the
+                # siblings mid-flight -- the same reason the arm fan-out gathers
+                # that way. No concurrency bound: the shared deadline is what
+                # protects the user-visible window, and a bound on top of it
+                # only decides which bridges miss out when the broker is slow.
+                await asyncio.gather(
+                    *(
+                        mqtt.async_publish(
+                            hass,
+                            channel.command_topic,
+                            _sniff_command(0),
+                            qos=1,
+                            retain=False,
+                        )
+                        for channel in targets
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
             _LOGGER.warning(
-                "Sniff stop to %s did not finish within %.0fs; cancelling it and releasing "
-                "the bridge, which would otherwise stay claimed until Home Assistant restarts",
-                channel.command_topic,
+                "Sniff stops to %s did not all finish within %.0fs; giving them up and "
+                "releasing the bridges, which would otherwise stay claimed until Home "
+                "Assistant restarts",
+                ", ".join(channel.bridge_id for channel in targets),
                 _SNIFF_STOP_TIMEOUT_SECONDS,
             )
-            stop_task.cancel()
-            # Released HERE rather than by waiting for the cancellation: this
-            # teardown has already given the publication up, and the claim must
-            # not outlive that decision by however long the cancel takes to land.
-            _release_capture_claim(channel.owner_key, session_id)
+        finally:
+            for channel in targets:
+                _release_capture_claim(channel.owner_key, session_id)
+
+    cleanup = hass.async_create_task(_stop_every_bridge(), f"{DOMAIN} sniff stop")
+    # Shielded: a cancelled caller must not take the deadline and the release
+    # with it. The task owns both and runs to completion either way.
+    with suppress(Exception):
+        await asyncio.shield(cleanup)
 
 
 async def _async_arm_sniff_channels(
@@ -872,12 +841,18 @@ async def _async_arm_sniff_channels(
 ) -> list[_SniffChannel]:
     """Arm every claimed bridge under one shared budget; return the armed ones.
 
-    Concurrent across bridges, bounded to ``_SNIFF_FANOUT_LIMIT`` in flight:
-    the MQTT bootstrap budget is a fixed 5 seconds however many bridges exist,
-    so a house that grows a bridge must not spend another SUBACK round trip of
-    it -- while a whole house's subscriptions in flight at once is its own
-    problem. Per bridge it stays ordered (subscribe, then open the window), so
-    no bridge's window is ever open with nothing listening to it.
+    Concurrent across bridges under ONE shared absolute deadline: the MQTT
+    bootstrap budget is a fixed 5 seconds however many bridges exist, so a house
+    that grows a bridge must not spend another SUBACK round trip of it. Per
+    bridge it stays ordered (subscribe, then open the window), so no bridge's
+    window is ever open with nothing listening to it.
+
+    There is deliberately no concurrency bound on top of that deadline. One was
+    tried and removed: the deadline is what protects the advertised capture
+    window, and a semaphore in front of it only decides WHICH bridges are the
+    ones to miss out when the broker is slow -- while adding an ordering hazard
+    of its own (a slot acquired outside the deadline could start arming after the
+    budget had expired, which is what round three had to fix).
 
     A bridge that raises, or that has not finished by ``deadline``, is SKIPPED
     rather than fatal: one slow or misbehaving bridge must not cost the user
@@ -891,16 +866,9 @@ async def _async_arm_sniff_channels(
     leaves a live subscription and a bridge sniffing with its owner key
     released -- exactly the state the claim discipline exists to prevent.
     """
-    limiter = asyncio.Semaphore(_SNIFF_FANOUT_LIMIT)
 
     async def _arm_one(channel: _SniffChannel) -> _SniffChannel | None:
-        # The deadline wraps the semaphore too, deliberately: a bridge queued
-        # behind a saturated fan-out spends the SAME absolute budget as one that
-        # started immediately. Acquiring first would let a queued bridge begin --
-        # or finish -- arming after the bootstrap budget it was supposed to share
-        # had already expired, pushing the advertised window out on a fleet big
-        # enough to queue (#57).
-        async with asyncio.timeout_at(deadline), limiter:
+        async with asyncio.timeout_at(deadline):
             await arm(channel)
         return channel
 
@@ -2573,10 +2541,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         very end of the listen has had no settle at all yet, while one held for
         twenty seconds already outlasted its window.
 
-        A press the candidate cap had no room for refuses the capture too. The
-        cap exists to bound what a SCREEN can name; letting it decide whether
-        anything competed would mean a busy bus could buy the silence that
-        reads as "only one remote was heard".
+        Which presses COMPETED is not computed here. It was recorded as it
+        happened, into the winner's own ``_ContestedWindow``, because
+        ``resolved_at`` moves and any float kept for later has to survive that
+        move -- three review rounds each found a way it did not (#57). This
+        sleeps out the window and reads the verdict.
         """
         anchor = attempt.resolved_at
         if anchor is None:
@@ -2587,35 +2556,20 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         remaining = anchor + _LEARN_SETTLE_SECONDS - self.hass.loop.time()
         if remaining > 0:
             await asyncio.sleep(remaining)
+        # The LAST window is this winner's: a window is opened by the same two
+        # statements that stamp `resolved_at`, so the final stamp owns the final
+        # window. Rivals kept accruing into it during the sleep above.
+        judged = attempt.contested[-1] if attempt.contested else None
+        rivals = sorted(judged.rivals) if judged is not None else []
+        if not rivals:
+            return True
         winner_signature = press_signature(
             winner.prefix,
             winner.remote_id,
             winner.channels,
             attempt.action,
         )
-        # Compared on the remote and the channel set -- what would be ADOPTED --
-        # rather than on the full signature: another button from the same remote
-        # on the same selector is the same answer to "which blind is this", and
-        # refusing on it would veto the remote for agreeing with itself.
-        winner_press = winner_signature[:2]
-        competing = sorted(
-            {
-                _press_name(signature)
-                for signature, last_heard in attempt.candidates.items()
-                if signature[:2] != winner_press
-                and abs(last_heard - anchor) <= _LEARN_SETTLE_SECONDS
-            }
-        )
-        # A press the cap had no room for counts exactly like a named one, and
-        # is judged by the same window: the drop has to have happened near THIS
-        # winner. Treating any drop during the whole listen as disqualifying
-        # let an unrelated burst 20 seconds earlier refuse a clean capture.
-        crowded_out = any(
-            abs(dropped - anchor) <= _LEARN_SETTLE_SECONDS for dropped in attempt.overflowed_at
-        )
-        if not competing and not crowded_out:
-            return True
-        self._learn_candidates = (_press_name(winner_signature), *competing)
+        self._learn_candidates = (_press_name(winner_signature), *rivals)
         _LOGGER.debug(
             "Learn: refusing to adopt one of %s heard together",
             self._learn_candidates,
