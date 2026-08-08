@@ -44,11 +44,13 @@ from custom_components.zemismart_blinds.const import (
     CONF_REPEATS,
     CONF_TRAVEL_DOWN,
     CONF_TRAVEL_UP,
+    DEFAULT_SNIFF_WINDOW_SECONDS,
     DOMAIN,
     MAX_SNIFF_WINDOW_SECONDS,
     MQTT_AVAILABILITY_TOPIC,
     MQTT_INFO_TOPIC,
     MQTT_ROOT,
+    TRAVEL_BURST_WINDOW_SECONDS,
 )
 from custom_components.zemismart_blinds.models import (
     BlindConfig,
@@ -451,6 +453,23 @@ def sniff_starts(fake: FakeMqtt, bridge: str) -> int:
         for published_topic, payload in fake.published
         if published_topic == topic and payload.get("seconds") != 0
     )
+
+
+def sniff_windows(fake: FakeMqtt, bridge: str) -> list[int]:
+    """Return the window, in seconds, of each sniff START published to one bridge.
+
+    Read off the published command rather than the module constant: what a bridge
+    actually sniffs for is what the payload says, and the whole point of the
+    window covering the settle is that it reaches the hardware (#57).
+    """
+    topic = f"{MQTT_ROOT}/{bridge}/cmd"
+    return [
+        seconds
+        for published_topic, payload in fake.published
+        if published_topic == topic
+        and isinstance(seconds := payload.get("seconds"), int)
+        and seconds
+    ]
 
 
 async def wait_for_sniff_starts(
@@ -1793,6 +1812,19 @@ async def test_a_competitor_arriving_after_the_capture_window_still_refuses(
     assert not [payload for _topic, payload in fake.published if payload.get("seconds") == 0], (
         "the capture window has closed and the sniff is still open: this is the settle"
     )
+    # What the bridges were actually TOLD to sniff has to cover the production
+    # capture window plus the settle that can follow a winner arriving in its
+    # last moment. Read off the published command rather than the constant, and
+    # measured against the production budget rather than this test's compressed
+    # one -- otherwise the assertions below pass on a window that only looks
+    # long enough because the timeout here is 50ms (#57).
+    for bridge in ("bridge-a", "bridge-b"):
+        armed = sniff_windows(fake, bridge)
+        assert armed, f"{bridge} was never armed"
+        assert min(armed) >= DEFAULT_SNIFF_WINDOW_SECONDS + TRAVEL_BURST_WINDOW_SECONDS, (
+            "each bridge must be told to sniff past the end of the capture window, or in "
+            "production this settle listens to bridges that have already stopped"
+        )
     await fake.emit(
         active_rx(fake, "bridge-b"),
         "rf433/bridge-b/rx",
@@ -1806,6 +1838,97 @@ async def test_a_competitor_arriving_after_the_capture_window_still_refuses(
         assert f"{prefix:06x}:{UNTABLED_REMOTE_ID:02x} on channels 1" in placeholders["remotes"]
 
     hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_rival_that_presses_again_later_still_refuses_the_capture(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole flow, for the erased-evidence case (#57).
+
+    A held winner and a rival heard beside it, then the rival pressed again a
+    second later -- ordinary behaviour for somebody using their own remote
+    across the room. Its single timestamp moved out of the winner's settle
+    window, the settle then saw nothing competing, and the wizard adopted a
+    capture two remotes had claimed at the same moment.
+    """
+    fake = FakeMqtt()
+    monkeypatch.setattr(config_flow_module, "_CAPTURE_TIMEOUT_SECONDS", 1.2, raising=False)
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    # Both untabled, so neither ends the window early: the first is HELD as the
+    # winner and adopted when the window closes.
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": UNTABLED_UP_B1, "t": 3}),
+    )
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": FOREIGN_UNTABLED_UP_B1, "t": 4}),
+    )
+    await asyncio.sleep(0.5)
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": FOREIGN_UNTABLED_UP_B1, "t": 5}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    for prefix in (UNTABLED_PREFIX, FOREIGN_UNTABLED_PREFIX):
+        assert f"{prefix:06x}:{UNTABLED_REMOTE_ID:02x} on channels 1" in placeholders["remotes"]
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_hung_sniff_stop_releases_the_bridge_instead_of_holding_it(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown is bounded, and a claim outlives no publish that never settles.
+
+    The stop fan-out runs in a `finally` on the flow's own task, once per bridge
+    in a list as wide as the discovery snapshot allows. Unbounded, one broker
+    publish that never returns pins that task and every bridge's claim with it,
+    so no later wizard can listen anywhere in the house until Home Assistant is
+    restarted -- while a bridge that never receives its stop merely keeps
+    sniffing until the window it was already given expires.
+    """
+    monkeypatch.setattr(config_flow_module, "_SNIFF_STOP_TIMEOUT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(config_flow_module, "_SNIFF_FANOUT_LIMIT", 2)
+    channels = sniff_channels(6)
+    session_id = "stop-fanout"
+    for channel in channels:
+        config_flow_module._CAPTURE_OWNERS[channel.owner_key] = session_id
+    in_flight = 0
+    peak = 0
+
+    async def publish(*_args: object, **_kwargs: object) -> None:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(mqtt, "async_publish", publish)
+
+    async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
+        await config_flow_module._async_stop_sniff_channels(hass, session_id, channels)
+
+    assert peak <= 2, "the stop fan-out is bounded like the arm fan-out"
+    assert config_flow_module._CAPTURE_OWNERS == {}, (
+        "the claim is given up with the publication, not once a cancellation lands: "
+        "a fleet claimed by a session that is gone needs a restart to clear"
+    )
     await hass.async_block_till_done()
 
 
@@ -1875,16 +1998,139 @@ async def test_a_stale_press_never_crowds_out_a_live_rival(hass: HomeAssistant) 
     assert {remote for remote, _channels, _button in attempt.candidates} == {"live"}, (
         "a press arriving a whole listen later displaces what can no longer compete"
     )
-    assert not attempt.overflowed
+    assert attempt.overflowed_at == []
 
     for index in range(cap - 1):
         stamp(f"busy-{index:02x}", 20.0)
     assert len(attempt.candidates) == cap
     stamp("crowded-out", 20.1)
     assert "crowded-out" not in {remote for remote, _channels, _button in attempt.candidates}
-    assert attempt.overflowed, "a press with no room to be named still forces the refusal"
+    assert attempt.overflowed_at == [20.1], (
+        "a press with no room to be named is remembered by WHEN it was dropped"
+    )
 
     attempt.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_crowded_out_press_stops_counting_once_it_ages_out(hass: HomeAssistant) -> None:
+    """Overflow is a moment, not a mode the whole listen stays in.
+
+    Recording it as a flag meant it could only ever be set: a burst of unrelated
+    remotes early in a 30-second listen refused every capture for the rest of it,
+    including a winner arriving twenty seconds after each press involved had
+    aged out of competing with anything. The drop is judged by the same window
+    its candidates are.
+    """
+    attempt = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    cap = config_flow_module._LEARN_CANDIDATE_CAP
+
+    def stamp(remote: str, heard_at: float) -> None:
+        config_flow_module._stamp_candidate(attempt, (remote, frozenset({1}), "UP"), heard_at)
+
+    for index in range(cap):
+        stamp(f"early-{index:02x}", 0.0)
+    stamp("crowded-out", 0.1)
+    assert attempt.overflowed_at == [0.1], "the drop happened"
+
+    # A press twenty seconds later: nothing from that early burst can compete
+    # with a winner now, and neither can the press they crowded out.
+    stamp("much-later", 20.0)
+    assert attempt.overflowed_at == [], "the drop aged out with the presses that caused it"
+
+    attempt.future.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_rivals_later_repress_never_erases_that_it_competed(hass: HomeAssistant) -> None:
+    """A press is remembered by the occurrence that DECIDES, not the newest one.
+
+    Each candidate keeps one timestamp. Overwriting it with every later copy is
+    right while no winner exists -- a winner still to come cannot anchor before
+    now -- but once one is stamped, the same remote pressed again seconds later
+    moved its only timestamp out of the winner's settle window and erased the
+    evidence that it had been pressed alongside it (#57).
+    """
+    attempt = config_flow_module._SniffAttempt(
+        action="UP",
+        measured={},
+        future=hass.loop.create_future(),
+    )
+    rival = ("rival", frozenset({1}), "UP")
+
+    config_flow_module._stamp_candidate(attempt, rival, 10.0)
+    config_flow_module._stamp_candidate(attempt, rival, 10.2)
+    assert attempt.candidates[rival] == 10.2, (
+        "with no winner yet the newest copy is the nearest any future winner can be"
+    )
+
+    attempt.resolved_at = 10.4
+    config_flow_module._stamp_candidate(attempt, rival, 25.0)
+    assert attempt.candidates[rival] == 10.2, (
+        "the occurrence beside the winner is what the settle has to judge"
+    )
+    config_flow_module._stamp_candidate(attempt, rival, 10.35)
+    assert attempt.candidates[rival] == 10.35, "a NEARER occurrence does replace it"
+
+    attempt.future.cancel()
+
+
+def _held_capture(frame: str, prefix: int, remote_id: int) -> Any:
+    """Build the capture a held (untabled) winner would be adopted from."""
+    from custom_components.zemismart_blinds.codec import decode_rx_capture
+
+    decoded = decode_rx_capture(frame)
+    return config_flow_module._LearnCapture(
+        frame=frame,
+        prefix=prefix,
+        remote_id=remote_id,
+        channels=tuple(decoded["chans"]),
+        command=decoded["cmd"],
+        button="UP",
+        inferred_button=None,
+        base=derive_base(tuple(decoded["chans"]), "UP", decoded["cmd"], remote_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_settle_judges_a_crowd_out_by_the_same_window_as_a_rival(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A press dropped for room refuses only if it was dropped NEAR this winner.
+
+    Overflow has to count exactly like a named rival, which means it is subject
+    to the same question: did it happen alongside the press being adopted? A
+    burst early in the listen refusing a winner twenty seconds later is the
+    unusable-wizard failure the settle window exists to prevent, arriving by
+    another door.
+    """
+    monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    winner = _held_capture(UNTABLED_UP_B1, UNTABLED_PREFIX, UNTABLED_REMOTE_ID)
+
+    def attempt_with(dropped_at: list[float]) -> Any:
+        attempt = config_flow_module._SniffAttempt(
+            action="UP",
+            measured={},
+            future=hass.loop.create_future(),
+        )
+        attempt.resolved_at = hass.loop.time()
+        attempt.overflowed_at = [attempt.resolved_at + offset for offset in dropped_at]
+        attempt.future.cancel()
+        return attempt
+
+    assert await flow._async_settle_first_capture(attempt_with([-20.0]), winner) is True, (
+        "a drop from twenty seconds ago competes with nothing"
+    )
+    assert await flow._async_settle_first_capture(attempt_with([0.005]), winner) is False, (
+        "a drop beside the winner is a press that was heard and could not be named"
+    )
 
 
 @pytest.mark.asyncio
@@ -2309,7 +2555,12 @@ async def test_learn_serializes_concurrent_sniffs_on_one_bridge(
 
     hass.config_entries.flow.async_abort(first_id)
     await fake.wait_for_publications(2)
-    await asyncio.sleep(0)
+    # Wait for the first flow's TEARDOWN, not merely for its stop to be
+    # published: the claim is released once teardown has accounted for every
+    # stop, and a retry that arrives before that is refused as busy. Waiting on
+    # the publication alone made the retry depend on which tick the release
+    # happened to land in.
+    await hass.async_block_till_done()
     second = await hass.config_entries.flow.async_configure(
         second_id,
         {"next_step_id": "learn_retry"},
@@ -2322,9 +2573,10 @@ async def test_learn_serializes_concurrent_sniffs_on_one_bridge(
         "rf433/bridge-a/rx",
         json.dumps({"frame": REFERENCE_UP_B1, "t": 7}),
     )
-    await fake.wait_for_publications(4)
-    second = await hass.config_entries.flow.async_configure(second_id)
-    assert second["step_id"] == "learn_next"
+    # Driven to the step rather than polled once: the capture task publishes its
+    # stop and then finishes accounting for it, so "the stop was published" is
+    # not yet "the capture is done".
+    second = await advance_to_step(hass, second_id, "learn_next")
     hass.config_entries.flow.async_abort(second_id)
 
 
@@ -3633,7 +3885,7 @@ async def test_sniff_handler_keys_a_press_on_the_button_it_actually_is(
 
     assert attempt.future.done(), "the requested action still resolves the attempt"
     assert sorted(button for _remote, _channels, button in attempt.candidates) == ["DOWN", "UP"]
-    assert not attempt.overflowed
+    assert attempt.overflowed_at == []
 
     held = config_flow_module._SniffAttempt(
         action="UP",
@@ -4606,17 +4858,8 @@ def heard_press(frame: str, prefix: int, remote_id: int) -> Any:
     )
 
 
-@pytest.mark.asyncio
-async def test_the_adopt_step_refuses_what_its_menu_would_not_offer(hass: HomeAssistant) -> None:
-    """The identity swap re-makes the refusal instead of trusting its caller.
-
-    Driven at the step rather than through the flow deliberately: Home
-    Assistant validates a menu choice against the options the step published,
-    so this is defence in depth rather than a reachable bypass today. It is
-    cheap and it keeps the rule where the damage is done -- the step rewrites
-    the device's stored identity from ``heard[0]``, and every reason not to
-    lives one screen away in code that only decides which buttons to draw.
-    """
+def _adopt_guard_flow(hass: HomeAssistant) -> Any:
+    """Build one flow parked where the identity swap would happen."""
     flow = config_flow_module.ZemismartBlindsConfigFlow()
     flow.hass = hass
     flow.flow_id = "adopt-guard"
@@ -4628,6 +4871,21 @@ async def test_the_adopt_step_refuses_what_its_menu_would_not_offer(hass: HomeAs
         name="Slider",
         channels=(1, 2),
     )
+    return flow
+
+
+@pytest.mark.asyncio
+async def test_the_adopt_step_refuses_what_its_menu_would_not_offer(hass: HomeAssistant) -> None:
+    """The identity swap re-makes the refusal instead of trusting its caller.
+
+    Driven at the step rather than through the flow deliberately: Home
+    Assistant validates a menu choice against the options the step published,
+    so this is defence in depth rather than a reachable bypass today. It is
+    cheap and it keeps the rule where the damage is done -- the step rewrites
+    the device's stored identity from ``heard[0]``, and every reason not to
+    lives one screen away in code that only decides which buttons to draw.
+    """
+    flow = _adopt_guard_flow(hass)
     flow._measure_heard = (
         heard_press(_foreign_rx_frame("UP"), REF_PREFIX, REF_REMOTE_ID),
         heard_press(_third_rx_frame("UP"), THIRD_PREFIX, THIRD_REMOTE_ID),
@@ -4640,6 +4898,111 @@ async def test_the_adopt_step_refuses_what_its_menu_would_not_offer(hass: HomeAs
     assert flow._identity == RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES), (
         "no identity was adopted"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_capped_heard_list_cannot_prove_one_remote_and_is_refused(
+    hass: HomeAssistant,
+) -> None:
+    """One-click adopt needs uniqueness the capped list cannot establish (#57).
+
+    Everything the screen concludes -- one foreign remote, and this device's own
+    never heard -- is read off a list with a cap. A stranger's remote worked
+    across enough selector positions fills it alone, and the press dropped for
+    room is then the user's own, so both conclusions hold of the list and
+    neither holds of the air. This is where a wrong one overwrites a correct
+    stored identity, so the overflow refuses rather than being outvoted by the
+    presses that happened to fit.
+    """
+    flow = _adopt_guard_flow(hass)
+    # One foreign remote, several selector positions: `_foreign_remotes` sees
+    # exactly one identity and our own is nowhere in the list -- the shape that
+    # offers the adopt.
+    flow._measure_heard = tuple(
+        heard_press(_foreign_rx_frame("UP"), REF_PREFIX, REF_REMOTE_ID) for _selector in range(3)
+    )
+    flow._measure_heard_overflowed = True
+
+    result = await flow.async_step_cover_measure_mismatch()
+
+    assert result["step_id"] == "cover_measure_mismatch"
+    assert "cover_measure_use_heard" not in result["menu_options"], (
+        "a capped list must not be offered as proof of which remote drives this shade"
+    )
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert "more remotes than can be listed" in placeholders["detail"]
+
+    # And the step itself refuses, not merely the menu that reaches it.
+    result = await flow.async_step_cover_measure_use_heard()
+
+    assert result["step_id"] == "cover_measure_mismatch"
+    assert flow._identity == RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES), (
+        "no identity was adopted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_uncapped_heard_list_still_offers_the_adopt(hass: HomeAssistant) -> None:
+    """The control: the refusal above must come from the overflow, not the shape.
+
+    Same presses, same single foreign identity, nothing dropped -- this is the
+    Kaelyn field case the one-click adopt exists for, and it has to keep working
+    or the fix above would be a silent removal of the feature.
+    """
+    flow = _adopt_guard_flow(hass)
+    flow._measure_heard = tuple(
+        heard_press(_foreign_rx_frame("UP"), REF_PREFIX, REF_REMOTE_ID) for _selector in range(3)
+    )
+
+    result = await flow.async_step_cover_measure_mismatch()
+
+    assert result["menu_options"][0] == "cover_measure_use_heard"
+
+
+@pytest.mark.asyncio
+async def test_the_stop_phase_keeps_waiting_when_teardown_clears_the_session(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task that still owes a result outranks a session already cleared.
+
+    ``_async_measure_finish`` sets ``_measure_session`` to None and THEN tears
+    the session down, so between the two this step is re-entered with no session
+    and a task still running -- and every poll re-enters it. Reading the missing
+    session as an abandoned measurement threw away a run the user had just made
+    and dropped the flow into the cover form, for no reason but a broker that
+    took a moment to accept the stop publication. Bounding that teardown (#57)
+    widened the window from "one tick" to "as long as the broker is slow".
+    """
+    _entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    await fake.emit(
+        fake.rx_subscriptions()[-1],
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_DOWN_B1, "t": 1_000, "boot": 7}),
+    )
+    result = await advance_to_step(hass, flow_id, "cover_measure_stop")
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+
+    flow = cast(
+        "config_flow_module.ZemismartBlindsConfigFlow",
+        hass.config_entries.flow._progress[flow_id],
+    )
+    assert flow._measure_task is not None and not flow._measure_task.done()
+    session = flow._measure_session
+    flow._measure_session = None
+
+    result = await hass.config_entries.flow.async_configure(flow_id)
+
+    assert result["type"] is FlowResultType.SHOW_PROGRESS, (
+        "the run is still in flight; only the ABSENCE of a task means there is nothing to wait for"
+    )
+    assert result["step_id"] == "cover_measure_stop"
+
+    # Hand the session back so teardown still releases bridge-a's claim.
+    flow._measure_session = session
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
 
 
 @pytest.mark.asyncio

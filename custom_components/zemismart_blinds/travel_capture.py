@@ -322,6 +322,13 @@ class TravelRun:
     # Which rejected presses `heard` already lists, keyed by signature so the
     # fleet's copies of one press collapse into its single row.
     heard_signatures: set[FrameSignature] = field(default_factory=set)
+    # Set when a DISTINCT rejected press had to be dropped for want of room.
+    # `heard` bounds what a screen can NAME; it must never be read as proof
+    # that only one foreign remote was heard, because the mismatch screen
+    # offers to rewrite this device's stored identity on exactly that basis --
+    # and one stranger's remote worked across enough selector positions fills
+    # the cap while the user's OWN press is what gets dropped (#57).
+    heard_overflowed: bool = False
     # When each signature was last heard, for the repeat filter below. Bounded
     # by construction: `classify_frame` pins the remote and the channel set
     # before a signature exists, so one run can only ever see UP, DOWN, STOP.
@@ -370,9 +377,25 @@ class TravelRun:
         the remote actually in the user's hand: deduplicating on the raw frame
         instead let one remote's copies -- whose bucket timings differ per
         bridge -- exhaust the cap and hide every other remote.
+
+        A press the cap had no room for is REPORTED rather than dropped in
+        silence. What consumes this list decides whether to rewrite the
+        device's identity, and "only one foreign remote was heard" is a claim
+        the list can no longer support once it has overflowed -- the press it
+        could not hold may have been the user's own.
         """
         signature = _mismatch_signature(mismatch)
-        if signature in self.heard_signatures or len(self.heard) >= _HEARD_CAP:
+        if signature in self.heard_signatures:
+            return
+        if len(self.heard) >= _HEARD_CAP:
+            self.heard_overflowed = True
+            _LOGGER.debug(
+                "travel: more than %d distinct presses rejected -- %06x:%02x on %s cannot be named",
+                _HEARD_CAP,
+                mismatch.prefix,
+                mismatch.remote_id,
+                mismatch.channels,
+            )
             return
         self.heard_signatures.add(signature)
         self.heard.append(mismatch)

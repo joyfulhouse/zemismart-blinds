@@ -160,6 +160,20 @@ What narrows it in practice:
   the point it appears rather than discovered later as a shade that stops half
   way.
 
+The same window **over**-catches in the opposite direction, and that is the
+half worth accepting (recorded in round four). `_is_repeat` stamps every STOP
+signature it sees, including a STOP that closed nothing — a duplicate arriving
+with no run open, say. A GENUINE STOP within 1.5 s of that stamp is then read as
+another copy of it and does not close the run, so the run keeps going and the
+eventual measurement is **longer** than the shade's travel.
+
+That is the safe direction, and it is the direction the whole dedup design
+already errs in: a long time stalls the motor against its own limit switch,
+where a short one leaves "closed" visibly open. It also has to survive the
+confirm screen, which prints the seconds before anything is stored. So the
+window keeps one rule for both cases rather than growing a second, more clever
+one that would have to distinguish bytes that are identical.
+
 The `recent` map needs no cap. `classify_frame` pins the remote identity and
 the channel set before a signature exists, so one run can only ever see UP,
 DOWN and STOP; an earlier draft's `_RECENT_CAP` eviction path was unreachable
@@ -172,6 +186,17 @@ press are not equal records at all. Each copy took a row, nine of them
 exhausted `_HEARD_CAP`, and the next remote to press had nowhere to be listed:
 the timeout screen then named one remote and offered to adopt it, which is the
 same silent guess the trust boundary below exists to refuse.
+
+That cap **reports what it turns away** (`heard_overflowed`), which round four
+added for the same reason round three gave the learn cap `overflowed_at`. What
+reads this list decides whether to rewrite the device's stored identity, on two
+claims that are only ever true *of the list*: that one foreign remote was heard,
+and that this device's own was not. One stranger's remote worked across enough
+selector positions fills the cap on its own, and the press dropped for want of
+room is then the user's own — so a full list would have offered to replace a
+correct identity with a stranger's, from evidence that proves neither claim. A
+capped list therefore refuses the one-click adopt (at the screen AND at the step
+that performs the swap), and says it heard "more remotes than can be listed".
 
 **Learn.** `_SniffAttempt.future` still resolves on the first acceptable
 capture; later copies from any bridge return at the `future.done()` gate. What
@@ -280,8 +305,28 @@ choice to make".
      it and the press competing with the winner had nowhere to be recorded. The
      capture then qualified as unambiguous *because* the bus was busy. Presses
      that can no longer compete with the stamped winner or any later one are
-     dropped first; if the cap is still full, the press that found no room sets
-     `overflowed`, which refuses the capture it could not be listed in.
+     dropped first; if the cap is still full, the press that found no room is
+     recorded in `overflowed_at`, which refuses the capture it could not be
+     listed in.
+
+     Round four made that record a **list of timestamps rather than a flag**,
+     judged by the same window as the candidates. A flag could only ever be
+     set, so an unrelated burst early in the listen refused every capture for
+     the remaining twenty-odd seconds — including winners arriving long after
+     every press involved had aged out of competing with anything. A refusal the
+     user cannot comply with is its own defect, the same one the settle window
+     exists to prevent, arriving by another door.
+
+   - **One press keeps the occurrence that DECIDES, not the newest** (round
+     four). Each candidate holds a single timestamp, re-stamped by every later
+     copy. That is right while no winner exists — a winner still to come cannot
+     anchor earlier than now, so the newest occurrence is the closest this press
+     can come to it. Once a winner is stamped it is wrong: a rival heard
+     *inside* the winner's settle window and then pressed again seconds later
+     moved its only timestamp out of that window, and the settle found nothing
+     competing. Somebody using their own remote twice was enough to erase the
+     evidence that two remotes had claimed one capture, so the occurrence
+     nearest the anchor is the one that survives.
 
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
@@ -430,8 +475,41 @@ candidate deadlines, so the re-publish semantics are unchanged.
 **Teardown.** `_async_measure_session_close` walks every channel: cancel the
 holder, unsubscribe, publish `{"action":"sniff","seconds":0}`, and release
 that bridge's owner key through the existing stop-task done-callback
-discipline (release only after the stop publication finished). All stop
-tasks are awaited together under the same shield-and-suppress pattern.
+discipline (release only after the stop publication finished).
+
+The stop fan-out is **bounded and deadlined** like the arm fan-out (round
+four), under the same reasoning: the channel list is as wide as the discovery
+snapshot allows, so an unbounded burst of QoS-1 publications is the teardown's
+own version of the problem arming already solved. Teardown also runs in a
+`finally` on the flow's own task, which makes an unbounded WAIT the more
+serious half — one broker publish that never settles pinned that task and held
+every bridge's claim for the life of the process, so no later wizard could
+listen anywhere in the house without a restart.
+
+At the deadline the outstanding publications are cancelled and their claims
+released *there*, rather than by waiting for the cancellation to land. Two
+properties are kept apart deliberately:
+
+- **Deadline expiry** cancels and releases: this teardown has already given the
+  publication up, and a bridge that never receives its stop merely keeps
+  sniffing until the window it was given expires on its own. Permanently
+  claimed is worse than briefly deaf, and only one of the two needs a restart.
+- **Teardown itself being cancelled** leaves the publications running, exactly
+  as the previous shielded gather did. They are independent tasks and release
+  their own claims when they finish.
+
+`asyncio.wait` replaces the shielded gather to express that: it neither cancels
+what it waits on nor leaves an orphaned shield logging a cancellation nobody is
+left to retrieve.
+
+Bounding that wait exposed a **latent race one tick wide** in
+`cover_measure_stop`, fixed with it: `_async_measure_finish` clears
+`_measure_session` and *then* tears the session down, and the step read a
+missing session as an abandoned measurement. Every poll re-enters that step, so
+a slow broker was enough to throw away a run the user had just made and drop the
+flow into the cover form. A RUNNING task now outranks a missing session — the
+task is what the step is waiting for, and it reports its own outcome; only the
+ABSENCE of a task means there is nothing to wait for.
 
 The Learn path's `_async_capture` gets the same per-bridge claim/subscribe/
 arm/stop treatment inline (it never had a session object; its lifetime is
@@ -461,6 +539,14 @@ strings themselves are untouched. The setup screens do change, from "the
 bridge for this device's area" to "every online bridge", and the picker's
 description now frames a named bridge as an override for diagnosing what one
 bridge hears.
+
+The failure screens are worded for **either** mode (round four). Saying a
+capture "claims every online bridge at once" is false for a user who picked one
+bridge as an override, and it is exactly those users who are diagnosing
+something and least well served by copy that describes a fleet they opted out
+of. "Every bridge it listens on" is true in both modes; the ambiguity screen
+likewise says a rival is heard "within range of the listening bridges" rather
+than "anywhere in the house".
 
 ## Out of scope
 
@@ -494,6 +580,8 @@ Pure machine (`tests/test_travel_capture.py`):
   closes nothing.
 - One press measured by several bridges, whose captures therefore differ byte
   for byte, takes ONE mismatch row and leaves room for the next remote.
+- A distinct press the mismatch list had no room for sets `heard_overflowed`,
+  with the fixture arranged so the press dropped is the user's OWN remote.
 - A re-press after a run closed too fast to store still opens a run — the
   filter must not swallow a press that has nothing to shorten.
 - A STOP 1.4 s after the direction press closes the run rather than being
@@ -541,6 +629,17 @@ Flow (`tests/test_config_flow.py`):
   the capture window plus the settle (and to stay under the firmware's cap).
 - A rival press the candidate cap had no room for refuses the capture anyway,
   while a press that can no longer compete is what the cap spends its room on.
+- A crowd-out ages out with the presses that caused it, and the settle judges it
+  by the same window it judges a named rival by.
+- A rival pressed again outside the settle window still refuses the capture it
+  competed with — at the handler and through the whole flow.
+- A capped mismatch list refuses the one-click adopt at the screen and at the
+  swap step, while an uncapped list with the same shape still offers it (the
+  control that keeps the refusal from being a silent feature removal).
+- A hung stop publication is bounded, cancelled, and its bridge released rather
+  than left claimed by a session that is gone.
+- The stop phase keeps waiting on a running task after teardown has cleared the
+  session, instead of discarding the run it is about to report.
 - One remote's OTHER button is counted as its own press and does not veto the
   capture it agrees with.
 - A bridge queued behind a saturated arm fan-out is cancelled where it waits
@@ -668,7 +767,42 @@ fails when it is removed, so the question need not be re-argued from a diff:
   that promises it rather than inherited, and the order the screens show is
   asserted.
 
-Three low-severity addenda from the same round closed without code changes:
+### Revised after review round 4
+
+Round three fixed the learn cap and left its exact twin unfixed one file away,
+which is the round's lesson: a rule established for one consumer of capped
+evidence has to be carried to every other one in the same change.
+
+- **The measure-side cap dropped presses in silence** while the learn-side cap
+  had just been taught to report them. `heard_overflowed` closes it, and the
+  one-click adopt refuses on it at both the screen and the swap step.
+- **A candidate's only timestamp was overwritten by its own later copies**,
+  erasing the evidence that it had competed with an already-stamped winner.
+- **Overflow was a flag rather than a moment**, so an early burst refused
+  captures for the rest of the listen.
+- **The stop fan-out was unbounded and undeadlined**, and could hold the flow
+  task and the whole fleet's claims on one hung publish — which in turn exposed
+  the one-tick `cover_measure_stop` race above.
+- **A test that did not bind its fix.** The competitor-after-the-window test
+  stayed green with the window constant reverted, because the fake broker keeps
+  delivering past a nominal expiry. It now reads the window off the PUBLISHED
+  command and measures it against the production budget rather than the test's
+  compressed one, so the constant is bound behaviourally as well as
+  arithmetically. (The arithmetic invariant test always did bind it — mutation
+  evidence in the PR — so the false confidence was in the behavioural test
+  alone.)
+- **Busy and ambiguous copy claimed "every online bridge"** even when the user
+  had picked one bridge as an override. Reworded to "every bridge it listens
+  on", which is true in both modes.
+
+Both findings the round adjudicated closed — the first-wins timeout path and the
+subscribe-ready cleanup — were confirmed correct as written; one reviewer
+withdrew its own blocker as a misread of the hunk rather than the file. The
+tests added in round three for both are what settled it, which is the argument
+for pinning a *contested but correct* behaviour with a test rather than only
+replying to the review.
+
+Three low-severity addenda from round three closed without code changes:
 
 - **The progress strings needed no edit.** Every `{bridge}` string places the
   placeholder after "on", which reads correctly for one bridge id or a

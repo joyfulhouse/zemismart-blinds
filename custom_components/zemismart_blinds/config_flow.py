@@ -229,11 +229,15 @@ _LEARN_SETTLE_SECONDS = TRAVEL_BURST_WINDOW_SECONDS
 _LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_LEARN_SETTLE_SECONDS)
 # Bounds the competing-press set against a busy bus. Two is already ambiguous,
 # so the cap only limits how many a screen can NAME -- never whether the
-# capture was ambiguous, which `_SniffAttempt.overflowed` keeps honest.
+# capture was ambiguous, which `_SniffAttempt.overflowed_at` keeps honest.
 _LEARN_CANDIDATE_CAP: Final = 8
 # How many bridges are armed at once. The fleet is single digits today, but the
 # bootstrap budget is fixed, so the work must not grow with it.
 _SNIFF_FANOUT_LIMIT: Final = 8
+# How long teardown waits for every bridge's sniff stop before cancelling what
+# is left. Teardown runs in a `finally` on the flow's own task, so an unbounded
+# wait here is a hung flow AND a fleet of bridges nobody can claim again.
+_SNIFF_STOP_TIMEOUT_SECONDS: Final = _MQTT_BOOTSTRAP_TIMEOUT_SECONDS
 # Consecutive failed re-arm publications before a bridge's hold gives up. The
 # window outlives several misses, and a bridge that is simply gone must not be
 # retried for the rest of the run.
@@ -273,6 +277,17 @@ def _release_capture_owner(
     if not stop_task.cancelled():
         with suppress(Exception):
             stop_task.result()
+    _release_capture_claim(owner_key, session_id)
+
+
+@callback
+def _release_capture_claim(owner_key: tuple[int, str], session_id: str) -> None:
+    """Drop one bridge's claim, if this session is still the holder.
+
+    Separate from the done-callback above so a teardown that has decided to
+    abandon a stop publication can give the bridge up THERE, rather than leaving
+    it claimed until a cancellation it can no longer wait for lands.
+    """
     if _CAPTURE_OWNERS.get(owner_key) == session_id:
         del _CAPTURE_OWNERS[owner_key]
 
@@ -438,7 +453,11 @@ def _stamp_candidate(
     than being lost silently, because refusing is the recoverable direction.
     """
     if signature in attempt.candidates:
-        attempt.candidates[signature] = heard_at
+        attempt.candidates[signature] = _decisive_occurrence(
+            attempt,
+            attempt.candidates[signature],
+            heard_at,
+        )
         return
     for stale in [
         candidate
@@ -446,10 +465,19 @@ def _stamp_candidate(
         if _cannot_compete(attempt, last_heard, heard_at)
     ]:
         del attempt.candidates[stale]
+    attempt.overflowed_at = [
+        dropped
+        for dropped in attempt.overflowed_at
+        if not _cannot_compete(attempt, dropped, heard_at)
+    ]
     if len(attempt.candidates) >= _LEARN_CANDIDATE_CAP:
         # Every entry is still in play, so there is nothing safe to evict. A
         # press we cannot even name is still a press that was heard.
-        attempt.overflowed = True
+        if len(attempt.overflowed_at) < _LEARN_CANDIDATE_CAP:
+            # Bounded like the candidates themselves. Being at this cap too
+            # means a whole cap's worth of drops are still in play, which the
+            # settle already refuses on -- one more timestamp changes nothing.
+            attempt.overflowed_at.append(heard_at)
         _LOGGER.debug(
             "Learn: more than %d presses in play at once -- %s cannot be named",
             _LEARN_CANDIDATE_CAP,
@@ -457,6 +485,26 @@ def _stamp_candidate(
         )
         return
     attempt.candidates[signature] = heard_at
+
+
+def _decisive_occurrence(attempt: _SniffAttempt, tracked: float, heard_at: float) -> float:
+    """Return which occurrence of one press the ambiguity check must remember.
+
+    Re-stamping with the newest copy is right while no winner exists: a winner
+    still to come cannot anchor earlier than now, so the newest occurrence is
+    the closest this press can possibly come to it.
+
+    Once a winner IS stamped, overwriting destroys evidence. A rival heard
+    INSIDE the winner's settle window and then pressed AGAIN twenty seconds
+    later kept only the later stamp, which is out of window -- so the settle
+    found nothing competing and adopted a capture two remotes had claimed
+    (#57). The occurrence nearest the anchor is the one that decides, so it is
+    the one that survives.
+    """
+    anchor = attempt.resolved_at
+    if anchor is None:
+        return heard_at
+    return min(tracked, heard_at, key=lambda occurrence: abs(occurrence - anchor))
 
 
 def _cannot_compete(attempt: _SniffAttempt, last_heard: float, now: float) -> bool:
@@ -741,32 +789,80 @@ async def _async_stop_sniff_channels(
     Ownership is released only once a bridge's stop publication finished (the
     existing single-bridge discipline, per channel): releasing earlier would
     let a new session arm a window this one is still about to close.
+
+    Bounded and deadlined like the arm fan-out, and for the same reason: the
+    channel list is as wide as the discovery snapshot allows, so an unbounded
+    burst of QoS-1 publications is the teardown's own version of the problem
+    arming already solved.
+
+    At the deadline the outstanding publications are CANCELLED rather than left
+    running, which releases their claims through the same done-callback. That is
+    the deliberate trade: a broker publish that never settles would otherwise
+    pin this flow task and hold every bridge's claim for the life of the
+    process, so no wizard could listen on them again without a restart -- while
+    a bridge that never receives its stop merely keeps sniffing until the window
+    it was given expires on its own. Permanently claimed is worse than briefly
+    deaf, and only one of the two is recoverable without a restart.
     """
     from homeassistant.components import mqtt
 
-    stops: list[tuple[_SniffChannel, asyncio.Task[None]]] = []
-    for channel in channels:
-        stop_task = hass.async_create_task(
-            mqtt.async_publish(
+    limiter = asyncio.Semaphore(_SNIFF_FANOUT_LIMIT)
+
+    async def _stop_one(channel: _SniffChannel) -> None:
+        async with limiter:
+            await mqtt.async_publish(
                 hass,
                 channel.command_topic,
                 _sniff_command(0),
                 qos=1,
                 retain=False,
-            ),
+            )
+
+    stops: list[tuple[_SniffChannel, asyncio.Task[None]]] = []
+    for channel in channels:
+        stop_task = hass.async_create_task(
+            _stop_one(channel),
             f"{DOMAIN} sniff stop",
         )
         stop_task.add_done_callback(
             functools.partial(_release_capture_owner, channel.owner_key, session_id)
         )
         stops.append((channel, stop_task))
+    if not stops:
+        return
+    expired = False
     try:
-        with suppress(Exception):
-            await asyncio.shield(asyncio.gather(*(task for _channel, task in stops)))
+        # `asyncio.wait` rather than a shielded gather: it does not cancel what
+        # it waits on, so a teardown that is itself cancelled still leaves every
+        # stop publication running exactly as the shield did -- and it reports a
+        # deadline by returning rather than by cancelling a future nobody is
+        # left to retrieve.
+        settled, _outstanding = await asyncio.wait(
+            [task for _channel, task in stops],
+            timeout=_SNIFF_STOP_TIMEOUT_SECONDS,
+        )
+        expired = len(settled) != len(stops)
     finally:
         for channel, stop_task in stops:
             if stop_task.done():
                 _release_capture_owner(channel.owner_key, session_id, stop_task)
+                continue
+            if not expired:
+                # Teardown was cancelled rather than slow. The publication is an
+                # independent task and finishes on its own, releasing its claim
+                # through the done-callback above.
+                continue
+            _LOGGER.warning(
+                "Sniff stop to %s did not finish within %.0fs; cancelling it and releasing "
+                "the bridge, which would otherwise stay claimed until Home Assistant restarts",
+                channel.command_topic,
+                _SNIFF_STOP_TIMEOUT_SECONDS,
+            )
+            stop_task.cancel()
+            # Released HERE rather than by waiting for the cancellation: this
+            # teardown has already given the publication up, and the claim must
+            # not outlive that decision by however long the cancel takes to land.
+            _release_capture_claim(channel.owner_key, session_id)
 
 
 async def _async_arm_sniff_channels(
@@ -911,6 +1007,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     _pending_measure: _PendingMeasure | None = None
     _measure_session: _MeasureSession | None = None
     _measure_heard: tuple[HeardPress, ...] = ()
+    # Whether the run had to drop a distinct rejected press for want of room.
+    # Carried alongside the presses themselves because it changes what they
+    # PROVE: a capped list cannot establish that only one foreign remote was
+    # heard, and that claim is the whole basis of the one-click adopt (#57).
+    _measure_heard_overflowed: bool = False
     _measure_task: asyncio.Task[TravelMeasurement | str] | None = None
     _measure_outcome: str | None = None
     _measure_error: str | None = None
@@ -1866,7 +1967,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._measure_task is None:
             session_id = secrets.token_hex(16)
             self._sniff_session_id = session_id
-            self._measure_heard = ()
+            self._forget_heard_presses()
             self._measure_task = self.hass.async_create_task(
                 self._async_measure_arm(session_id),
                 f"{DOMAIN} travel arm",
@@ -1910,15 +2011,22 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_show_progress_done(next_step_id="cover_measure_timeout")
 
         session = self._measure_session
-        if session is None:
-            return await self._async_measure_abandoned()
         if self._measure_task is None:
+            if session is None:
+                return await self._async_measure_abandoned()
             self._measure_task = self.hass.async_create_task(
                 self._async_measure_finish(session),
                 f"{DOMAIN} travel stop wait",
             )
-
-        started = session.run.started
+        # A RUNNING task outranks a missing session, deliberately. The finish
+        # task clears `_measure_session` and then tears the session down, so
+        # between those two there is a moment when the session is gone and the
+        # task still owes us its outcome -- and this step is re-entered on every
+        # poll. Reading the missing session as abandonment there threw the
+        # measurement away (and the flow into the cover form) for no reason but
+        # a slow broker: the task is what we are waiting for, and it reports its
+        # own result above. Only its ABSENCE means there is nothing to wait for.
+        started = session.run.started if session is not None else None
         return self.async_show_progress(
             step_id="cover_measure_stop",
             progress_action="measuring_stop",
@@ -2013,6 +2121,18 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    def _forget_heard_presses(self) -> None:
+        """Drop what a measurement heard, and whether it could hold it all.
+
+        Both together, always. They are one piece of evidence: an overflow flag
+        left set from an earlier attempt refuses a later legitimate adopt,
+        while one cleared on its own lets a capped list prove the uniqueness it
+        cannot (#57). Three call sites had to remember the pair, which is the
+        shape of bug this whole change keeps finding.
+        """
+        self._measure_heard = ()
+        self._measure_heard_overflowed = False
+
     async def async_step_cover_measure_mismatch(
         self,
         user_input: dict[str, Any] | None = None,
@@ -2052,23 +2172,35 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             None,
         )
         foreign = _foreign_remotes(heard, identity)
-        if own is None and len(foreign) > 1:
+        capped = self._measure_heard_overflowed
+        if own is None and (len(foreign) > 1 or capped):
             # The whole fleet is listening, so "the remote we heard" can be
             # several houses' worth of them. Adopting heard[0] would pin this
             # device to whichever happened to arrive first (#57).
+            #
+            # A capped list refuses on the same grounds even when it holds ONE
+            # foreign remote. "This device's own remote was never heard" is
+            # then unprovable -- the press dropped for want of room may have
+            # been exactly that -- and one stranger's remote worked across
+            # enough selector positions fills the list on its own.
+            named = ", ".join(
+                f"{prefix:06x}:{remote_id:02x}" for prefix, remote_id in sorted(foreign)
+            )
+            detail = (
+                "Presses from more remotes than can be listed were heard while listening, "
+                f"including {named}. "
+                if capped
+                else f"Presses from several different remotes were heard while listening: {named}. "
+            )
             return self.async_show_menu(
                 step_id="cover_measure_mismatch",
                 menu_options=menu_options,
                 description_placeholders={
                     "detail": (
-                        "Presses from several different remotes were heard while listening: "
-                        + ", ".join(
-                            f"{prefix:06x}:{remote_id:02x}" for prefix, remote_id in sorted(foreign)
-                        )
-                        + ". None of them is this device's stored remote "
-                        f"{identity.prefix:06x}:{identity.remote_id:02x}, and which one drives "
-                        "this shade cannot be told apart from here. Try again while only this "
-                        "shade's own remote is being pressed."
+                        detail + "None of the presses that could be recorded is this device's "
+                        f"stored remote {identity.prefix:06x}:{identity.remote_id:02x}, and which "
+                        "remote drives this shade cannot be told apart from here. Try again while "
+                        "only this shade's own remote is being pressed."
                     )
                 },
             )
@@ -2131,10 +2263,15 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 for press in heard
             )
             or len(_foreign_remotes(heard, stored)) != 1
+            or self._measure_heard_overflowed
         ):
             # Either this device's own remote was heard (the identity is
             # right, the channel selector is not) or several remotes were,
             # and which one drives this shade is not knowable from here.
+            #
+            # A list that overflowed cannot answer either question: it proves
+            # only what it had room to keep, and this step is where a wrong
+            # answer overwrites a correct stored identity.
             _LOGGER.debug("Travel: refusing a one-click adopt the mismatch screen would not offer")
             return await self.async_step_cover_measure_mismatch()
         key = (heard[0].prefix, heard[0].remote_id)
@@ -2158,7 +2295,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             identity, _derived = _remote_identity_from_captures(captures)
         except ValueError:
             return await self.async_step_cover_measure_timeout()
-        self._measure_heard = ()
+        self._forget_heard_presses()
         if self.source == config_entries.SOURCE_RECONFIGURE:
             failure = await self._async_swap_entry_identity(identity)
             if failure is not None:
@@ -2306,7 +2443,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._measure_task.cancel()
         self._measure_task = None
         self._sniff_session_id = None
-        self._measure_heard = ()
+        self._forget_heard_presses()
         session = self._measure_session
         self._measure_session = None
         if session is not None:
@@ -2469,7 +2606,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 and abs(last_heard - anchor) <= _LEARN_SETTLE_SECONDS
             }
         )
-        if not competing and not attempt.overflowed:
+        # A press the cap had no room for counts exactly like a named one, and
+        # is judged by the same window: the drop has to have happened near THIS
+        # winner. Treating any drop during the whole listen as disqualifying
+        # let an unrelated burst 20 seconds earlier refuse a clean capture.
+        crowded_out = any(
+            abs(dropped - anchor) <= _LEARN_SETTLE_SECONDS for dropped in attempt.overflowed_at
+        )
+        if not competing and not crowded_out:
             return True
         self._learn_candidates = (_press_name(winner_signature), *competing)
         _LOGGER.debug(
@@ -2685,8 +2829,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     await session.armed.wait()
             except TimeoutError:
                 # What WAS heard survives the session so the timeout screen
-                # can name the remote actually in the user's hand.
+                # can name the remote actually in the user's hand -- with
+                # whether anything had to be dropped, which decides what the
+                # list is allowed to prove.
                 self._measure_heard = tuple(session.run.heard)
+                self._measure_heard_overflowed = session.run.heard_overflowed
                 return "no_press"
             armed = True
             return "armed"

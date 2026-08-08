@@ -689,3 +689,44 @@ def test_one_foreign_press_heard_by_the_fleet_leaves_room_for_the_next() -> None
         (UNTABLED_PREFIX, UNTABLED_REMOTE_ID),
         (TEST_PREFIX, TEST_REMOTE_ID),
     ], "the remote that pressed next is still there to be named"
+    assert not run.heard_overflowed, "two presses fit; nothing was dropped"
+
+
+def test_a_dropped_mismatch_is_reported_not_silently_forgotten() -> None:
+    """A full `heard` list must say so, because of what reads it (#57).
+
+    The mismatch screen offers to REWRITE this device's stored identity when
+    exactly one foreign remote was heard and this device's own was not. Both
+    halves of that are claims about a list with a cap: one stranger's remote
+    worked across enough selector positions fills it on its own, and the press
+    dropped for want of room is then the user's own remote -- so the screen
+    would read "one foreign remote, ours never heard" off evidence that proves
+    neither, and overwrite a correct identity with a stranger's.
+    """
+    run = run_for()
+    for channel in range(1, _HEARD_CAP + 1):
+        one_selector = {
+            "frame": b1_frame(
+                UNTABLED_PREFIX,
+                UNTABLED_REMOTE_ID,
+                (channel,),
+                "DOWN",
+                UNTABLED_BASES,
+            ),
+            "t": 1_000 + channel,
+            "boot": 7,
+        }
+        assert run.offer_payload(one_selector, 100.0 + channel * 0.1, "bridge-a") is None
+    assert len(run.heard) == _HEARD_CAP
+    assert not run.heard_overflowed, "the cap is reached, but nothing has been turned away yet"
+
+    own_on_other_channels = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (7,), "UP", TEST_BASES),
+        "t": 5_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(own_on_other_channels, 102.0, "bridge-a") is None
+    assert all(
+        (press.prefix, press.remote_id) != (TEST_PREFIX, TEST_REMOTE_ID) for press in run.heard
+    ), "the fixture must exercise the case where OUR press is the one dropped"
+    assert run.heard_overflowed, "the list has to admit it could not hold everything"

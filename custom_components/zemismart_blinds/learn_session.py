@@ -136,12 +136,16 @@ class _SniffAttempt:
     # that was also pressed minutes earlier still competes if it is pressed
     # again alongside ours.
     candidates: dict[FrameSignature, float] = field(default_factory=dict)
-    # Set when a distinct press arrived with the candidate cap full of presses
-    # that could all still compete. The cap bounds how many presses a SCREEN
-    # can name; it must never decide whether the capture was ambiguous, or a
-    # busy bus would buy silence -- so a press dropped for room forces the
-    # refusal it could not be listed in (#57).
-    overflowed: bool = False
+    # When each press the candidate cap had no room for was heard. The cap
+    # bounds how many presses a SCREEN can name; it must never decide whether
+    # the capture was ambiguous, or a busy bus would buy silence -- so a press
+    # dropped for room forces the refusal it could not be listed in (#57).
+    #
+    # Timestamps rather than a flag, because a flag could only ever be set: an
+    # unrelated burst early in the 30-second listen then refused a capture
+    # whose winner arrived twenty seconds after every press involved had aged
+    # out. These age by the same window rule the candidates do.
+    overflowed_at: list[float] = field(default_factory=list)
     # When the capture that WON this attempt arrived, on the event loop clock.
     # The competing-press window is measured from here, not from the start of
     # the 30-second listen: a press heard 20 seconds before ours is ordinary

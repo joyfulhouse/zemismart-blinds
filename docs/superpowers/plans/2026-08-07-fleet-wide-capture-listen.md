@@ -187,6 +187,38 @@ Round-3 addendum, all documentation (no code, no strings):
 - The arm fan-out's semaphore is KEPT; Bounds records why (the fan-out is as
   wide as the 256-entry discovery snapshot, not as the house's bridge count).
 
+### Task 9: Fourth review round
+
+Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`,
+`strings.json`, `translations/en.json`, both test modules, spec
+
+Round three's lesson repeated one file away: a rule established for one consumer
+of capped evidence was not carried to the other.
+
+- `TravelRun.heard_overflowed` mirrors the learn cap's `overflowed_at`: a
+  distinct rejected press dropped at `_HEARD_CAP` is reported, and the
+  mismatch screen and the identity-swap step both refuse the one-click adopt on
+  it. One foreign remote across enough selector positions fills the list while
+  the user's own press is dropped — the shape that offered to overwrite a
+  correct identity with a stranger's.
+- `_decisive_occurrence` keeps the occurrence of a press NEAREST the stamped
+  winner instead of the newest, so a rival pressed again later cannot erase that
+  it competed.
+- `overflowed_at` is a list of timestamps aged by the same window as the
+  candidates, replacing a flag that could only ever be set.
+- The stop fan-out is bounded by `_SNIFF_FANOUT_LIMIT` and deadlined by
+  `_SNIFF_STOP_TIMEOUT_SECONDS`; at expiry it cancels and releases the claim
+  itself. Cancellation of the teardown still leaves the publications running.
+- `cover_measure_stop` lets a RUNNING task outrank a cleared session — a latent
+  one-tick race the bounded teardown widened into a visible one.
+- The competitor-after-the-window test now reads the armed window off the
+  PUBLISHED command and compares it against the production budget, so it fails
+  when the window constant is reverted (it did not before).
+- Busy/ambiguous copy is mode-neutral: "every bridge it listens on".
+- Docs: the STOP repeat filter's over-catch (a genuine STOP suppressed within
+  1.5 s of an earlier STOP's stamp → measures LONG, the safe direction) recorded
+  beside the existing under-catch.
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and

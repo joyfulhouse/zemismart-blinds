@@ -260,7 +260,7 @@
       },
       "learn_busy": {
         "title": "The bridges are busy",
-        "description": "Another Zemismart setup window is already listening on {bridge}. A capture claims every online bridge at once, and one press must be learned by one window rather than both, so it cannot start while any bridge is held. Finish or close the other window, then try again.",
+        "description": "Another Zemismart setup window is already listening on {bridge}. A capture claims every bridge it listens on, and one press must be learned by one window rather than both, so it cannot start while any of them is held. Finish or close the other window, then try again.",
         "menu_options": {
           "learn_retry": "Try again",
           "advanced": "Advanced"
@@ -268,7 +268,7 @@
       },
       "learn_ambiguous": {
         "title": "More than one press was heard",
-        "description": "More than one press arrived while listening for {action}: {remotes}. Every online bridge is listening, so a remote pressed anywhere in the house is heard here, and adopting the wrong one would misconfigure this device silently. Try again, pressing only the remote you are setting up, once, on the channel selector this blind uses.",
+        "description": "More than one press arrived while listening for {action}: {remotes}. Any remote pressed within range of the listening bridges is heard here, and adopting the wrong one would misconfigure this device silently. Try again, pressing only the remote you are setting up, once, on the channel selector this blind uses.",
         "menu_options": {
           "learn_retry": "Try again",
           "advanced": "Advanced"
@@ -276,7 +276,7 @@
       },
       "cover_measure_busy": {
         "title": "The bridges are busy",
-        "description": "Another Zemismart setup window is already listening on {bridge}. A measurement claims every online bridge at once, so it cannot start while any of them is held. Finish or close the other window, then measure again.",
+        "description": "Another Zemismart setup window is already listening on {bridge}. A measurement claims every bridge it listens on, so it cannot start while any of them is held. Finish or close the other window, then measure again.",
         "menu_options": {
           "cover_measure_run": "Try {wanted} again",
           "cover_measure_manual": "Type the times instead"
