@@ -47,7 +47,7 @@ does: on every online bridge at once.
 | Decision | Choice |
 | --- | --- |
 | Subscription shape | One subscription **per target bridge**, not the `rf433/+/rx` wildcard — a flow-local wildcard would also hear bridges the user explicitly excluded via the override, and per-bridge subscriptions give each handler its `bridge_id` without re-parsing topics |
-| Dedup | A **signature-keyed sliding filter**, keyed and windowed like `state_sync`'s debounce, plus an unconditional rule that the run's opening signature can never re-anchor it — see below |
+| Dedup | A **signature-keyed sliding filter**, keyed and windowed like `state_sync`'s debounce, plus an unconditional rule that no signature which has ALREADY anchored the run can re-anchor it — see below |
 | Timing across bridges | Bridge-clock subtraction only when the direction press and the STOP were heard by the **same** bridge; otherwise fall back to the monotonic receive times |
 | Ownership | Claim **every** target bridge in `_CAPTURE_OWNERS` or none: any bridge another session holds refuses the whole claim as a **conflict**, never as silence on air and never as a quiet listen on the subset |
 | First learn capture | Refuses to adopt when a **second press** was heard alongside it, on the resolved and the timed-out path alike — see the trust boundary below |
@@ -197,16 +197,20 @@ correct identity with a stranger's, from evidence that proves neither claim. A
 capped list therefore refuses the one-click adopt (at the screen AND at the step
 that performs the swap), and says it heard "more remotes than can be listed".
 
-This cap cannot be structured away the way the learn-side one was (below): the
-`heard` list is not a window's worth of recent presses but the whole timeout
-screen's evidence, gathered across a 30-second arm and read once at the end. So
-it keeps an explicit overflow report, and the one thing it must never do is
-answer a uniqueness question from a list that overflowed.
+The learn side needs no such report, and this cap cannot borrow that (below):
+the learn bound holds a window's worth of recent presses, so what it drops can be
+shown to be harmless, while the `heard` list is the whole timeout screen's
+evidence, gathered across a 30-second arm and read once at the end. Both bounds
+still exist; only the learn side's overflow bookkeeping was structured away. So
+this one keeps an explicit report, and the one thing it must never do is answer a
+uniqueness question from a list that overflowed.
 
 **Learn.** `_SniffAttempt.future` still resolves on the first acceptable
-capture; later copies from any bridge return at the `future.done()` gate. What
-fleet listening does change there is *which* remote may resolve it — see the
-trust boundary below.
+capture; later copies from any bridge stop short of resolving anything at the
+`future.done()` gate. They are recorded BEFORE that gate, though, which is what
+lets a rival arriving after the winner still land in the winner's window — see
+the trust boundary below, which is also where *which* remote may resolve it
+changed.
 
 ## Timing: same-bridge preferred, monotonic across bridges
 
@@ -220,11 +224,12 @@ boot guard. So:
   **same** `bridge_id` (both-`None` counts as same, preserving the pure unit
   tests and any payload without attribution). Otherwise it falls through to
   the monotonic receive-time difference, exactly like the missing-`t` path.
-- `started` is the first copy heard of the opening press, and the repeat
-  filter guarantees it is the only copy that reaches the run. When the STOP
-  arrives from that same bridge the interval is computed on the bridge clock;
-  when it arrives from any other (the Kaelyn case, or a bridge that died
-  mid-run) the monotonic receive times bound it.
+- `started` is the first copy heard of the opening press, and it stays that
+  copy because `_open` refuses every signature already in `anchored` — not
+  because of the repeat filter, which direction frames deliberately bypass (see
+  the dedup section). When the STOP arrives from that same bridge the interval is
+  computed on the bridge clock; when it arrives from any other (the Kaelyn case,
+  or a bridge that died mid-run) the monotonic receive times bound it.
 
 There is deliberately **no per-bridge stamp map**. An earlier draft kept one,
 so a STOP could always be timed against its own bridge's copy of the start.
@@ -252,10 +257,11 @@ choice to make".
    identity to gate on — `_capture_belongs_to_this_action` compares against
    already-measured actions, and on the first there are none — so any
    Zemismart remote satisfies it. It now keeps listening for
-   `_LEARN_SETTLE_SECONDS` (one burst window) past its winner, collecting
-   every distinct press heard. One candidate: proceed as before. More than
-   one: refuse, name them, and offer retry (`learn_ambiguous`). Captures 2
-   and 3 need no settle — the first capture has pinned the remote by then.
+   `_LEARN_SETTLE_SECONDS` (one burst window) past its winner, counting any
+   press from a DIFFERENT remote or selector into that winner's window. An empty
+   window: proceed as before. Anything in it: refuse, name what was heard, and
+   offer retry (`learn_ambiguous`). Captures 2 and 3 need no settle — the first
+   capture has pinned the remote by then.
 
    Three details decide whether that rule is honest, and the second review
    round corrected all three:
@@ -349,7 +355,7 @@ choice to make".
        unambiguous. Production is 8, so no live defect — but a floor stated as 2
        licensed turning the knob into the unsafe range, which is why
        `test_the_press_bound_leaves_room_for_a_rival` now pins 4 and demonstrates
-       the eviction one below it. The rival NAMES a screen
+       the eviction below it, at 3 and at 2. The rival NAMES a screen
        shows are bounded separately and are safe at any size, because a name is
        dropped only once that many are already in a set that is therefore not
        empty. `overflowed_at` and its aging existed to compensate for a bound
@@ -402,7 +408,9 @@ actually give. Pressing again while nobody else is pressing resolves it in one
 action, and the wizard says exactly that.
 
 **Cost.** One burst window (1.5 s) added to the first capture of a Learn run,
-and nothing anywhere else.
+and each learn bridge told to sniff for that settle on top of the capture window
+(`_LEARN_SNIFF_WINDOW_SECONDS`, 32 s rather than 30) so the settle is not spent
+deaf. Nothing anywhere else.
 
 ## Ownership: exclusive, and a conflict is not silence
 
@@ -473,10 +481,12 @@ Fleet-sized work needs fleet-independent limits:
   republished to forever, so breadth costs nothing.
 - **Caches**: `_LEARN_CANDIDATE_CAP` bounds two things, neither of them a
   verdict — how many recently-heard presses one attempt remembers (oldest
-  dropped, and a window can only reach the newest) and how many rivals a screen
-  NAMES. `_HEARD_CAP` mismatch rows per travel run, keyed by signature so one
-  press cannot fill it, and reporting what it turns away. The repeat filter needs
-  no cap — see the dedup section.
+  dropped; what keeps that from hiding a rival is that the winner takes the
+  newest slot, which is also why the bound has a floor of
+  `len(_LEARN_ACTIONS) + 1`) and how many rivals a screen NAMES. `_HEARD_CAP`
+  mismatch rows per travel run, keyed by signature so one press cannot fill it,
+  and reporting what it turns away. The repeat filter needs no cap — see the
+  dedup section.
 
 ## Session shape
 
@@ -514,10 +524,14 @@ must not kill the holder (nor, being separate tasks, the other bridges'
 holders). The firmware's `start_sniff` still takes the later of current and
 candidate deadlines, so the re-publish semantics are unchanged.
 
-**Teardown.** `_async_measure_session_close` walks every channel: cancel the
-holder, unsubscribe, publish `{"action":"sniff","seconds":0}`, and release
-that bridge's owner key through the existing stop-task done-callback
-discipline (release only after the stop publication finished).
+**Teardown.** `_async_measure_session_close` walks every channel to cancel the
+holder and unsubscribe, then hands the whole set to
+`_async_stop_sniff_channels`, which publishes `{"action":"sniff","seconds":0}`
+to every bridge and releases every owner key from the `finally` of its own
+independent task — after the publications settle, after they fail, or at the
+shared deadline. The per-publication done-callback that used to gate each
+release was deleted in round five along with the per-bridge stop tasks: one task
+that always releases is what survives its own caller being cancelled.
 
 The stop fan-out carries **its own absolute deadline and its own release**,
 inside one independent task the caller merely waits on (rounds four and five).
@@ -641,7 +655,7 @@ Pure machine (`tests/test_travel_capture.py`):
   insensitive to channel order.
 - Direction on bridge A, STOP only on bridge B → monotonic fallback, never a
   cross-bridge `t` subtraction (even with equal `boot` values).
-- A second STOP copy after the run closed is ignored.
+- The seven repeats behind a closing STOP resolve nothing further.
 
 Flow (`tests/test_config_flow.py`):
 
@@ -679,7 +693,6 @@ Flow (`tests/test_config_flow.py`):
 - A competitor arriving after the capture window closed but inside the settle is
   still heard and still refuses, and the armed learn window is asserted to cover
   the capture window plus the settle (and to stay under the firmware's cap).
-- A rival press the candidate cap had no room for refuses the capture anyway.
 - The press bound's floor is `len(_LEARN_ACTIONS) + 1`: at the floor a rival
   survives the winner's own other buttons, and one below it the eviction that
   sets the floor is demonstrated.
@@ -696,9 +709,10 @@ Flow (`tests/test_config_flow.py`):
 - The settle judges the window it was HANDED, so the same attempt refuses or
   adopts according to which capture is being adopted; a capture with no window
   refuses.
-- The remembered-press bound drops the oldest and still leaves a rival named, at
-  the smallest bound production allows; and more rivals than can be NAMED still
-  refuse. (The floor itself is the bullet above.)
+- The remembered-press bound drops the oldest and still names every rival it
+  can reach, driven at production's own bound with a distinct remote per press;
+  and more rivals than can be NAMED still refuse. (The floor is the bullet
+  above.)
 - A flow removed at the arm→STOP handoff releases every bridge it had claimed.
 - A rival pressed again outside the settle window still refuses the capture it
   competed with — at the handler and through the whole flow.
@@ -838,6 +852,24 @@ fails when it is removed, so the question need not be re-argued from a diff:
   that promises it rather than inherited, and the order the screens show is
   asserted.
 
+Three low-severity addenda from round three closed without code changes:
+
+- **The progress strings needed no edit.** Every `{bridge}` string places the
+  placeholder after "on", which reads correctly for one bridge id or a
+  comma-joined list, so only the placeholder's value changed — see Copy above.
+  The plan's Task 4 claimed an edit the diff did not contain, and has been
+  corrected rather than the strings being changed to match the claim.
+- **The STOP-copy residual is now written down** rather than left implicit in
+  the asymmetry between `anchored` and the sliding window — see "Residual risk"
+  in the dedup section.
+- **The arm fan-out kept its semaphore** at the time, with the reason recorded
+  in Bounds: the fan-out's width comes from a 256-entry discovery snapshot, not
+  from the house's bridge count. **Superseded in round five** — the semaphore is
+  deleted and the fan-out runs concurrently under one shared absolute deadline,
+  which is what bounds the user-visible window; see Bounds for why a limit in
+  front of that deadline only chose which bridges miss out, and carried an
+  ordering hazard of its own.
+
 ### Revised after review round 4
 
 Round three fixed the learn cap and left its exact twin unfixed one file away,
@@ -917,8 +949,9 @@ one test-quality gap that would have let the refactor rot:
   invariant.** It claimed the press bound drops what no window can reach;
   everything the bound holds is inside one settle window, so the drop IS
   reachable. The real reason is that the winner occupies the newest slot — which
-  makes the bound safe only at 2 or more, a floor nothing enforced while the
-  suite was monkeypatching it to 1. Corrected, pinned, and the forbidden
+  made the bound look safe at 2 or more (**superseded in round seven: the floor
+  is `len(_LEARN_ACTIONS) + 1`**), a floor nothing enforced while the suite was
+  monkeypatching it to 1. Corrected, pinned, and the forbidden
   configuration removed from the suite.
 - **The refactor's two seams were only covered by units built by hand.** Delete
   the window's look-back, or the line storing the recognised winner's window, and
@@ -976,20 +1009,34 @@ drifted from the code it describes:
   fan-out, whose bound and whose test were both deleted in round five. The
   guarantee that replaced it is in the fan-out bullet above it.
 
-Three low-severity addenda from round three closed without code changes:
+### Revised after review round 9
 
-- **The progress strings needed no edit.** Every `{bridge}` string places the
-  placeholder after "on", which reads correctly for one bridge id or a
-  comma-joined list, so only the placeholder's value changed — see Copy above.
-  The plan's Task 4 claimed an edit the diff did not contain, and has been
-  corrected rather than the strings being changed to match the claim.
-- **The STOP-copy residual is now written down** rather than left implicit in
-  the asymmetry between `anchored` and the sliding window — see "Residual risk"
-  in the dedup section.
-- **The arm fan-out kept its semaphore** at the time, with the reason recorded
-  in Bounds: the fan-out's width comes from a 256-entry discovery snapshot, not
-  from the house's bridge count. **Superseded in round five** — the semaphore is
-  deleted and the fan-out runs concurrently under one shared absolute deadline,
-  which is what bounds the user-visible window; see Bounds for why a limit in
-  front of that deadline only chose which bridges miss out, and carried an
-  ordering hazard of its own.
+Clean on code for the third round running, so this round reconciled the
+document instead: every claim in this file, in the plan, and in the docstrings
+of the four modules the PR touches was re-read against head and checked, and
+every identifier the prose names was confirmed either present in the tree or
+described as deleted.
+
+That sweep is the point. Written round by round, this file accumulated prose
+that was true when a round wrote it and orphaned by the round after — the
+repeat filter credited with a guarantee `anchored` took over, a teardown
+paragraph describing a release discipline deleted two rounds earlier, a cache
+note still carrying the false invariant round seven replaced, a test-inventory
+bullet for a test round three replaced and another for one round five deleted.
+None of it was a code defect; all of it would have re-surfaced as a finding.
+
+Two structural fixes rather than word changes:
+
+- The round-three addenda had been stranded under the round-eight heading by
+  the sections inserted between them, which read as round eight's work. Moved
+  back under round three.
+- Claims in the dated history that a later round reversed now say so inline
+  (the press bound's floor of 2, the arm fan-out's semaphore, the settle-time
+  arithmetic), so the history stays readable as history without inviting a
+  re-flag.
+
+Also checked and left alone, because they are accurate: the plan's stated
+mypy gate (both `uv run mypy --strict` and the plan's `--strict .` report the
+same 33 files), `cover_measure_use_heard` adopting `heard[0]` (guarded to the
+one foreign remote before it reads position zero), and the Problem section's
+quote of the pre-#57 one-bridge docstring, which is dated to v0.9.4.

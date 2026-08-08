@@ -108,8 +108,10 @@ class TravelMeasurement:
 def interval_seconds(start: TimedPress, stop: TimedPress) -> float | None:
     """Return the run's duration, preferring the bridge's own clock.
 
-    Both frames come from one bridge over one MQTT path, so subtracting their
-    ``t`` values cancels broker and event-loop jitter outright. This is NOT a
+    When both frames came from the SAME bridge they travelled one MQTT path, so
+    subtracting their ``t`` values cancels broker and event-loop jitter
+    outright. That is the preferred case and the reason the bridge clock is
+    consulted at all; the fleet-wide case is the paragraph below. This is NOT a
     ``BridgeClock`` projection: that class places events on Home Assistant's
     timeline, and a run needs only an interval on the bridge's own.
 

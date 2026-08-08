@@ -37,9 +37,13 @@ Files: `travel_capture.py`, `tests/test_travel_capture.py`
   those two see only genuinely new presses. `offer_payload` gains a
   `bridge_id: str | None = None` parameter. No per-bridge stamp map: its
   precision was below measurement granularity.
+  (Superseded in Task 7: the filter no longer gates `_open` at all — a press
+  with no run open cannot shorten one — and the anchor is protected by
+  `anchored` instead.)
 - Tests: fleet-wide dedup, the spread-copy short-travel regression, a fast
   STOP not swallowed, signature separation, cross-bridge monotonic fallback
-  (equal boots!), post-close STOP ignored.
+  (equal boots!), post-close STOP ignored (superseded in Task 8: that test could
+  not fail, and is now the stale-STOP-into-a-reopened-run case).
 
 ### Task 2: Fleet-wide measure session
 
@@ -55,6 +59,10 @@ Files: `config_flow.py`
 - `_async_measure_arm` claims/subscribes/holds per bridge, skipping owned
   bridges, failing only when none claim. `_async_measure_session_close`
   tears down every channel with the existing stop-task/release discipline.
+  (Superseded in Task 10: one independent task publishes every stop and
+  releases every claim from its own `finally`, per-bridge stop tasks and their
+  done-callbacks deleted. Task 8 also made the claim atomic, so no bridge is
+  skipped.)
 - `cover_measure_setup`: Automatic → `BridgeRegistry.online_bridge_ids()`
   (new method); explicit → that bridge. Delete `_measure_area_id`.
 
@@ -113,6 +121,8 @@ Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
   several foreign remotes were heard.
 - Claim conflicts reported as `bridge_busy` rather than as silence on air.
 - Bounded arm fan-out; bounded re-arm retry on a narrow `HomeAssistantError`.
+  (Both narrowed later: Task 7 widened the re-arm `except` back to broad, keeping
+  the bounded retry, and Task 10 deleted the fan-out bound.)
 - Teardown assertion that every test released its bridge claims.
 
 ### Task 7: Second review round
@@ -120,7 +130,7 @@ Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
 Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
 `tests/test_travel_capture.py`, `tests/test_config_flow.py`
 
-Each round-6 fix had a second code path it did not cover:
+Each Task-6 fix had a second code path it did not cover:
 
 - The trust boundary now also gates the unrecognised-opcode TIMEOUT path, and
   its settle sleeps only the remainder of the window the winner has not
@@ -148,7 +158,7 @@ Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`,
 `bridge_registry.py`, `tests/test_travel_capture.py`,
 `tests/test_config_flow.py`, spec
 
-Each round-7 guard protected one instance of something there were several of:
+Each Task-7 guard protected one instance of something there were several of:
 
 - `TravelRun` remembers EVERY signature that has anchored the run, not just the
   current one, and clears them on close. A run restarted on UP was otherwise
@@ -160,6 +170,8 @@ Each round-7 guard protected one instance of something there were several of:
 - `_stamp_candidate` prunes presses that can no longer compete before applying
   `_LEARN_CANDIDATE_CAP`, and a press it still had no room for sets
   `overflowed`, which refuses the capture. The cap bounds naming only.
+  (Superseded in Task 10: `_stamp_candidate` is `_record_press`, and the
+  overflow report is gone because no bound decides a verdict any more.)
 - Mismatch rows dedup by signature, not by raw frame: bridges report their own
   pulse widths, so one press was filling `_HEARD_CAP`.
 - The arm fan-out's shared deadline wraps the semaphore acquisition too.
@@ -186,6 +198,7 @@ Round-3 addendum, all documentation (no code, no strings):
   before anything is saved.
 - The arm fan-out's semaphore is KEPT; Bounds records why (the fan-out is as
   wide as the 256-entry discovery snapshot, not as the house's bridge count).
+  (Superseded in Task 10: deleted, along with the ordering hazard it carried.)
 
 ### Task 9: Fourth review round
 
@@ -203,12 +216,17 @@ of capped evidence was not carried to the other.
   correct identity with a stranger's.
 - `_decisive_occurrence` keeps the occurrence of a press NEAREST the stamped
   winner instead of the newest, so a rival pressed again later cannot erase that
-  it competed.
+  it competed. (Superseded in Task 10: deleted — a rival is counted when it
+  arrives, so no occurrence has to be chosen.)
 - `overflowed_at` is a list of timestamps aged by the same window as the
-  candidates, replacing a flag that could only ever be set.
+  candidates, replacing a flag that could only ever be set. (Superseded in
+  Task 10: deleted with the rest of the settle-time arithmetic.)
 - The stop fan-out is bounded by `_SNIFF_FANOUT_LIMIT` and deadlined by
   `_SNIFF_STOP_TIMEOUT_SECONDS`; at expiry it cancels and releases the claim
   itself. Cancellation of the teardown still leaves the publications running.
+  (Superseded in Task 10: the bound is gone and the deadline moved into the
+  independent task, because a deadline on the caller's await dies with the
+  caller.)
 - `cover_measure_stop` lets a RUNNING task outrank a cleared session — a latent
   one-tick race the bounded teardown widened into a visible one.
 - The competitor-after-the-window test now reads the armed window off the
@@ -233,15 +251,19 @@ one exists, so the prescribed dual-timestamp patch was NOT written:
   anchor is judged out of the recently-heard presses as the window opens; the
   half after, as each press arrives. The settle sleeps and reads the verdict.
   `_decisive_occurrence`, `_cannot_compete` and `overflowed_at` are deleted, and
-  no cap can decide a verdict any more (the remembered-press bound drops the
-  oldest, which no window can reach; the name cap only shortens a screen).
+  no cap can decide a verdict any more — the remembered-press bound drops the
+  oldest while the winner holds the newest slot (Task 12 corrects the reasoning
+  first written here, which claimed the dropped press was out of every window's
+  reach, and derives the floor of `len(_LEARN_ACTIONS) + 1`); the name cap only
+  shortens a screen.
 - The stop teardown owns its deadline and its release inside one independent
   task: a deadline on the caller's await vanishes when the caller is cancelled,
   which left hung publications untimed and their bridges claimed for the life of
   the process.
-- `_SNIFF_FANOUT_LIMIT` deleted from the arm fan-out, and with it the ordering
-  hazard round three had to fix inside it. The shared absolute deadline is what
-  protects the advertised window.
+- `_SNIFF_FANOUT_LIMIT` deleted outright — from the arm fan-out, and with it the
+  ordering hazard Task 8 had to fix inside it, and from the stop fan-out Task 9
+  had just bounded. The shared absolute deadline is what protects the advertised
+  window.
 - A real arm-timeout test drives nine distinct mismatches and asserts the screen
   offers no adopt, covering the `heard_overflowed` wiring line that every other
   test straddled.
@@ -263,9 +285,11 @@ that has to hold the invariant in place.
   and every bridge claimed until a restart.
 - The press bound's justification was false (everything it holds is in window, so
   the dropped press IS reachable). Replaced with the real arithmetic — the winner
-  takes the newest slot — which makes the bound safe only at 2 or more; that
-  floor is now pinned by `test_the_press_bound_leaves_room_for_a_rival`, and the
-  suite no longer monkeypatches the bound to 1.
+  takes the newest slot — which made the bound look safe at 2 or more
+  (superseded in Task 12: the floor is `len(_LEARN_ACTIONS) + 1`, because the
+  winner's own other buttons take slots a rival cannot); that floor is pinned by
+  `test_the_press_bound_leaves_room_for_a_rival`, and the suite no longer
+  monkeypatches the bound to 1.
 - The before-half tests now record the winner FIRST, as the handler does, and run
   at the bound's floor, so they exercise the interaction that made the old
   justification wrong.
@@ -314,6 +338,18 @@ corrections):
 - Two live test-inventory bullets in the spec were stale: the press bound's
   "floor of two", and a bridge queueing behind a saturated arm fan-out whose
   bound and test were deleted in round 5.
+
+### Task 13: Ninth review round — documentation reconciliation
+
+Files: docstrings in `travel_capture.py` and `bridge_registry.py`, spec, this
+plan. No production behaviour: the executable tokens of both modules are
+byte-identical across this task.
+
+Clean on code for the third round running. Every claim in the spec, in this
+plan, and in the docstrings of the four modules the PR touches was re-read
+against head; each round-by-round task above that a later task reversed now
+says so inline, and the "round-N" labels that actually meant "Task N" are
+fixed. Details in the spec's round-9 entry.
 
 ## Status
 

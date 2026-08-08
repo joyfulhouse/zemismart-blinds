@@ -37,7 +37,12 @@ class BridgeInfo:
 
 
 class BridgeRegistry:
-    """Track retained bridge availability/info and resolve one TX target."""
+    """Track retained bridge availability/info and resolve who a flow talks to.
+
+    Two different questions, deliberately two methods: ``resolve`` picks the ONE
+    bridge a command transmits from, while ``online_bridge_ids`` returns every
+    bridge a capture flow listens on (#57).
+    """
 
     def __init__(self) -> None:
         """Initialize an empty registry."""
