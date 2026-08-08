@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A press that fails to match is now reported, and a mismatched remote can be adopted.** When
+  the listen window closes without a matching press but a real press *was* heard, the flow says
+  what it heard instead of a generic timeout: this remote on the wrong channel set (naming both
+  sets), or a different remote entirely — with a one-click option to replace the device's stored
+  remote with the heard one. The replacement calibration is seeded from the buttons actually
+  heard, deriving only the untouched ones, and goes through the same drain/disarm/device-re-key
+  procedure as a relearn.
+
 ### Changed
+
+- **The listen window no longer spins for two minutes.** The arming deadline dropped from 120 s
+  to 30 s — the user is standing at the shade pressing buttons, so if nothing matched in half a
+  minute nothing will, and the timeout screen is more useful than more spinning.
 
 - **Travel measurement now reacts visibly to each press.** The single spinner that ran from
   arming to STOP is split into two phases: the first screen advances the moment a direction

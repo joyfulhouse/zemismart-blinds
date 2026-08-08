@@ -3160,3 +3160,133 @@ async def test_a_virtual_remote_still_refuses_blank_travel(
     )
     assert result["step_id"] == "cover"
     assert result["errors"] == {"base": "travel_required"}
+
+
+def _foreign_rx_frame(button: str, channels: tuple[int, ...] = (1, 2)) -> str:
+    """Synthesize a capture from the tabled reference remote (not the entry's)."""
+    return b0_to_b1(
+        encode_b0(make_payload(REF_PREFIX, REF_REMOTE_ID, channels, button, bases=REF_BASES))
+    )
+
+
+async def _start_remeasure_listening(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ConfigEntry, str, FakeMqtt]:
+    """Reach an armed re-measure session on bridge-a for a stored cover."""
+    entry = await create_remote_entry(
+        hass,
+        monkeypatch,
+        [
+            {
+                CONF_NAME: "Slider",
+                CONF_CHANNELS: "1,2",
+                CONF_TRAVEL_UP: 10,
+                CONF_TRAVEL_DOWN: 10,
+            }
+        ],
+    )
+    slider = stored_cover_rows(entry)[0]
+    fake = FakeMqtt()
+    install_mqtt(monkeypatch, fake)
+    result = await start_reconfigure_flow(hass, entry)
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "cover_pick_edit"})
+    await hass.config_entries.flow.async_configure(flow_id, {CONF_COVER_ID: slider[CONF_COVER_ID]})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "cover_measure_start"})
+    result = await hass.config_entries.flow.async_configure(flow_id, {CONF_BRIDGE: "bridge-a"})
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await fake.wait_for_publications(1)
+    return entry, flow_id, fake
+
+
+@pytest.mark.asyncio
+async def test_hearing_a_different_remote_offers_an_identity_update(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreign remote heard during the arming window can be adopted.
+
+    The Kaelyn field case: the stored identity does not match the remote in
+    the user's hand, so nothing ever matches and the old flow spun for the
+    full deadline. Now the timeout names the heard remote and one menu click
+    replaces the entry's identity -- seeded from the presses actually heard,
+    with only the untouched button derived.
+    """
+    monkeypatch.setattr(config_flow_module, "TRAVEL_ARM_TIMEOUT_SECONDS", 0.5)
+    entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    rx = fake.rx_subscriptions()[-1]
+    for button, millis in (("UP", 1_000), ("STOP", 3_000)):
+        await fake.emit(
+            rx,
+            "rf433/bridge-a/rx",
+            json.dumps({"frame": _foreign_rx_frame(button), "t": millis, "boot": 7}),
+        )
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "cover_measure_mismatch"
+    assert result["menu_options"] == [
+        "cover_measure_use_heard",
+        "cover_measure_run",
+        "cover_measure_manual",
+    ]
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x}" in placeholders["detail"]
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"next_step_id": "cover_measure_use_heard"}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["step_id"] == "cover_measure_run"
+
+    adopted = RemoteConfig.from_entry(entry.data).remote
+    assert (adopted.prefix, adopted.remote_id) == (REF_PREFIX, REF_REMOTE_ID)
+    assert adopted.bases is not None
+    # UP and STOP were measured from the heard frames; only DOWN is derived.
+    assert adopted.bases.up == REF_BASES.up
+    assert adopted.bases.stop == REF_BASES.stop
+    assert adopted.bases.down == REF_BASES.down
+    assert entry.unique_id == adopted.key
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_hearing_the_own_remote_on_other_channels_names_both_sets(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrong-channel-selector near-miss is explained, not offered as update.
+
+    The identity is right, so replacing it would be wrong -- the fix is the
+    remote's channel selector (or the cover's channels), and the menu says so
+    without the adopt option.
+    """
+    monkeypatch.setattr(config_flow_module, "TRAVEL_ARM_TIMEOUT_SECONDS", 0.5)
+    _entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    rx = fake.rx_subscriptions()[-1]
+    own_wrong_channel = b0_to_b1(
+        encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", bases=TEST_BASES))
+    )
+    await fake.emit(
+        rx,
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": own_wrong_channel, "t": 1_000, "boot": 7}),
+    )
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_configure(flow_id)
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "cover_measure_mismatch"
+    assert result["menu_options"] == ["cover_measure_run", "cover_measure_manual"]
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert "channels 3" in placeholders["detail"]
+    assert "channels 1,2" in placeholders["detail"]
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()

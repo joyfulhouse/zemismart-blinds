@@ -248,6 +248,15 @@
           "cover_edit": "Edit name, channels and travel times",
           "cover_measure_start": "Measure travel times with the remote"
         }
+      },
+      "cover_measure_mismatch": {
+        "title": "Nothing matched, but a press was heard",
+        "description": "{detail}",
+        "menu_options": {
+          "cover_measure_use_heard": "Update this device to the heard remote",
+          "cover_measure_run": "Try again",
+          "cover_measure_manual": "Type the times instead"
+        }
       }
     },
     "error": {
