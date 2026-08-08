@@ -19,6 +19,7 @@ from custom_components.zemismart_blinds.travel_capture import (
     TravelRun,
     identify_button,
     interval_seconds,
+    press_signature,
     stored_value,
 )
 from tests.synthetic import (
@@ -406,42 +407,93 @@ def test_a_stop_heard_only_by_another_bridge_falls_back_to_monotonic() -> None:
     assert measurement.measured_seconds == 14.5, "cross-bridge t subtraction is meaningless"
 
 
-def test_a_stop_prefers_its_own_bridges_start_stamp() -> None:
-    """A bridge that heard both frames times the run on its own clock.
+def test_one_press_heard_by_every_bridge_is_counted_once() -> None:
+    """A press the whole fleet heard opens ONE run, timed from the first copy.
 
-    The run was opened by bridge-a's copy, but the STOP arrives on bridge-b,
-    which also heard the press 80 ms later. bridge-b's own stamp pair is the
-    precise measurement; the earliest-start monotonic fallback is not needed.
+    Seven bridges each delivering the 8-frame burst is 56 copies of one
+    physical press. Every copy after the first must be filtered out ahead of
+    the run: the measurement is bounded by when the press HAPPENED, not by
+    which bridge's delivery happened to arrive last.
     """
     run = run_for()
-    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
-    run.offer_payload(rx("DOWN", 50_080), 100.08, bridge_id="bridge-b")
-    measurement = run.offer_payload(rx("STOP", 64_390), 114.4, bridge_id="bridge-b")
-    assert measurement is not None
-    assert measurement.measured_seconds == 14.31
-
-
-def test_a_restart_clears_the_other_bridges_start_stamps() -> None:
-    """A restarted run must not time its STOP against a stale first press.
-
-    bridge-b heard the ABANDONED press and not the restart. Its stale stamp
-    would time the run from 30 s ago; only clearing the map on restart leaves
-    the monotonic fallback to bound it from the press that actually opened
-    the run. The two answers are deliberately far apart -- a stale stamp that
-    happened to agree would prove nothing.
-    """
-    run = run_for()
-    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
-    run.offer_payload(rx("DOWN", 50_000), 100.05, bridge_id="bridge-b")
-    # Outside the burst window: the user started over.
-    run.offer_payload(rx("DOWN", 5_000), 104.0, bridge_id="bridge-a")
-    measurement = run.offer_payload(rx("STOP", 80_000), 118.5, bridge_id="bridge-b")
-    assert measurement is not None
-    assert measurement.measured_seconds == 14.5, (
-        "bridge-b never heard the restart, so its stale stamp must be gone "
-        "and the run timed monotonically from the restart press -- keeping it "
-        "would have read 30.0s off bridge-b's own clock"
+    # Every bridge reports its own `t`; only the receive clock relates them.
+    # Copies interleave across bridges, so they are offered in arrival order.
+    arrivals = sorted(
+        (repeat * 0.076 + index * 0.011, index, bridge, repeat)
+        for index, bridge in enumerate(f"bridge-{letter}" for letter in "abcdefg")
+        for repeat in range(8)
     )
+    for offset, index, bridge, repeat in arrivals:
+        assert (
+            run.offer_payload(
+                rx("DOWN", 1_000 + index * 40_000 + repeat * 76),
+                100.0 + offset,
+                bridge_id=bridge,
+            )
+            is None
+        )
+    assert run.started is not None
+    assert run.started.bridge_id == "bridge-a", "the first copy heard opens the run"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, "56 copies of one press are one press"
+
+
+def test_a_lagging_bridges_spread_copies_never_shorten_the_run() -> None:
+    """Copies that keep arriving must not expire into a phantom re-press.
+
+    A bridge under broker backpressure delivers its share of the burst
+    stretched out, so the LAST copy of one press can land more than a burst
+    window after the FIRST. Treating that copy as a new press restarts the
+    run and stores a travel time short by the whole spread -- the unsafe
+    direction, since a short time leaves "closed" visibly open. The filter
+    slides per signature, so the chain holds however long it runs.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    for step in (1.0, 2.0, 3.0):
+        assert (
+            run.offer_payload(rx("DOWN", 500_000 + int(step * 1_000)), 100.0 + step, "bridge-b")
+            is None
+        ), f"the copy {step}s in is still one press, not a re-press"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, (
+        "a re-anchor on the 3.0s copy would have stored 11.31s -- 3 seconds short"
+    )
+
+
+def test_a_stop_inside_the_window_is_not_swallowed_as_a_repeat() -> None:
+    """The button is part of the dedup key, so a fast STOP still closes.
+
+    A user who stops the shade 1.4 s after starting it presses inside the
+    repeat window. Keying the filter on the remote and channels alone would
+    read that STOP as another copy of the DOWN and never close the run.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    measurement = run.offer_payload(rx("STOP", 2_400), 101.4, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "DOWN"
+    assert measurement.measured_seconds == 1.4
+
+
+def test_a_signature_separates_remotes_and_channels_not_just_buttons() -> None:
+    """Two presses collapse only when they are copies of ONE press on air.
+
+    The measure run gates on a calibrated identity before the filter sees a
+    frame, so within one run the signature can only vary by button. The Learn
+    wizard has no such gate -- it is the reason the key carries the remote and
+    the channel set as well.
+    """
+    base = press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "DOWN")
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (2, 1), "DOWN") == base, (
+        "one selector, whatever order the channels decode in"
+    )
+    assert press_signature(UNTABLED_PREFIX, TEST_REMOTE_ID, (1, 2), "DOWN") != base
+    assert press_signature(TEST_PREFIX, UNTABLED_REMOTE_ID, (1, 2), "DOWN") != base
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 3), "DOWN") != base
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP") != base
 
 
 def test_a_second_bridges_stop_copy_after_the_close_is_ignored() -> None:

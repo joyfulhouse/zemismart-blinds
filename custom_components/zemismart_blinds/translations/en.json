@@ -58,7 +58,7 @@
       },
       "learn_confirm": {
         "title": "Confirm the detected remote",
-        "description": "Detected prefix {prefix}, remote ID {remote_id}, and channels {channels} for {name} through {bridge}. Measured from a real press: {measured}. Calculated rather than measured: {derived}. A calculated base can be wrong for remotes outside the common command layout — test those actions, and correct them under Edit remote settings if a blind does not respond.",
+        "description": "Detected prefix {prefix}, remote ID {remote_id}, and channels {channels} for {name}, heard on {bridge}. Measured from a real press: {measured}. Calculated rather than measured: {derived}. A calculated base can be wrong for remotes outside the common command layout — test those actions, and correct them under Edit remote settings if a blind does not respond.",
         "menu_options": {
           "remote_settings": "Continue",
           "learn_retry": "Try again",
@@ -255,6 +255,30 @@
         "menu_options": {
           "cover_measure_use_heard": "Update this device to the heard remote",
           "cover_measure_run": "Try again",
+          "cover_measure_manual": "Type the times instead"
+        }
+      },
+      "learn_busy": {
+        "title": "The bridges are busy",
+        "description": "Another Zemismart setup window is already listening on {bridge}. Only one capture can hold a bridge at a time, otherwise one press would be learned by both windows. Finish or close the other window, then try again.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
+      "learn_ambiguous": {
+        "title": "More than one remote was heard",
+        "description": "Presses from several remotes arrived while listening for {action}: {remotes}. Every online bridge is listening, so a remote pressed anywhere in the house is heard here, and adopting the wrong one would misconfigure this device silently. Try again, and press only the remote you are setting up.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
+      "cover_measure_busy": {
+        "title": "The bridges are busy",
+        "description": "Another Zemismart setup window is already listening on {bridge}. Only one capture can hold a bridge at a time. Finish or close the other window, then measure again.",
+        "menu_options": {
+          "cover_measure_run": "Try {wanted} again",
           "cover_measure_manual": "Type the times instead"
         }
       }

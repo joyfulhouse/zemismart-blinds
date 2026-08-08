@@ -29,14 +29,17 @@ Files: `travel_capture.py`, `tests/test_travel_capture.py`
 - `TimedPress` gains `bridge_id: str | None = None`.
 - `interval_seconds` uses the bridge clock only when both presses carry the
   same `bridge_id` (both `None` counts as same); otherwise monotonic.
-- `TravelRun` gains `starts: dict[str, TimedPress]` per-bridge stamps of the
-  current press; `offer_payload` gains a `bridge_id: str | None = None`
-  parameter. `_open` absorbs same-direction copies inside the burst window
-  while stamping each new bridge once; a restart clears the stamps. `_close`
-  prefers the STOP bridge's own stamp; else the earliest start (which then
-  falls to monotonic via the `bridge_id` mismatch).
-- Tests: two-bridge dedup, cross-bridge monotonic fallback (equal boots!),
-  same-bridge preference, restart clears stamps, post-close STOP ignored.
+- New `press_signature(prefix, remote_id, channels, button)` returning the
+  same `FrameSignature` shape `state_sync` debounces on; `classify_frame`
+  returns it alongside the button.
+- `TravelRun` gains `recent: dict[FrameSignature, float]` and `_is_repeat`,
+  a SLIDING window (each copy re-stamps) applied BEFORE `_open`/`_close`, so
+  those two see only genuinely new presses. `offer_payload` gains a
+  `bridge_id: str | None = None` parameter. No per-bridge stamp map: its
+  precision was below measurement granularity.
+- Tests: fleet-wide dedup, the spread-copy short-travel regression, a fast
+  STOP not swallowed, signature separation, cross-bridge monotonic fallback
+  (equal boots!), post-close STOP ignored.
 
 ### Task 2: Fleet-wide measure session
 
@@ -71,8 +74,13 @@ Files: `strings.json`, `translations/en.json`
 
 - `learn_setup.data_description.bridge`, `cover_measure_setup.description`,
   `progress.sniffing` / `progress.measuring`: Automatic = every online
-  bridge, named bridge = single-bridge override. `{bridge}` placeholder now
-  carries the joined listening set.
+  bridge, named bridge = single-bridge override. The `{bridge}` placeholder
+  carries the joined listening set on the screens that describe LISTENING.
+- `learn_confirm` is the exception and must not: "learned ... through
+  {bridge}" is a claim about which bridge HEARD the remote, so it receives
+  the bridges the captures actually arrived on. Feeding it the armed set
+  would name bridges that heard nothing.
+- New failure screens `learn_busy`, `learn_ambiguous`, `cover_measure_busy`.
 
 ### Task 5: Flow tests + mutation check
 
@@ -85,6 +93,19 @@ Files: `tests/test_config_flow.py`
   measurement; bridge-silent-mid-run completes via the other bridge;
   explicit override arms exactly one; Learn captures off the second bridge.
 - Run each new test with the implementation reverted to confirm red.
+
+### Task 6: Review round (added after the first tribunal pass)
+
+Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
+`tests/conftest.py`
+
+- Dedup by signature ahead of the run (Task 1 above, rewritten).
+- Learn first-capture trust boundary: settle, then refuse to adopt when a
+  second remote was heard; withdraw the measure screen's one-click adopt when
+  several foreign remotes were heard.
+- Claim conflicts reported as `bridge_busy` rather than as silence on air.
+- Bounded arm fan-out; bounded re-arm retry on a narrow `HomeAssistantError`.
+- Teardown assertion that every test released its bridge claims.
 
 ## Status
 

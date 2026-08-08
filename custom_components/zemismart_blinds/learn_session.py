@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.core import callback
@@ -108,6 +108,15 @@ class _LearnCapture:
     inferred_button: str | None
     # The per-remote calibrated base recovered from this exact capture.
     base: int
+    # Which bridge delivered this capture. The wizard arms the whole fleet, so
+    # "the bridge" is only knowable per capture -- and which bridge can hear a
+    # given remote is the useful half of what #57 measured.
+    bridge_id: str | None = None
+
+    @property
+    def remote_key(self) -> tuple[int, int]:
+        """Identify the physical remote this capture came from."""
+        return self.prefix, self.remote_id
 
 
 @dataclass(slots=True)
@@ -117,6 +126,12 @@ class _SniffAttempt:
     action: str
     measured: dict[str, _LearnCapture]
     future: asyncio.Future[_LearnCapture]
+    # Every distinct remote heard pressing this action, not just the winner.
+    # The first capture of a wizard run has no calibrated identity to gate on,
+    # so with the whole fleet listening ANY remote pressed anywhere in the
+    # house lands here; adopting one while another was heard too would be a
+    # silent guess (#57).
+    candidates: dict[tuple[int, int], _LearnCapture] = field(default_factory=dict)
     # A structurally valid capture whose opcode byte is not in the codec's
     # action table. That table is a 10-sample empirical fit, not protocol, so
     # an unrecognised opcode is not evidence of a bad capture -- it is held

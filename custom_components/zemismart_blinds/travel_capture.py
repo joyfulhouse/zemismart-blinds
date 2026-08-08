@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .codec import DecodedFrame
+    from .command_ledger import FrameSignature
     from .config_models import RemoteIdentity
 
 __all__ = [
@@ -39,10 +40,14 @@ __all__ = [
     "classify_frame",
     "identify_button",
     "interval_seconds",
+    "press_signature",
     "stored_value",
 ]
 
 _HEARD_CAP: Final = 8
+# One run sees three signatures (UP, DOWN, STOP) from one remote. The cap is a
+# runaway guard for a bus carrying traffic we reject, not a working set.
+_RECENT_CAP: Final = 32
 
 DIRECTIONS: Final = ("UP", "DOWN")
 BUTTONS: Final = ("UP", "DOWN", "STOP")
@@ -148,6 +153,24 @@ def stored_value(seconds: float) -> int | None:
     return value
 
 
+def press_signature(
+    prefix: int,
+    remote_id: int,
+    channels: tuple[int, ...],
+    button: str,
+) -> FrameSignature:
+    """Identify one physical press: which remote, which channels, which button.
+
+    The same shape and key order ``state_sync`` debounces its fleet-wide
+    captures on, because it answers the same question: two captures share a
+    signature exactly when they are copies of one press on air. Channels and
+    remote are part of the key deliberately -- a bare button would collapse
+    two different remotes, or one remote on two channel selectors, into a
+    single press.
+    """
+    return f"{prefix:06x}:{remote_id:02x}", frozenset(channels), button
+
+
 def identify_button(
     identity: RemoteIdentity,
     channels: tuple[int, ...],
@@ -161,13 +184,14 @@ def classify_frame(
     identity: RemoteIdentity,
     channels: tuple[int, ...],
     frame: str,
-) -> tuple[str | None, HeardPress | None]:
+) -> tuple[str | None, HeardPress | None, FrameSignature | None]:
     """Match one frame against the calibration, or explain the rejection.
 
-    Returns ``(button, None)`` on a match; ``(None, HeardPress)`` when the
-    frame is a real press that fails the identity or channel gate -- the two
-    rejections a user can act on; ``(None, None)`` for everything else
-    (undecodable input and this remote's own non-action trailer burst).
+    Returns ``(button, None, signature)`` on a match; ``(None, HeardPress,
+    None)`` when the frame is a real press that fails the identity or channel
+    gate -- the two rejections a user can act on; ``(None, None, None)`` for
+    everything else (undecodable input and this remote's own non-action
+    trailer burst).
 
     Exact, not inferred. ``derive_base`` validates its ``button`` argument and
     then never uses it -- the recovery keeps the capture's opcode byte and
@@ -185,11 +209,11 @@ def classify_frame(
     """
     bases = identity.bases
     if bases is None:
-        return None, None
+        return None, None, None
     try:
         decoded = decode_rx_capture(frame)
     except _DECODE_ERRORS:
-        return None, None
+        return None, None, None
     observed_channels = tuple(decoded["chans"])
     if (decoded["prefix"], decoded["remote_id"]) != (identity.prefix, identity.remote_id):
         _LOGGER.debug(
@@ -199,7 +223,7 @@ def classify_frame(
             identity.prefix,
             identity.remote_id,
         )
-        return None, _heard(frame, decoded, observed_channels)
+        return None, _heard(frame, decoded, observed_channels), None
     if observed_channels != channels:
         _LOGGER.debug(
             "travel: ignoring this remote's press on channels %s -- the cover being "
@@ -207,20 +231,29 @@ def classify_frame(
             decoded["chans"],
             list(channels),
         )
-        return None, _heard(frame, decoded, observed_channels)
+        return None, _heard(frame, decoded, observed_channels), None
     try:
         base = derive_base(observed_channels, "UP", decoded["cmd"], decoded["remote_id"])
     except _DECODE_ERRORS:
-        return None, None
+        return None, None, None
     for button in BUTTONS:
         if base == bases.base(button):
-            return button, None
+            return (
+                button,
+                None,
+                press_signature(
+                    decoded["prefix"],
+                    decoded["remote_id"],
+                    observed_channels,
+                    button,
+                ),
+            )
     _LOGGER.debug(
         "travel: base 0x%04x matches none of this remote's calibrated actions "
         "(likely the OEM trailer burst)",
         base,
     )
-    return None, None
+    return None, None, None
 
 
 def _heard(
@@ -261,11 +294,9 @@ class TravelRun:
     channels: tuple[int, ...]
     wanted: frozenset[str]
     started: TimedPress | None = None
-    # The first copy of the CURRENT press each bridge heard. Fleet listening
-    # delivers one physical press from several bridges; timing a run on one
-    # bridge's clock requires knowing when THAT bridge heard the start.
-    starts: dict[str, TimedPress] = field(default_factory=dict)
     heard: list[HeardPress] = field(default_factory=list)
+    # When each signature was last heard, for the repeat filter below.
+    recent: dict[FrameSignature, float] = field(default_factory=dict)
 
     def offer_payload(
         self,
@@ -277,13 +308,15 @@ class TravelRun:
         frame = payload.get(MQTT_RX_FIELD_FRAME)
         if not isinstance(frame, str):
             return None
-        button, mismatch = classify_frame(self.identity, self.channels, frame)
+        button, mismatch, signature = classify_frame(self.identity, self.channels, frame)
         if mismatch is not None and len(self.heard) < _HEARD_CAP and mismatch not in self.heard:
             # A repeat burst is 8 copies of one press; keeping distinct
             # presses only is what lets the timeout screen name the remote
             # actually in the user's hand instead of a wall of duplicates.
             self.heard.append(mismatch)
-        if button is None:
+        if button is None or signature is None:
+            return None
+        if self._is_repeat(signature, received_at_monotonic):
             return None
         press = TimedPress(
             button=button,
@@ -297,8 +330,31 @@ class TravelRun:
             return None
         return self._close(press)
 
+    def _is_repeat(self, signature: FrameSignature, received_at_monotonic: float) -> bool:
+        """Report whether this is another copy of a press already counted.
+
+        One physical press reaches this run many times over: 8 embedded OEM
+        frames on air, times every bridge that heard them. Filtering those out
+        HERE, ahead of the run, is what leaves ``_open`` and ``_close`` seeing
+        only genuinely new presses.
+
+        The window slides -- each copy re-stamps its signature -- so a burst
+        chains however long its copies keep arriving. A fixed window anchored
+        at the first copy would expire mid-burst on a lagging bridge and let a
+        late copy through as a fresh press, restarting the run and silently
+        SHORTENING the stored travel time. Human re-presses are seconds apart
+        and land well outside the window either way.
+        """
+        previous = self.recent.pop(signature, None)
+        self.recent[signature] = received_at_monotonic
+        while len(self.recent) > _RECENT_CAP:
+            del self.recent[next(iter(self.recent))]
+        if previous is None:
+            return False
+        return 0.0 <= received_at_monotonic - previous <= TRAVEL_BURST_WINDOW_SECONDS
+
     def _open(self, press: TimedPress) -> None:
-        """Start a run, ignoring the repeats of the burst that already did."""
+        """Start a run on a press the repeat filter already vouched is new."""
         if press.button not in self.wanted:
             # The screen has asked for the other direction. Re-pressing the one
             # already measured is not an overwrite -- redo is a menu option.
@@ -309,19 +365,6 @@ class TravelRun:
             )
             return
         started = self.started
-        if (
-            started is not None
-            and started.button == press.button
-            and press.received_at_monotonic - started.received_at_monotonic
-            <= TRAVEL_BURST_WINDOW_SECONDS
-        ):
-            # Another copy of the SAME press: a repeat of the burst on the
-            # bridge that opened the run, or a different bridge hearing it.
-            # Stamp that bridge's first copy so a STOP heard there can be
-            # timed on one clock, but never re-anchor the run itself.
-            if press.bridge_id is not None:
-                self.starts.setdefault(press.bridge_id, press)
-            return
         if started is not None:
             _LOGGER.debug(
                 "travel: restarting the run on %s (was %s)",
@@ -331,15 +374,14 @@ class TravelRun:
         else:
             _LOGGER.debug("travel: run opened on %s", press.button)
         self.started = press
-        self.starts = {press.bridge_id: press} if press.bridge_id is not None else {}
 
     def _close(self, press: TimedPress) -> TravelMeasurement | None:
         """Resolve a STOP against the open run, if there is one.
 
-        Timed on the STOP bridge's own start stamp when that bridge heard the
-        press too; otherwise against the earliest start, which
-        ``interval_seconds`` then times on the monotonic receive clocks --
-        cross-bridge ``t`` subtraction is never meaningful.
+        Timed against the first copy heard of the opening press. When that
+        copy and this STOP came from the same bridge the bridge clock times
+        it; otherwise ``interval_seconds`` falls back to the monotonic receive
+        clocks, since cross-bridge ``t`` subtraction is never meaningful.
         """
         started = self.started
         if started is None:
@@ -348,10 +390,7 @@ class TravelRun:
                 "was never heard, or a previous STOP already closed the run"
             )
             return None
-        if press.bridge_id is not None:
-            started = self.starts.get(press.bridge_id, started)
         self.started = None
-        self.starts = {}
         elapsed = interval_seconds(started, press)
         if elapsed is None:
             _LOGGER.debug(
