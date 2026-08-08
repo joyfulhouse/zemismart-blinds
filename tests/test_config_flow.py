@@ -854,6 +854,12 @@ def test_remote_centric_flow_copy_is_complete_and_synchronized() -> None:
     ambiguous = strings["config"]["step"]["learn_ambiguous"]["description"]
     assert "within range of the listening bridges" in ambiguous
     assert "every online bridge" not in ambiguous
+    # A refusal with nobody to name gets its OWN screen: the ambiguity copy
+    # would claim more than one press over a list of one (#57).
+    unchecked = strings["config"]["step"]["learn_unchecked"]
+    assert "could not check it against what else was on air" in unchecked["description"]
+    assert "More than one" not in f"{unchecked['title']} {unchecked['description']}"
+    assert "learn_retry" in unchecked["menu_options"]
     # The picker and its setup screens DO describe the modes, so they keep saying
     # what Automatic does -- the phrase is only wrong where the mode is unknown.
     assert (
@@ -2017,12 +2023,17 @@ async def test_a_press_heard_before_a_winner_is_judged_as_the_window_opens(
     measuring it later -- is what removes the whole class of defect three review
     rounds found in that arithmetic (#57).
 
-    Run at a press bound of 2, the smallest production allows, and with the
-    winner recorded first as the handler records it: the winner takes one slot
-    and the rival has to survive in the other. That interaction is what the
-    earlier version of this test skipped by never recording the winner at all.
+    Run at the press bound's floor -- `len(_LEARN_ACTIONS) + 1`, the smallest
+    production allows -- and with the winner recorded first as the handler records
+    it, so the winner occupies a slot before its own look-back reads the rest.
+    That interaction is what the earlier version of this test skipped by never
+    recording the winner at all.
     """
-    monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", 2)
+    monkeypatch.setattr(
+        config_flow_module,
+        "_LEARN_CANDIDATE_CAP",
+        len(config_flow_module._LEARN_ACTIONS) + 1,
+    )
     attempt = _sniff_attempt(hass)
     config_flow_module._record_press(attempt, _press("rival"), 10.0)
     config_flow_module._record_press(attempt, _press("stale"), 1.0)
@@ -2209,10 +2220,12 @@ async def test_the_settle_judges_the_window_handed_to_it_not_the_newest(
     assert held_window.rivals, "the held capture had a rival beside it"
     assert resolved_window.rivals == set(), "the recognised winner that replaced it did not"
 
-    assert await flow._async_settle_first_capture(attempt, held, held_window) is False, (
+    assert await flow._async_settle_first_capture(attempt, held, held_window) == "ambiguous", (
         "adopting the HELD capture judges the HELD window, whatever opened after it"
     )
-    assert await flow._async_settle_first_capture(attempt, recognised, resolved_window) is True
+    assert await flow._async_settle_first_capture(attempt, recognised, resolved_window) is None, (
+        "and the recognised winner it did not judge is adopted"
+    )
 
 
 @pytest.mark.asyncio
@@ -2235,7 +2248,48 @@ async def test_a_capture_with_no_window_is_refused_rather_than_adopted(
     config_flow_module._record_press(attempt, signature, 100.0)
     attempt.resolved_at = 100.0
 
-    assert await flow._async_settle_first_capture(attempt, winner, None) is False
+    assert await flow._async_settle_first_capture(attempt, winner, None) == "unchecked", (
+        "refused as UNCHECKED, not as ambiguous: there are no rivals to name"
+    )
+    assert flow._learn_candidates == (), "so the ambiguity screen is not given a list of one"
+
+
+@pytest.mark.asyncio
+async def test_an_unchecked_capture_gets_its_own_screen_not_the_ambiguity_one(
+    hass: HomeAssistant,
+) -> None:
+    """A refusal with nobody to name must not borrow the "two remotes" screen.
+
+    The fail-safe refusal for a capture nothing judged has no rivals, so routing
+    it to `learn_ambiguous` rendered "More than one press arrived … : <one name>"
+    -- false, and it sends the user off to press again somewhere else when as far
+    as anything knows their press was fine. This checks the outcome reaches its
+    own step and that the step renders.
+    """
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    flow.flow_id = "unchecked-screen"
+    flow.handler = DOMAIN
+    flow.context = {}
+    flow._learn_action = "UP"
+
+    async def unchecked() -> config_flow_module._CaptureOutcome:
+        return "unchecked"
+
+    flow._sniff_task = hass.async_create_task(unchecked())
+    await flow._sniff_task
+
+    result = await flow.async_step_learn_sniff()
+    assert result["type"] is FlowResultType.SHOW_PROGRESS_DONE
+    assert result["step_id"] == "learn_unchecked", (
+        "the outcome has to reach a screen of its own, not the timeout catch-all"
+    )
+
+    result = await flow.async_step_learn_unchecked()
+    assert result["type"] is FlowResultType.MENU
+    assert result["step_id"] == "learn_unchecked"
+    assert "learn_retry" in result["menu_options"]
+    assert result["description_placeholders"] == {"action": "UP"}
 
 
 @pytest.mark.asyncio
@@ -2243,25 +2297,49 @@ async def test_the_press_bound_leaves_room_for_a_rival(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The press bound has a floor of two, and nothing else enforces it.
+    """The press bound's floor is one MORE than the actions, not two.
 
-    The winner occupies one slot before its own look-back reads the rest, so a
-    bound of 1 evicts the only rival and the capture reads as unambiguous:
-    record a rival, record the winner, and `recent` holds the winner alone.
-    Production must therefore never drop below 2, and this is what says so.
+    `recent` is keyed by the full signature -- remote, channel set and action --
+    while a RIVAL is only a different remote or selector. So the winner's own
+    other buttons on its own selector take slots that can never refuse anything,
+    and they are what evicts the foreign press that would have. One remote on one
+    selector can produce a signature per action the codec can name, and an
+    untabled opcode falls back into that same set, so the floor is
+    `len(_LEARN_ACTIONS) + 1`: the winner, its own two other buttons, and room
+    for one rival.
+
+    The sequence below is the one that loses the rival: a stranger presses, then
+    the user's own DOWN and STOP land inside the same settle window before their
+    UP wins. If the bound is ever made rival-aware -- keyed on remote and selector
+    rather than the full signature -- the below-the-floor half of this test starts
+    refusing, and the documented floor should come down with it.
     """
-    assert config_flow_module._LEARN_CANDIDATE_CAP >= 2, (
-        "a bound of 1 lets the winner evict the rival that would have refused it"
+    floor = len(config_flow_module._LEARN_ACTIONS) + 1
+    assert floor <= config_flow_module._LEARN_CANDIDATE_CAP, (
+        "below the floor the winner's OWN other buttons evict the only rival"
     )
-    monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", 2)
-    attempt = _sniff_attempt(hass)
-    for index in range(6):
-        config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 10.0 + index * 0.01)
 
-    window = _stamp_winner(attempt, _press("winner"), 10.06)
+    def rivals_at(bound: int) -> set[str]:
+        monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", bound)
+        attempt = _sniff_attempt(hass)
+        config_flow_module._record_press(attempt, _press("stranger"), 100.00)
+        for offset, button in enumerate(("DOWN", "STOP"), start=1):
+            config_flow_module._record_press(
+                attempt,
+                _press("mine", button=button),
+                100.00 + offset * 0.01,
+            )
+        # `_stamp_winner` hands back the private window type, so the names it
+        # collected are only `set[str]` by construction.
+        return cast("set[str]", _stamp_winner(attempt, _press("mine"), 100.03).rivals)
 
-    assert len(attempt.recent) == 2, "the bound is saturated by the winner and one rival"
-    assert window.rivals, "the smallest safe bound still names a rival"
+    assert rivals_at(floor) == {"stranger on channels 1"}, (
+        "at the floor the winner, its own two other buttons and one rival all fit"
+    )
+    assert rivals_at(floor - 1) == set(), (
+        "one below, the winner's own presses evict the rival -- which is WHY the floor "
+        "is where it is, not behaviour worth keeping"
+    )
 
 
 @pytest.mark.asyncio
@@ -2275,7 +2353,9 @@ async def test_the_press_bound_drops_the_oldest_and_keeps_the_verdict(
     being out of reach, which is what an earlier comment here claimed. It is safe
     by arithmetic: the winner takes the newest slot, so a bound of N leaves N-1
     presses that can still be named, and any rival in window leaves the window
-    non-empty.
+    non-empty. How many of those N-1 can actually BE rivals is what sets the
+    bound's floor -- see `test_the_press_bound_leaves_room_for_a_rival`; here
+    every press is a distinct remote, so all of them are.
     """
     attempt = _sniff_attempt(hass)
     cap = config_flow_module._LEARN_CANDIDATE_CAP
@@ -2313,7 +2393,7 @@ async def test_more_rivals_than_can_be_named_still_refuse(
     for index in range(cap + 3):
         config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 100.001)
 
-    assert await flow._async_settle_first_capture(attempt, winner, window) is False
+    assert await flow._async_settle_first_capture(attempt, winner, window) == "ambiguous"
     assert len(flow._learn_candidates) == cap + 1, (
         "the winner, plus as many rivals as the screen can name"
     )
@@ -2338,7 +2418,7 @@ async def test_a_press_that_aged_out_is_never_a_rival(
 
     window = _stamp_winner(attempt, signature, 100.0)
 
-    assert await flow._async_settle_first_capture(attempt, winner, window) is True
+    assert await flow._async_settle_first_capture(attempt, winner, window) is None
     assert flow._learn_candidates == (), "an adopted capture names nobody"
     assert set(attempt.recent) == {signature}, "the aged-out press was forgotten"
 

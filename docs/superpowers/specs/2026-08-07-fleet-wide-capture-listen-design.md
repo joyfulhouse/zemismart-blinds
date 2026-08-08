@@ -333,11 +333,23 @@ choice to make".
        open: the dropped press IS reachable, so "out of reach" was never the
        argument. What actually holds is arithmetic. The winner is recorded
        immediately before its own look-back runs, so it occupies the newest slot
-       and survives the drop, which leaves `_LEARN_CANDIDATE_CAP - 1` slots for
-       rivals — and one rival in window is all a refusal needs. **That is safe
-       only for a bound of 2 or more**: at 1 the winner evicts the only rival and
-       the capture reads as unambiguous (verified, and pinned by
-       `test_the_press_bound_leaves_room_for_a_rival`). The rival NAMES a screen
+       and survives the drop, which leaves `_LEARN_CANDIDATE_CAP - 1` slots —
+       and one rival in window is all a refusal needs.
+
+       Not all of those slots can hold a rival, though, which round seven
+       corrected: `recent` is keyed by the full signature (remote, channel set
+       AND action) while a RIVAL is only a different remote or selector, so the
+       winner's own other buttons on its own selector take slots that refuse
+       nothing. One remote on one selector can produce a signature per action the
+       codec can name — an untabled opcode falls back into that same set — so the
+       floor is **`len(_LEARN_ACTIONS) + 1`, which is 4**: the winner, its own two
+       other buttons, and room for one rival. Verified below it: a stranger
+       presses, the user's own DOWN and STOP land in the same settle window, and
+       at a bound of 2 or 3 the stranger is evicted and the capture reads as
+       unambiguous. Production is 8, so no live defect — but a floor stated as 2
+       licensed turning the knob into the unsafe range, which is why
+       `test_the_press_bound_leaves_room_for_a_rival` now pins 4 and demonstrates
+       the eviction one below it. The rival NAMES a screen
        shows are bounded separately and are safe at any size, because a name is
        dropped only once that many are already in a set that is therefore not
        empty. `overflowed_at` and its aging existed to compensate for a bound
@@ -357,7 +369,12 @@ choice to make".
        belongs to the recognised one, judging a clean window and losing a
        refusal. A capture arriving at the settle with no window at all is
        impossible — the two are assigned together — and REFUSES if it ever
-       happens, because unjudged is not the same as uncontested.
+       happens, because unjudged is not the same as uncontested. It refuses with
+       its own outcome and its own screen (`learn_unchecked`, round seven): there
+       are no rivals to name, and the ambiguity screen's "more than one press was
+       heard" over a list of one name is both false and the wrong instruction —
+       it sends the user off to press again alone when nothing suggests the air
+       was the problem.
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
    listening, `heard` can hold several unrelated remotes, so adoption is now
@@ -652,16 +669,22 @@ Flow (`tests/test_config_flow.py`):
   that refusal itself.
 - This device's own remote on the wrong channels is diagnosed wherever in the
   heard list it arrived, not only when it arrived first.
-- The arm fan-out saturates its bound without exceeding it and loses no
-  bridge; one bridge raising strands no sibling behind the caller; one bridge
-  missing the deadline is skipped rather than fatal; a hold that keeps failing
-  to re-arm gives up, and a success clears the failure count.
+- The arm fan-out puts every bridge in flight together under the shared deadline
+  and loses none — no concurrency bound, so nothing to saturate or queue behind;
+  one bridge raising strands no sibling behind the caller; one bridge missing the
+  deadline is skipped rather than fatal; a hold that keeps failing to re-arm
+  gives up, and a success clears the failure count.
 - The confirm screen names the bridges that HEARD the remote, not the armed
   set.
 - A competitor arriving after the capture window closed but inside the settle is
   still heard and still refuses, and the armed learn window is asserted to cover
   the capture window plus the settle (and to stay under the firmware's cap).
 - A rival press the candidate cap had no room for refuses the capture anyway.
+- The press bound's floor is `len(_LEARN_ACTIONS) + 1`: at the floor a rival
+  survives the winner's own other buttons, and one below it the eviction that
+  sets the floor is demonstrated.
+- A capture nothing judged refuses on its OWN screen, which does not claim more
+  than one press was heard.
 - Each half of a window is judged where it happens: a press already on air when
   the window opens, and a press arriving while it is open — each also driven by
   REAL presses on a real fleet through to the screen, with an aged-out control,
@@ -908,6 +931,32 @@ one test-quality gap that would have let the refactor rot:
   `contested` list and the `contested[-1]` re-derivation are gone, which removes
   the ordering invariant coupling an adopted capture to someone else's window.
 
+### Revised after review round 7
+
+The mildest round: no blockers, no highs, and both engines re-verified the
+round-six fixes and the refactor equivalence. What it caught was a guardrail that
+was wrong in the safe direction and a screen that told the truth about its
+decision but not about its reason.
+
+- **The press bound's floor is 4, not 2.** Round six corrected the *reason* the
+  bound cannot decide a verdict but got the arithmetic's scope wrong: it counted
+  spare slots rather than slots a RIVAL could occupy, and `recent` is keyed by
+  the full signature while rivalry ignores the action. Production is 8, so
+  nothing was broken — but a floor stated as 2 licensed lowering the knob into a
+  range where the user's own DOWN and STOP evict the stranger who pressed
+  alongside them. Corrected in both comments, the spec, and the guard test. (The
+  alternative — key the bound on remote and selector so every slot is a potential
+  rival — is a real option and left unbuilt: it changes behaviour for no live
+  defect, where the documented floor costs nothing.)
+- **`learn_unchecked` splits off `learn_ambiguous`.** The fail-safe refusal has
+  no rivals, so the ambiguity screen rendered "More than one press arrived …"
+  over a single name. The settle now returns WHICH refusal it made rather than a
+  bare boolean, which also removes the outcome string that used to be
+  hard-coded at both call sites.
+- **Stale doc claims corrected**: the round-three addendum still said the arm
+  fan-out keeps its semaphore, which round five deleted, and the test inventory
+  still described saturation and queueing.
+
 Three low-severity addenda from round three closed without code changes:
 
 - **The progress strings needed no edit.** Every `{bridge}` string places the
@@ -918,6 +967,10 @@ Three low-severity addenda from round three closed without code changes:
 - **The STOP-copy residual is now written down** rather than left implicit in
   the asymmetry between `anchored` and the sliding window — see "Residual risk"
   in the dedup section.
-- **The arm fan-out keeps its semaphore**, with the reason recorded in Bounds:
-  the fan-out's width comes from a 256-entry discovery snapshot, not from the
-  house's bridge count.
+- **The arm fan-out kept its semaphore** at the time, with the reason recorded
+  in Bounds: the fan-out's width comes from a 256-entry discovery snapshot, not
+  from the house's bridge count. **Superseded in round five** — the semaphore is
+  deleted and the fan-out runs concurrently under one shared absolute deadline,
+  which is what bounds the user-visible window; see Bounds for why a limit in
+  front of that deadline only chose which bridges miss out, and carried an
+  ordering hazard of its own.

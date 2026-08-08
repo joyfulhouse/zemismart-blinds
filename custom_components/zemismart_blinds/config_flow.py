@@ -233,13 +233,23 @@ _LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_L
 # Bounds two things against a busy bus, neither of them the VERDICT: how many
 # recently-heard presses are remembered, and how many rivals one screen NAMES.
 #
-# MUST be 2 or more. The press bound drops the oldest entry, and everything it
-# holds is inside one settle window, so a dropped press IS one the window about
-# to open could have reached. What saves the verdict is that the winner takes
-# the newest slot, leaving this many minus one for rivals -- at 1 the winner
-# evicts the only rival and the capture reads as unambiguous. The name bound is
-# safe at any size: a name is dropped only once that many are already in the
-# set, which is non-empty, so the screen loses a name and never the refusal.
+# MUST be `len(_LEARN_ACTIONS) + 1` (4) or more. The press bound drops the oldest
+# entry, and everything it holds is inside one settle window, so a dropped press
+# IS one the window about to open could have reached. What saves the verdict is
+# that room is left for a rival to survive the drop -- and that takes more than
+# one spare slot, because `recent` is keyed by the FULL signature (remote,
+# channel set AND action) while a RIVAL is only a different remote or selector.
+# The winner's own other buttons on its own selector therefore occupy slots that
+# can never refuse anything: one remote on one selector can produce a signature
+# per action the codec can name, and an untabled opcode falls back into that same
+# set, so three of them plus the winner's own press plus one rival is the floor.
+# Below it the user's own DOWN and STOP evict the stranger who pressed alongside
+# them and the capture reads as unambiguous -- verified at 2 and at 3, and pinned
+# by `test_the_press_bound_leaves_room_for_a_rival`.
+#
+# The name bound is safe at any size: a name is dropped only once that many are
+# already in the set, which is non-empty, so the screen loses a name and never
+# the refusal.
 _LEARN_CANDIDATE_CAP: Final = 8
 # How long teardown gives every bridge's sniff stop before giving them up.
 # Teardown runs in a `finally` on the flow's own task, so an unbounded wait here
@@ -257,7 +267,13 @@ _SNIFF_REARM_FAILURE_LIMIT: Final = 3
 _LEARN_ACTIONS: Final = ("UP", "DOWN", "STOP")
 # How one learn capture ended. Anything but "captured" is a failure the user
 # can act on, and each has its own remedy -- see _LEARN_OUTCOME_STEPS.
-type _CaptureOutcome = Literal["captured", "timeout", "bridge_busy", "ambiguous"]
+type _CaptureOutcome = Literal[
+    "captured",
+    "timeout",
+    "bridge_busy",
+    "ambiguous",
+    "unchecked",
+]
 # Where each capture outcome sends the wizard. Everything unlisted is silence
 # on air, which `learn_timeout` already explains; the named ones are failures
 # with a different cause and a different remedy, so they get their own screen
@@ -266,6 +282,7 @@ _LEARN_OUTCOME_STEPS: Final = {
     "captured": "learn_next",
     "bridge_busy": "learn_busy",
     "ambiguous": "learn_ambiguous",
+    "unchecked": "learn_unchecked",
 }
 _CAPTURE_OWNERS: dict[tuple[int, str], str] = {}
 # CoverConfig enforces storage identity while this validation draft is not yet
@@ -459,13 +476,13 @@ def _record_press(
         # Drop the OLDEST. Everything here is already inside one settle window,
         # so a dropped entry IS reachable by the window about to open -- the
         # bound cannot claim otherwise. What keeps it from deciding a VERDICT is
-        # arithmetic: the winner is recorded immediately before its own window
-        # opens, so it holds the newest slot and survives; the drop therefore
-        # leaves at least ``_LEARN_CANDIDATE_CAP - 1`` other presses, and any
-        # rival in window leaves the window non-empty. That is safe only for a
-        # bound of 2 or more, which `test_the_press_bound_leaves_room_for_a_rival`
-        # pins -- at 1 the winner evicts the only rival and the capture is
-        # adopted as unambiguous.
+        # that a rival still fits: the winner is recorded immediately before its
+        # own window opens, so it holds the newest slot and survives, and the
+        # drop leaves ``_LEARN_CANDIDATE_CAP - 1`` other presses. Those are not
+        # all potential rivals, though -- the winner's own other buttons on its
+        # own selector are keyed separately here and refuse nothing -- so the
+        # bound needs a floor of ``len(_LEARN_ACTIONS) + 1``, as the constant
+        # explains and `test_the_press_bound_leaves_room_for_a_rival` pins.
         del attempt.recent[min(attempt.recent, key=attempt.recent.__getitem__)]
     for window in (attempt.unrecognized_window, attempt.resolved_window):
         # Both candidates keep collecting: either may still be adopted, and only
@@ -1552,6 +1569,29 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    async def async_step_learn_unchecked(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Report a capture that could not be checked against the air.
+
+        Its own screen rather than a reuse of `learn_ambiguous`, for the reason
+        that screen exists at all: the remedy hangs off the CAUSE. "More than one
+        press was heard" over a list of one name is false, and it sends the user
+        to stand somewhere else and press again alone -- when as far as anything
+        knows, the press they made was fine and the wizard simply failed to judge
+        it. Retrying is right; being told why is what makes it worth doing.
+        """
+        del user_input
+        self._sniff_session_id = None
+        self._sniff_task = None
+        self._learn_candidates = ()
+        return self.async_show_menu(
+            step_id="learn_unchecked",
+            menu_options=self._learn_failure_menu_options("learn_retry"),
+            description_placeholders={"action": self._learn_action},
+        )
+
     async def async_step_learn_sniff(
         self,
         user_input: dict[str, Any] | None = None,
@@ -2534,8 +2574,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         attempt: _SniffAttempt,
         winner: _LearnCapture,
         window: _ContestedWindow | None,
-    ) -> bool:
-        """Report whether the first capture of a run may be adopted.
+    ) -> _CaptureOutcome | None:
+        """Return None if the first capture of a run may be adopted, else why not.
+
+        The refusals differ in what the user has to be told, so the caller gets
+        the outcome rather than a bare False: "another remote was pressed too"
+        sends them off to press again alone, while "this could not be checked"
+        must not, because there may have been nothing wrong with the air at all.
 
         The first capture is the one with no calibrated identity to gate on --
         ``_capture_belongs_to_this_action`` compares against already-measured
@@ -2571,6 +2616,9 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         cannot come apart. A missing window is an impossible state -- the two
         are assigned together -- and it REFUSES rather than adopts: unchecked is
         not the same as uncontested, and refusing is the recoverable direction.
+        It refuses as ``unchecked`` rather than ``ambiguous`` because there are
+        no rivals to name, and a screen that says "more than one press was
+        heard" over a list of one is telling the user something untrue.
         """
         anchor = attempt.resolved_at
         if anchor is None:
@@ -2587,9 +2635,10 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "Learn: the capture being adopted has no ambiguity window, which should not "
                 "be reachable; refusing it rather than adopting evidence nothing judged"
             )
-        rivals = sorted(window.rivals) if window is not None else []
-        if window is not None and not rivals:
-            return True
+            return "unchecked"
+        rivals = sorted(window.rivals)
+        if not rivals:
+            return None
         winner_signature = press_signature(
             winner.prefix,
             winner.remote_id,
@@ -2601,7 +2650,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "Learn: refusing to adopt one of %s heard together",
             self._learn_candidates,
         )
-        return False
+        return "ambiguous"
 
     async def _async_capture(self, session_id: str) -> _CaptureOutcome:
         """Capture one action and always release/stop every bridge sniff.
@@ -2660,12 +2709,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 capture = await capture_future
             # Each capture brings its OWN judging window: the recognised winner
             # here, the held fallback below. Neither reads the other's.
-            if first_capture and not await self._async_settle_first_capture(
-                attempt,
-                capture,
-                attempt.resolved_window,
+            if first_capture and (
+                refusal := await self._async_settle_first_capture(
+                    attempt,
+                    capture,
+                    attempt.resolved_window,
+                )
             ):
-                return "ambiguous"
+                return refusal
             return self._store_capture(session_id, capture)
         except TimeoutError:
             # An unrecognised opcode cannot end the window early: nothing
@@ -2680,12 +2731,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             unrecognized = attempt.unrecognized
             if unrecognized is None:
                 return "timeout"
-            if first_capture and not await self._async_settle_first_capture(
-                attempt,
-                unrecognized,
-                attempt.unrecognized_window,
+            if first_capture and (
+                refusal := await self._async_settle_first_capture(
+                    attempt,
+                    unrecognized,
+                    attempt.unrecognized_window,
+                )
             ):
-                return "ambiguous"
+                return refusal
             return self._store_capture(session_id, unrecognized)
         except asyncio.CancelledError:
             raise

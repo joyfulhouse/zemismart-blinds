@@ -274,6 +274,14 @@
           "advanced": "Advanced"
         }
       },
+      "learn_unchecked": {
+        "title": "The capture could not be checked",
+        "description": "The {action} press was heard, but the wizard could not check it against what else was on air at the time, so it has not been adopted. Nothing is known to be wrong with the press itself. Try again, and if this keeps happening please report it.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
       "cover_measure_busy": {
         "title": "The bridges are busy",
         "description": "Another Zemismart setup window is already listening on {bridge}. A measurement claims every bridge it listens on, so it cannot start while any of them is held. Finish or close the other window, then measure again.",

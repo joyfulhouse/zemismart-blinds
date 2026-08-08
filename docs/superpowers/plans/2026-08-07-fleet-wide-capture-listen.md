@@ -279,6 +279,29 @@ that has to hold the invariant in place.
   `test_a_press_that_aged_out_is_never_a_rival` now drive the settle decision
   instead of asserting internals.
 
+### Task 12: Seventh review round — a guardrail and a screen
+
+Files: `config_flow.py`, `strings.json`, `translations/en.json`,
+`tests/test_config_flow.py`, spec
+
+No blockers, no highs; both engines re-verified the round-six fixes.
+
+- The press bound's floor is `len(_LEARN_ACTIONS) + 1` (4), not 2. Round six
+  counted spare slots instead of slots a RIVAL can occupy: `recent` is keyed by
+  the full signature while rivalry ignores the action, so the winner's own other
+  buttons on its own selector take slots that refuse nothing. Production is 8 so
+  nothing was broken, but the floor as stated licensed lowering the knob into the
+  range where a stranger's press is evicted by the user's own DOWN and STOP.
+  Corrected in both comments and the spec; the guard test now pins 4 and
+  demonstrates the eviction at 3.
+- `learn_unchecked` splits off `learn_ambiguous` for the fail-safe refusal, which
+  has no rivals to name and was rendering "More than one press arrived … " over a
+  single name. `_async_settle_first_capture` now returns the refusal it made
+  instead of a bool, so neither call site hard-codes the outcome.
+- Spec: the round-three addendum still claimed the arm fan-out keeps a semaphore
+  (deleted in round five) and the test inventory still described saturation and
+  queueing.
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and
