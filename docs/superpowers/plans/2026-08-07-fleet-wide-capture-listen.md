@@ -72,10 +72,18 @@ Files: `config_flow.py`, `bridge_registry.py`
 
 Files: `strings.json`, `translations/en.json`
 
-- `learn_setup.data_description.bridge`, `cover_measure_setup.description`,
-  `progress.sniffing` / `progress.measuring`: Automatic = every online
-  bridge, named bridge = single-bridge override. The `{bridge}` placeholder
-  carries the joined listening set on the screens that describe LISTENING.
+- `learn_setup.data_description.bridge` and `cover_measure_setup.description`
+  are rewritten: Automatic = every online bridge, named bridge = single-bridge
+  override.
+- `progress.sniffing` / `progress.measuring` are NOT edited (corrected after
+  review round 3, which caught this task claiming an edit the diff does not
+  contain). What changes there is the VALUE of `{bridge}`, which now carries the
+  joined listening set. Both strings already place the placeholder after "on"
+  -- "Capturing on {bridge}", "Listening on {bridge}" -- so they read correctly
+  for one bridge and for a comma-joined list alike, and so do the other three
+  `{bridge}` screens (`learn_confirm`, `learn_busy`, `cover_measure_busy`).
+  A string of the form "the bridge {bridge}" would have needed rewording; none
+  exists.
 - `learn_confirm` is the exception and must not: "learned ... through
   {bridge}" is a claim about which bridge HEARD the remote, so it receives
   the bridges the captures actually arrived on. Feeding it the armed set
@@ -164,6 +172,20 @@ Each round-7 guard protected one instance of something there were several of:
   `_async_subscribe_ready` already unsubscribes on cancellation before
   readiness; `online_bridge_ids` already returned sorted order (now promised
   locally rather than inherited from `bridges`).
+
+Round-3 addendum, all documentation (no code, no strings):
+
+- Task 4 above corrected: the progress strings were never edited, and did not
+  need to be — every `{bridge}` string reads "…on {bridge}", which takes a
+  comma-joined list unchanged.
+- The design's dedup section gains a **residual-risk** subsection: opening
+  presses get unconditional signature protection while STOP closes rely on the
+  sliding window, so a STOP copy lagging more than the burst window can close a
+  re-opened run. Accepted, because honouring a late STOP is the safe default;
+  narrowed by `MIN_MEASURED_SECONDS` and by the screens that print the seconds
+  before anything is saved.
+- The arm fan-out's semaphore is KEPT; Bounds records why (the fan-out is as
+  wide as the 256-entry discovery snapshot, not as the house's bridge count).
 
 ## Status
 

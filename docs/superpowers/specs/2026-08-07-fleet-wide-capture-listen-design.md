@@ -114,6 +114,52 @@ cannot shorten anything, and filtering those swallowed a user's re-press after
 a run that closed too fast to store — the wizard then waited out its whole
 deadline having heard the user twice.
 
+### Residual risk: the protection is asymmetric, and deliberately so
+
+Opening presses and closing presses are not guarded to the same strength, and
+they cannot be:
+
+- A press that would **open** a run is protected by the signature itself,
+  unconditionally: `anchored` remembers every signature that has anchored this
+  run, so no copy of any of them can re-anchor it however late it arrives.
+- A press that would **close** a run is protected only by the 1.5 s sliding
+  window. There is no equivalent of `anchored` available, because the state the
+  guard would need is exactly the state the close destroys: after `_close` the
+  run is gone, and the *next* run is a legitimate thing for a STOP to end.
+
+So one case remains open. A run closes too fast to store (under
+`MIN_MEASURED_SECONDS`), the user immediately presses the direction again, and a
+bridge lagging by **more** than the burst window then delivers its copy of that
+first STOP. It escapes the window, finds the new run open, and closes it —
+storing a fabricated measurement bounded by the gap between the user's two
+presses rather than by the shade's travel. That is the unsafe direction: a short
+time leaves "closed" visibly open.
+
+It is accepted rather than fixed, for the same reason the anchor rule exists at
+all: a late copy and a genuine STOP are the same bytes, with no sequence number
+and no per-press nonce to separate them. Every available rule guesses, and the
+guesses are not symmetric in cost. Refusing an out-of-window STOP would break
+the ordinary case this feature exists for — the user presses STOP once, only a
+lagging bridge hears it, and the wizard must honour it — while accepting one can
+only produce a measurement the confirm screen still shows the user before
+anything is stored. **The safe default is therefore to honour the STOP**, and
+the residual is a short measurement the user can see and redo, not a silent
+one they cannot.
+
+What narrows it in practice:
+
+- The fabricated interval still has to clear `MIN_MEASURED_SECONDS` (1 s) to be
+  stored at all, so the bridge's lag must exceed both the burst window and the
+  user's re-press gap by a further second. The round-3 regression case — STOP at
+  +0.5 s, re-press at +1.0 s, stale copy at +1.6 s — would measure 0.6 s and be
+  discarded even if the copy did close the run.
+- Nothing is written silently. `cover_measure_next` prints "{measured} took
+  {seconds} s, which will be stored as {stored} s" for each direction, and
+  `cover_measure_confirm` shows both values with "Correct either value before
+  saving" — so a fabricated short time is visible, correctable, and redoable at
+  the point it appears rather than discovered later as a shade that stops half
+  way.
+
 The `recent` map needs no cap. `classify_frame` pins the remote identity and
 the channel set before a signature exists, so one run can only ever see UP,
 DOWN and STOP; an earlier draft's `_RECENT_CAP` eviction path was unreachable
@@ -306,9 +352,21 @@ Fleet-sized work needs fleet-independent limits:
   acquisition** as well (round three): a fleet bigger than the bound queues,
   the queue drains exactly when the bridges ahead of it are cancelled at the
   deadline, and a bridge acquiring its slot outside the deadline would then
-  begin — or finish — arming on a budget that had already expired. Per bridge it stays ordered —
-  subscribe, then open the window — so no bridge's window is ever open with
-  nothing listening to it.
+  begin — or finish — arming on a budget that had already expired. Per bridge it
+  stays ordered — subscribe, then open the window — so no bridge's window is
+  ever open with nothing listening to it.
+
+  **The semaphore is KEPT rather than dropped** (asked and answered in round
+  three: for a single-digit fleet a bare `gather` under the shared deadline
+  would behave identically, and the ordering bug above could not have existed).
+  The width of this fan-out is not set by how many bridges the house has,
+  though — it is set by how many the flow-local discovery snapshot accepted,
+  and that snapshot is built from retained `rf433/+/availability` topics with a
+  cap of `_BRIDGE_MAX_ENTRIES` (256). A stale or mistakenly-published retained
+  beacon is enough to widen it, and that is precisely the input the fixed 5 s
+  bootstrap budget must survive. With the deadline now wrapping the
+  acquisition, the bound costs one `async with` clause, cannot reorder
+  anything, and is covered by its own saturation test.
 
   A bridge that raises, or that has not finished by the deadline, is **skipped
   rather than fatal**; zero armed bridges is what fails. The fan-out gathers
@@ -396,9 +454,13 @@ stores the *raw* picker value in `_learn_suggested` so re-showing the form
 round-trips "Automatic" instead of a resolved bridge id.
 
 **Copy.** The `{bridge}` placeholder in the sniff/measure progress text
-becomes the joined listening set. Strings change from "the bridge for this
-device's area" to "every online bridge"; the picker's description now
-frames a named bridge as an override for diagnosing what one bridge hears.
+becomes the joined listening set — the placeholder's VALUE, not the sentence
+around it: every `{bridge}` string already reads "…on {bridge}", which takes
+one bridge id or a comma-joined list without rewording, so the progress
+strings themselves are untouched. The setup screens do change, from "the
+bridge for this device's area" to "every online bridge", and the picker's
+description now frames a named bridge as an override for diagnosing what one
+bridge hears.
 
 ## Out of scope
 
@@ -605,3 +667,17 @@ fails when it is removed, so the question need not be re-argued from a diff:
   whose snapshot is ordered by bridge id. The sort is now explicit at the point
   that promises it rather than inherited, and the order the screens show is
   asserted.
+
+Three low-severity addenda from the same round closed without code changes:
+
+- **The progress strings needed no edit.** Every `{bridge}` string places the
+  placeholder after "on", which reads correctly for one bridge id or a
+  comma-joined list, so only the placeholder's value changed — see Copy above.
+  The plan's Task 4 claimed an edit the diff did not contain, and has been
+  corrected rather than the strings being changed to match the claim.
+- **The STOP-copy residual is now written down** rather than left implicit in
+  the asymmetry between `anchored` and the sliding window — see "Residual risk"
+  in the dedup section.
+- **The arm fan-out keeps its semaphore**, with the reason recorded in Bounds:
+  the fan-out's width comes from a 256-entry discovery snapshot, not from the
+  house's bridge count.
