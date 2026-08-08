@@ -5,7 +5,7 @@ at once (the way `state_sync` already does), deduplicate the same physical
 press heard by several bridges, and make "Automatic" the fleet-wide default
 with the bridge picker as an explicit single-bridge override.
 
-**Spec:** `docs/claude/specs/2026-08-07-fleet-wide-capture-listen-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-07-fleet-wide-capture-listen-design.md`
 **Issue:** #57
 
 ## Global Constraints
