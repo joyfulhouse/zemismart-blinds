@@ -157,11 +157,9 @@ class _SniffAttempt:
     measured: dict[str, _LearnCapture]
     future: asyncio.Future[_LearnCapture]
     # Every distinct press heard RECENTLY, mapped to when its last copy arrived,
-    # pruned to one settle window and capped by dropping the oldest. It exists
+    # pruned to one settle window and bounded by dropping the oldest. It exists
     # only to answer, at the moment a window opens, "what else was on air just
-    # before this". A window looks BACK at most one settle window from its
-    # anchor, so the newest entries are the only ones that can fall inside it
-    # and dropping the oldest can never hide a rival.
+    # before this".
     #
     # Keyed by the FULL press signature -- remote, channel set and action -- the
     # same key `state_sync` and the travel run dedup on: two channel sets from
@@ -169,13 +167,9 @@ class _SniffAttempt:
     # would hide the second. Last copy rather than first, because within a
     # window that is the copy nearest anything that can still open one.
     recent: dict[FrameSignature, float] = field(default_factory=dict)
-    # One window per candidate winner, in the order they were stamped. At most
-    # two exist: the held-unrecognised fallback and the recognised winner that
-    # can supersede it. The LAST is always the one that would be adopted.
-    contested: list[_ContestedWindow] = field(default_factory=list)
     # When the capture that WON this attempt arrived, on the event loop clock.
     # The settle sleeps to the end of this window; which presses COMPETED with
-    # it is already recorded in `contested`, not measured from here afterwards.
+    # it is recorded in that winner's own window, not measured from here.
     resolved_at: float | None = None
     # A structurally valid capture whose opcode byte is not in the codec's
     # action table. That table is a 10-sample empirical fit, not protocol, so
@@ -185,6 +179,20 @@ class _SniffAttempt:
     # prompted action still wins outright, which keeps the OEM TRAILER burst
     # that follows UP/DOWN from being mistaken for the action itself.
     unrecognized: _LearnCapture | None = None
+    # Each candidate winner's judging window, stored BESIDE the capture it
+    # judges. Both can be open at once -- the held fallback and the recognised
+    # winner that supersedes it -- and both keep collecting rivals, because
+    # either may still be the capture that gets adopted.
+    #
+    # One field per candidate rather than a list the settle reads the end of.
+    # That ordering was an implicit invariant with a reachable break: if a
+    # recognised frame resolves the future in the same ready-batch as the
+    # capture timeout and is ordered first, the flow adopts the HELD capture
+    # while the newest window belongs to the recognised one -- judging the
+    # wrong window and losing a refusal. Pairing each capture with its own
+    # window makes that mismatch unexpressible (#57).
+    unrecognized_window: _ContestedWindow | None = None
+    resolved_window: _ContestedWindow | None = None
 
 
 def _remote_identity_from_captures(

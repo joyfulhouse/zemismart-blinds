@@ -326,18 +326,38 @@ choice to make".
      Two consequences worth stating, because they are what earlier rounds had to
      add machinery for:
 
-     - **No cap can decide a verdict any more.** Remembered presses are pruned
-       to one settle window and bounded by dropping the OLDEST — and a window
-       looks BACK from its anchor, which is never earlier than the presses
-       recorded before it, so the oldest entry is precisely the one no window can
-       reach. The rival NAMES a screen shows are capped separately, and the
-       verdict is whether that set is empty, so dropping the ninth name cannot
-       make a contested window look clean. `overflowed_at` and its aging existed
-       only to compensate for a cap that sat in front of the evidence; both are
-       deleted.
+     - **No bound can decide a verdict any more** — but not for the reason the
+       first draft of this section gave, which round six caught. Remembered
+       presses are pruned to one settle window and bounded by dropping the
+       oldest, and *everything* left is therefore inside the window about to
+       open: the dropped press IS reachable, so "out of reach" was never the
+       argument. What actually holds is arithmetic. The winner is recorded
+       immediately before its own look-back runs, so it occupies the newest slot
+       and survives the drop, which leaves `_LEARN_CANDIDATE_CAP - 1` slots for
+       rivals — and one rival in window is all a refusal needs. **That is safe
+       only for a bound of 2 or more**: at 1 the winner evicts the only rival and
+       the capture reads as unambiguous (verified, and pinned by
+       `test_the_press_bound_leaves_room_for_a_rival`). The rival NAMES a screen
+       shows are bounded separately and are safe at any size, because a name is
+       dropped only once that many are already in a set that is therefore not
+       empty. `overflowed_at` and its aging existed to compensate for a bound
+       that sat in front of the evidence; both are deleted.
      - **A rival cannot un-compete.** It is counted against the open window when
        it arrives, so pressing the same remote again seconds later has nothing to
        move.
+     - **The capture and the window that judged it cannot come apart** (round
+       six). Each candidate keeps its own window — one field beside the held
+       capture, one for the resolved winner — and the settle judges the window it
+       is handed rather than the newest one on a list. Both windows stay open and
+       both keep collecting, because either capture may still be adopted; only
+       the adopted one's window is read. A list plus "read the last" coupled them
+       by an implicit ordering invariant with a reachable break: a recognised
+       frame resolving the future in the same ready-batch as the capture timeout
+       can leave the flow adopting the HELD capture while the newest window
+       belongs to the recognised one, judging a clean window and losing a
+       refusal. A capture arriving at the settle with no window at all is
+       impossible — the two are assigned together — and REFUSES if it ever
+       happens, because unjudged is not the same as uncontested.
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
    listening, `heard` can hold several unrelated remotes, so adoption is now
@@ -502,6 +522,20 @@ There is no concurrency bound here either, for the reason given under Bounds: on
 shared deadline is what protects the window, and `return_exceptions` is what
 keeps one broker error from abandoning the siblings.
 
+**Removal closes the session too** (round six). Every other path that ends a
+measurement runs teardown from a task: the arm phase closes in its `finally`
+unless it succeeded, and the STOP phase closes in its own. The gap is the
+handoff BETWEEN them — `_async_measure_arm` returning "armed" deliberately leaves
+the session open for the STOP phase to inherit, and Home Assistant advances to
+that phase from a task it schedules when the arm task completes, suppressing
+`UnknownFlow` if the flow has gone by the time that task runs. An abort processed
+in that gap left a session nobody owned: the arm task had finished, the STOP task
+was never created, and the per-bridge holders went on re-arming their sniff
+windows with every claim held until Home Assistant restarted. `async_remove`
+therefore detaches the session and closes it from a task of its own. That task
+needs no shield — only shutdown cancels it, and at shutdown the claims go with
+the process.
+
 Bounding that wait exposed a **latent race one tick wide** in
 `cover_measure_stop`, fixed with it: `_async_measure_finish` clears
 `_measure_session` and *then* tears the session down, and the step read a
@@ -629,12 +663,20 @@ Flow (`tests/test_config_flow.py`):
   the capture window plus the settle (and to stay under the firmware's cap).
 - A rival press the candidate cap had no room for refuses the capture anyway.
 - Each half of a window is judged where it happens: a press already on air when
-  the window opens, and a press arriving while it is open.
+  the window opens, and a press arriving while it is open — each also driven by
+  REAL presses on a real fleet through to the screen, with an aged-out control,
+  because a unit reading `window.rivals` off an attempt it built by hand stays
+  green when the look-back itself is deleted.
 - A superseded anchor never decides the final winner, and its rival does not veto
-  one that nothing competed with (the transition, in both directions), including
-  through the settle itself.
-- The remembered-press bound drops the oldest, which no window can reach, and
+  one that nothing competed with (the transition, in both directions), through
+  the settle and through the whole flow.
+- The settle judges the window it was HANDED, so the same attempt refuses or
+  adopts according to which capture is being adopted; a capture with no window
+  refuses.
+- The remembered-press bound drops the oldest and still leaves a rival named, at
+  the smallest bound production allows; the bound's floor of two is pinned; and
   more rivals than can be NAMED still refuse.
+- A flow removed at the arm→STOP handoff releases every bridge it had claimed.
 - A rival pressed again outside the settle window still refuses the capture it
   competed with — at the handler and through the whole flow.
 - A capped mismatch list refuses the one-click adopt at the screen and at the
@@ -839,6 +881,32 @@ written:
 - The `candidates` field comment described "last-heard rather than first" long
   after that stopped being the rule; the field is now `recent` and says what it
   is for.
+
+### Revised after review round 6
+
+Three engines validated the `_ContestedWindow` refactor by executing the
+bookkeeping rather than reading it, and confirmed the recurring ambiguity class
+is gone. What survived were two production edges the refactor did not touch and
+one test-quality gap that would have let the refactor rot:
+
+- **A flow removed at the arm→STOP handoff leaked the whole fleet.** See
+  Removal, under Teardown. The one path that hands a session on without a task
+  owning it was the one path nothing closed.
+- **The comment justifying the deleted `overflowed_at` stated a false
+  invariant.** It claimed the press bound drops what no window can reach;
+  everything the bound holds is inside one settle window, so the drop IS
+  reachable. The real reason is that the winner occupies the newest slot — which
+  makes the bound safe only at 2 or more, a floor nothing enforced while the
+  suite was monkeypatching it to 1. Corrected, pinned, and the forbidden
+  configuration removed from the suite.
+- **The refactor's two seams were only covered by units built by hand.** Delete
+  the window's look-back, or the line storing the recognised winner's window, and
+  every test asserting `window.rivals` on a hand-built attempt stayed green. Four
+  fleet end-to-end tests now drive real presses from two bridges through to the
+  screen, in refuse/adopt pairs, and each seam is mutation-red against them.
+- **The judging window moved onto the candidate** (round-six Fix 4, above): the
+  `contested` list and the `contested[-1]` re-derivation are gone, which removes
+  the ordering invariant coupling an adopted capture to someone else's window.
 
 Three low-severity addenda from round three closed without code changes:
 

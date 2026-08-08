@@ -58,7 +58,11 @@ from custom_components.zemismart_blinds.models import (
     RemoteConfig,
     RemoteIdentity,
 )
-from custom_components.zemismart_blinds.travel_capture import _HEARD_CAP, TravelRun
+from custom_components.zemismart_blinds.travel_capture import (
+    _HEARD_CAP,
+    TravelRun,
+    press_signature,
+)
 from tests.synthetic import (
     SYNTHETIC_REMOTES,
     TEST_ACTION_BASES,
@@ -115,6 +119,13 @@ REFERENCE_UP_B1 = b0_to_b1(TEST_CH12_UP_B0)
 REFERENCE_DOWN_B1 = b0_to_b1(TEST_CH12_DOWN_B0)
 REFERENCE_STOP_B1 = b0_to_b1(
     encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "STOP", bases=TEST_BASES))
+)
+# The same second remote's DOWN. Recognised by the opcode table, so while the
+# wizard is soliciting UP it neither resolves the attempt nor gets held as the
+# fallback -- it only lands in the recently-heard set. That makes it the one
+# rival ONLY a winner's look-back can notice (#57).
+SECOND_REMOTE_DOWN_B1 = b0_to_b1(
+    encode_b0(make_payload(REF_PREFIX, REF_REMOTE_ID, (1, 2), "DOWN", bases=REF_BASES))
 )
 
 # An R11-shaped remote: its calibration-normalised action commands carry the
@@ -1954,44 +1965,6 @@ async def test_a_cancelled_teardown_still_deadlines_and_releases_the_fleet(
     )
 
 
-@pytest.mark.asyncio
-async def test_a_competitor_the_candidate_cap_could_not_name_still_refuses(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The cap bounds what a SCREEN can name, never whether anything competed.
-
-    Applied at insert time it decided ambiguity too: with the cap full, the
-    rival press had nowhere to be recorded, so the capture qualified as
-    unambiguous exactly because the bus was busy. A press dropped for room now
-    forces the refusal it could not be listed in (#57).
-    """
-    fake = FakeMqtt()
-    monkeypatch.setattr(config_flow_module, "_CAPTURE_TIMEOUT_SECONDS", 0.2, raising=False)
-    monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", 1)
-    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
-
-    for bridge, frame in (
-        ("bridge-a", UNTABLED_UP_B1),
-        ("bridge-b", FOREIGN_UNTABLED_UP_B1),
-    ):
-        await fake.emit(
-            active_rx(fake, bridge),
-            f"rf433/{bridge}/rx",
-            json.dumps({"frame": frame, "t": 3}),
-        )
-    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
-
-    placeholders = result["description_placeholders"]
-    assert placeholders is not None
-    assert (
-        f"{UNTABLED_PREFIX:06x}:{UNTABLED_REMOTE_ID:02x} on channels 1" in placeholders["remotes"]
-    )
-
-    hass.config_entries.flow.async_abort(flow_id)
-    await hass.async_block_till_done()
-
-
 def _sniff_attempt(hass: HomeAssistant, action: str = "UP") -> Any:
     """Build one bare attempt for the ambiguity bookkeeping tests."""
     attempt = config_flow_module._SniffAttempt(
@@ -2008,9 +1981,34 @@ def _press(remote: str, channel: int = 1, button: str = "UP") -> Any:
     return (remote, frozenset({channel}), button)
 
 
+def _stamp_winner(
+    attempt: Any,
+    signature: Any,
+    heard_at: float,
+    *,
+    held: bool = False,
+) -> Any:
+    """Stamp one candidate winner exactly the way the sniff handler does.
+
+    Record the press, THEN open its window, and store that window beside the
+    capture it judges. The order is the point: the winner occupies a slot of the
+    press bound before its own look-back reads the rest, which is the only reason
+    that bound cannot decide a verdict.
+    """
+    config_flow_module._record_press(attempt, signature, heard_at)
+    window = config_flow_module._open_contest_window(attempt, signature, heard_at)
+    attempt.resolved_at = heard_at
+    if held:
+        attempt.unrecognized_window = window
+    else:
+        attempt.resolved_window = window
+    return window
+
+
 @pytest.mark.asyncio
 async def test_a_press_heard_before_a_winner_is_judged_as_the_window_opens(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The verdict is taken when the anchor exists, not re-derived afterwards.
 
@@ -2018,16 +2016,23 @@ async def test_a_press_heard_before_a_winner_is_judged_as_the_window_opens(
     recently heard. Deciding it here -- rather than storing a float per press and
     measuring it later -- is what removes the whole class of defect three review
     rounds found in that arithmetic (#57).
+
+    Run at a press bound of 2, the smallest production allows, and with the
+    winner recorded first as the handler records it: the winner takes one slot
+    and the rival has to survive in the other. That interaction is what the
+    earlier version of this test skipped by never recording the winner at all.
     """
+    monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", 2)
     attempt = _sniff_attempt(hass)
     config_flow_module._record_press(attempt, _press("rival"), 10.0)
     config_flow_module._record_press(attempt, _press("stale"), 1.0)
 
-    config_flow_module._open_contest_window(attempt, _press("winner"), 10.5)
+    window = _stamp_winner(attempt, _press("winner"), 10.5)
 
-    assert [sorted(window.rivals) for window in attempt.contested] == [["rival on channels 1"]], (
+    assert sorted(window.rivals) == ["rival on channels 1"], (
         "the press beside the winner competes; the one nine seconds earlier does not"
     )
+    assert attempt.resolved_window is window, "the winner keeps the window that judged it"
 
 
 @pytest.mark.asyncio
@@ -2036,14 +2041,14 @@ async def test_a_press_heard_after_a_winner_is_counted_as_it_arrives(
 ) -> None:
     """The other half of the window needs no stored timestamp either."""
     attempt = _sniff_attempt(hass)
-    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
-    assert attempt.contested[-1].rivals == set()
+    window = _stamp_winner(attempt, _press("winner"), 10.0)
+    assert window.rivals == set()
 
     config_flow_module._record_press(attempt, _press("rival"), 11.0)
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}
+    assert window.rivals == {"rival on channels 1"}
 
     config_flow_module._record_press(attempt, _press("late"), 20.0)
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+    assert window.rivals == {"rival on channels 1"}, (
         "a press a whole listen later did not overlap this winner"
     )
 
@@ -2052,13 +2057,13 @@ async def test_a_press_heard_after_a_winner_is_counted_as_it_arrives(
 async def test_the_winners_own_other_button_is_not_a_rival(hass: HomeAssistant) -> None:
     """Same remote, same selector: it agrees with the winner rather than rivalling it."""
     attempt = _sniff_attempt(hass)
-    config_flow_module._open_contest_window(attempt, _press("winner", button="UP"), 10.0)
+    window = _stamp_winner(attempt, _press("winner", button="UP"), 10.0)
 
     config_flow_module._record_press(attempt, _press("winner", button="DOWN"), 10.2)
-    assert attempt.contested[-1].rivals == set()
+    assert window.rivals == set()
 
     config_flow_module._record_press(attempt, _press("winner", channel=3), 10.3)
-    assert attempt.contested[-1].rivals == {"winner on channels 3"}, (
+    assert window.rivals == {"winner on channels 3"}, (
         "the same remote on ANOTHER selector is a different answer to which blind this is"
     )
 
@@ -2074,13 +2079,13 @@ async def test_a_rivals_later_repress_cannot_erase_that_it_competed(
     winner's window and erased the evidence. There is now nothing to move.
     """
     attempt = _sniff_attempt(hass)
-    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
+    window = _stamp_winner(attempt, _press("winner"), 10.0)
     config_flow_module._record_press(attempt, _press("rival"), 10.1)
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}
+    assert window.rivals == {"rival on channels 1"}
 
     config_flow_module._record_press(attempt, _press("rival"), 25.0)
 
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+    assert window.rivals == {"rival on channels 1"}, (
         "the rival was judged against this winner when it arrived, once and for all"
     )
 
@@ -2104,19 +2109,17 @@ async def test_a_superseded_anchor_never_decides_the_final_winner(
     rival = _press("rival")
     recognised = _press("recognised")
 
-    config_flow_module._record_press(attempt, held, 1.0)
-    config_flow_module._open_contest_window(attempt, held, 1.0)
+    held_window = _stamp_winner(attempt, held, 1.0, held=True)
     config_flow_module._record_press(attempt, rival, 1.1)
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}, "the held anchor is contested"
+    assert held_window.rivals == {"rival on channels 1"}, "the held anchor is contested"
 
     config_flow_module._record_press(attempt, rival, 25.0)
-    config_flow_module._record_press(attempt, recognised, 25.1)
-    config_flow_module._open_contest_window(attempt, recognised, 25.1)
+    resolved_window = _stamp_winner(attempt, recognised, 25.1)
 
-    assert attempt.contested[-1].rivals == {"rival on channels 1"}, (
+    assert resolved_window.rivals == {"rival on channels 1"}, (
         "the FINAL winner had the rival on air 0.1s before it, whatever the old anchor saw"
     )
-    assert len(attempt.contested) == 2, "each anchor keeps its own verdict"
+    assert attempt.unrecognized_window is held_window, "each candidate keeps its own verdict"
 
 
 @pytest.mark.asyncio
@@ -2131,15 +2134,13 @@ async def test_an_abandoned_anchors_rival_does_not_veto_a_later_winner(
     cannot act on.
     """
     attempt = _sniff_attempt(hass)
-    config_flow_module._record_press(attempt, _press("held"), 1.0)
-    config_flow_module._open_contest_window(attempt, _press("held"), 1.0)
+    held_window = _stamp_winner(attempt, _press("held"), 1.0, held=True)
     config_flow_module._record_press(attempt, _press("rival"), 1.1)
 
-    config_flow_module._record_press(attempt, _press("recognised"), 25.1)
-    config_flow_module._open_contest_window(attempt, _press("recognised"), 25.1)
+    resolved_window = _stamp_winner(attempt, _press("recognised"), 25.1)
 
-    assert attempt.contested[-1].rivals == set()
-    assert attempt.contested[0].rivals == {"rival on channels 1"}, (
+    assert resolved_window.rivals == set()
+    assert held_window.rivals == {"rival on channels 1"}, (
         "the abandoned window keeps its own verdict; it just is not the one read"
     )
 
@@ -2161,57 +2162,120 @@ def _held_capture(frame: str, prefix: int, remote_id: int) -> Any:
     )
 
 
+def _settle_flow(hass: HomeAssistant) -> Any:
+    """A bare flow object for driving the settle decision directly."""
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    return flow
+
+
+def _winner_pair(frame: str, prefix: int) -> tuple[Any, Any]:
+    """Return one winner capture and the press signature the handler keys it on."""
+    winner = _held_capture(frame, prefix, UNTABLED_REMOTE_ID)
+    signature = press_signature(
+        winner.prefix,
+        winner.remote_id,
+        winner.channels,
+        "UP",
+    )
+    return winner, signature
+
+
 @pytest.mark.asyncio
-async def test_the_settle_reads_the_window_of_the_winner_it_was_given(
+async def test_the_settle_judges_the_window_handed_to_it_not_the_newest(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two anchors, two verdicts, and only the FINAL one decides.
+    """The adopted capture and the window that judged it cannot come apart.
 
-    A held unrecognised capture opens a window that a recognised winner then
-    supersedes. Reading the wrong one is wrong in both directions: the abandoned
-    window's rival would refuse a capture nothing competed with -- a refusal the
-    user cannot comply with -- and its silence would adopt one that two remotes
-    claimed.
+    Both candidates can be open at once, and which one is adopted is settled by a
+    race the bookkeeping cannot see: a recognised frame resolving the future in
+    the same ready-batch as the capture timeout can leave the flow adopting the
+    HELD capture. Reading "the newest window" then judged the recognised winner's
+    window -- a clean one -- and lost the refusal the held capture had earned.
+    Each capture now brings its own window, so the same attempt yields opposite
+    verdicts depending only on which capture is being adopted.
     """
     monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
-    flow = config_flow_module.ZemismartBlindsConfigFlow()
-    flow.hass = hass
-    winner = _held_capture(UNTABLED_UP_B1, UNTABLED_PREFIX, UNTABLED_REMOTE_ID)
+    flow = _settle_flow(hass)
+    attempt = _sniff_attempt(hass)
+    held, held_signature = _winner_pair(UNTABLED_UP_B1, UNTABLED_PREFIX)
+    recognised, recognised_signature = _winner_pair(FOREIGN_UNTABLED_UP_B1, FOREIGN_UNTABLED_PREFIX)
 
-    def attempt_with(*verdicts: bool) -> Any:
-        attempt = _sniff_attempt(hass)
-        anchor = hass.loop.time()
-        for index, contested in enumerate(verdicts):
-            window = config_flow_module._ContestedWindow(
-                anchor=anchor + index,
-                press=("winner", frozenset({1})),
-            )
-            if contested:
-                window.rivals.add("rival on channels 1")
-            attempt.contested.append(window)
-        attempt.resolved_at = anchor + len(verdicts) - 1
-        return attempt
+    held_window = _stamp_winner(attempt, held_signature, 100.0, held=True)
+    config_flow_module._record_press(attempt, _press("rival"), 100.005)
+    resolved_window = _stamp_winner(attempt, recognised_signature, 100.5)
 
-    assert await flow._async_settle_first_capture(attempt_with(True, False), winner) is True, (
-        "the abandoned anchor's rival must not veto the winner that replaced it"
+    assert held_window.rivals, "the held capture had a rival beside it"
+    assert resolved_window.rivals == set(), "the recognised winner that replaced it did not"
+
+    assert await flow._async_settle_first_capture(attempt, held, held_window) is False, (
+        "adopting the HELD capture judges the HELD window, whatever opened after it"
     )
-    assert await flow._async_settle_first_capture(attempt_with(False, True), winner) is False, (
-        "the winner that was actually adopted had a rival beside it"
-    )
+    assert await flow._async_settle_first_capture(attempt, recognised, resolved_window) is True
 
 
 @pytest.mark.asyncio
-async def test_the_recent_bound_drops_the_oldest_and_can_hide_no_rival(
+async def test_a_capture_with_no_window_is_refused_rather_than_adopted(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unjudged is not the same as uncontested.
+
+    A capture reaching the settle without a window is impossible today -- the
+    window is assigned in the same breath as the anchor -- so this pins the
+    direction that impossibility fails in. Adopting would make a missing window
+    read as "nobody else was on air", which is the shape of every defect this
+    subsystem has produced.
+    """
+    monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
+    flow = _settle_flow(hass)
+    attempt = _sniff_attempt(hass)
+    winner, signature = _winner_pair(UNTABLED_UP_B1, UNTABLED_PREFIX)
+    config_flow_module._record_press(attempt, signature, 100.0)
+    attempt.resolved_at = 100.0
+
+    assert await flow._async_settle_first_capture(attempt, winner, None) is False
+
+
+@pytest.mark.asyncio
+async def test_the_press_bound_leaves_room_for_a_rival(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The press bound has a floor of two, and nothing else enforces it.
+
+    The winner occupies one slot before its own look-back reads the rest, so a
+    bound of 1 evicts the only rival and the capture reads as unambiguous:
+    record a rival, record the winner, and `recent` holds the winner alone.
+    Production must therefore never drop below 2, and this is what says so.
+    """
+    assert config_flow_module._LEARN_CANDIDATE_CAP >= 2, (
+        "a bound of 1 lets the winner evict the rival that would have refused it"
+    )
+    monkeypatch.setattr(config_flow_module, "_LEARN_CANDIDATE_CAP", 2)
+    attempt = _sniff_attempt(hass)
+    for index in range(6):
+        config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 10.0 + index * 0.01)
+
+    window = _stamp_winner(attempt, _press("winner"), 10.06)
+
+    assert len(attempt.recent) == 2, "the bound is saturated by the winner and one rival"
+    assert window.rivals, "the smallest safe bound still names a rival"
+
+
+@pytest.mark.asyncio
+async def test_the_press_bound_drops_the_oldest_and_keeps_the_verdict(
     hass: HomeAssistant,
 ) -> None:
     """A bound on remembered presses must not be able to decide a verdict.
 
-    This is what the earlier `overflowed_at` bookkeeping existed to compensate
-    for, and why it is gone: a window looks BACK from its anchor, and its anchor
-    is never earlier than the presses recorded before it, so the oldest entry is
-    the one no window can reach. Dropping it is structurally unable to hide a
-    rival.
+    Everything `recent` holds is inside one settle window, so the press the bound
+    drops IS one the window about to open could have reached -- it is not safe by
+    being out of reach, which is what an earlier comment here claimed. It is safe
+    by arithmetic: the winner takes the newest slot, so a bound of N leaves N-1
+    presses that can still be named, and any rival in window leaves the window
+    non-empty.
     """
     attempt = _sniff_attempt(hass)
     cap = config_flow_module._LEARN_CANDIDATE_CAP
@@ -2223,33 +2287,60 @@ async def test_the_recent_bound_drops_the_oldest_and_can_hide_no_rival(
     assert "press-00" not in remembered, "the oldest went first"
     assert f"press-{cap + 3:02x}" in remembered, "the newest is always kept"
 
-    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0 + (cap + 3) * 0.01)
-    assert len(attempt.contested[-1].rivals) == cap, "every press it can still reach is named"
+    window = _stamp_winner(attempt, _press("winner"), 10.0 + (cap + 4) * 0.01)
+
+    assert len(window.rivals) == cap - 1, "the winner takes one slot; every other is named"
+    assert window.rivals, "the verdict survives the bound"
 
 
 @pytest.mark.asyncio
-async def test_more_rivals_than_can_be_named_still_refuse(hass: HomeAssistant) -> None:
-    """The name cap bounds the SCREEN, and cannot make a contested window clean."""
+async def test_more_rivals_than_can_be_named_still_refuse(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The name bound shortens the SCREEN; the refusal is not negotiable.
+
+    Driven through the settle rather than read off the window, so what is pinned
+    is the decision the wizard acts on: refuse, and name as many of the rivals as
+    a screen can carry.
+    """
+    monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
+    flow = _settle_flow(hass)
     attempt = _sniff_attempt(hass)
-    config_flow_module._open_contest_window(attempt, _press("winner"), 10.0)
-    for index in range(config_flow_module._LEARN_CANDIDATE_CAP + 3):
-        config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 10.1)
+    winner, signature = _winner_pair(UNTABLED_UP_B1, UNTABLED_PREFIX)
+    cap = config_flow_module._LEARN_CANDIDATE_CAP
+    window = _stamp_winner(attempt, signature, 100.0)
+    for index in range(cap + 3):
+        config_flow_module._record_press(attempt, _press(f"rival-{index:02x}"), 100.001)
 
-    window = attempt.contested[-1]
-    assert len(window.rivals) == config_flow_module._LEARN_CANDIDATE_CAP
-    assert window.rivals, "however many are dropped, the window is still contested"
-
-
-@pytest.mark.asyncio
-async def test_a_press_that_aged_out_is_never_a_rival(hass: HomeAssistant) -> None:
-    """Presses no window can reach are forgotten, so they cannot veto anything."""
-    attempt = _sniff_attempt(hass)
-    config_flow_module._record_press(attempt, _press("early"), 1.0)
-    config_flow_module._record_press(
-        attempt, _press("later"), 1.0 + TRAVEL_BURST_WINDOW_SECONDS * 2
+    assert await flow._async_settle_first_capture(attempt, winner, window) is False
+    assert len(flow._learn_candidates) == cap + 1, (
+        "the winner, plus as many rivals as the screen can name"
     )
+    assert flow._learn_candidates[0] == config_flow_module._press_name(signature)
 
-    assert {remote for remote, _channels, _button in attempt.recent} == {"later"}
+
+@pytest.mark.asyncio
+async def test_a_press_that_aged_out_is_never_a_rival(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Presses no window can reach are forgotten, so they cannot veto anything.
+
+    Driven through the settle for the same reason: an unreachable press must
+    produce an ADOPTION, not merely an empty rival set.
+    """
+    monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", 0.01)
+    flow = _settle_flow(hass)
+    attempt = _sniff_attempt(hass)
+    winner, signature = _winner_pair(UNTABLED_UP_B1, UNTABLED_PREFIX)
+    config_flow_module._record_press(attempt, _press("early"), 95.0)
+
+    window = _stamp_winner(attempt, signature, 100.0)
+
+    assert await flow._async_settle_first_capture(attempt, winner, window) is True
+    assert flow._learn_candidates == (), "an adopted capture names nobody"
+    assert set(attempt.recent) == {signature}, "the aged-out press was forgotten"
 
 
 @pytest.mark.asyncio
@@ -2290,6 +2381,189 @@ async def test_the_listening_set_is_named_in_a_stable_order(
     assert placeholders["bridge"] == "bridge-a, bridge-z"
     await wait_for_sniff_starts(fake, 1, "bridge-a")
     await wait_for_sniff_starts(fake, 1, "bridge-z")
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+def _learned_remote_name() -> str:
+    """How the ambiguity screen names the remote these tests learn."""
+    return f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x} on channels 1,2"
+
+
+def _rival_remote_name() -> str:
+    """How it names the second remote pressed alongside."""
+    return f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x} on channels 1,2"
+
+
+@pytest.mark.asyncio
+async def test_a_rival_pressed_before_the_winner_refuses_the_whole_flow(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The winner's look-back, driven by real presses on a real fleet (#57).
+
+    Everything else covering this half of the window asserts `window.rivals` on
+    an attempt the test built, so deleting the look-back leaves those green while
+    a real wizard silently adopts. Here two remotes are pressed on two bridges
+    and the assertion is the SCREEN.
+
+    The rival is a recognised DOWN while UP is solicited: it cannot resolve the
+    attempt and is not held as the fallback, so it opens no window of its own.
+    Only the winner looking back can notice it.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": SECOND_REMOTE_DOWN_B1, "t": 3}),
+    )
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 4}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert _learned_remote_name() in placeholders["remotes"]
+    assert _rival_remote_name() in placeholders["remotes"], (
+        "the remote pressed just before the winner has to be named, not merely counted"
+    )
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_rival_pressed_long_before_the_winner_is_adopted(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the look-back reaches one settle window, not the whole listen.
+
+    Same two presses, spaced further apart than the settle. Without this the
+    refusal above could be produced by a look-back that vetoes on anything ever
+    heard -- a refusal the user cannot comply with in a house with two remotes.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": SECOND_REMOTE_DOWN_B1, "t": 3}),
+    )
+    await asyncio.sleep(0.5)
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 4}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_next")
+
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_recognised_winner_that_supersedes_a_held_one_is_still_judged(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anchor transition, driven by real presses end to end (#57).
+
+    An untabled press is HELD as the fallback and opens its own window; a
+    recognised UP then supersedes it and must be judged by a window of its OWN.
+    The rival is pressed twice -- once beside the held capture, once beside the
+    recognised winner -- which is what the round-5 defect could not see: it kept
+    the occurrence near the ABANDONED anchor and measured it against the final
+    one, 24 seconds away, and adopted.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": UNTABLED_UP_B1, "t": 3}),
+    )
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": SECOND_REMOTE_DOWN_B1, "t": 4}),
+    )
+    # Long enough that the first copy of the rival is out of reach of anything
+    # opening now: only the RE-press can put it beside the recognised winner.
+    await asyncio.sleep(0.5)
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": SECOND_REMOTE_DOWN_B1, "t": 5}),
+    )
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 6}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert _learned_remote_name() in placeholders["remotes"]
+    assert _rival_remote_name() in placeholders["remotes"]
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_recognised_winner_ignores_the_held_windows_own_rival(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the transition: the abandoned window does not veto.
+
+    Identical to the case above without the re-press. The held capture's window
+    is contested and the recognised winner's is not, and it is the winner's that
+    decides -- otherwise a stray press early in the listen would refuse every
+    capture for the rest of it.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": UNTABLED_UP_B1, "t": 3}),
+    )
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": SECOND_REMOTE_DOWN_B1, "t": 4}),
+    )
+    await asyncio.sleep(0.5)
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 6}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_next")
+
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
 
     hass.config_entries.flow.async_abort(flow_id)
     await hass.async_block_till_done()
@@ -4004,7 +4278,8 @@ async def test_sniff_handler_keys_a_press_on_the_button_it_actually_is(
 
     assert attempt.future.done(), "the requested action still resolves the attempt"
     assert sorted(button for _remote, _channels, button in attempt.recent) == ["DOWN", "UP"]
-    assert attempt.contested[-1].rivals == set(), (
+    assert attempt.resolved_window is not None
+    assert attempt.resolved_window.rivals == set(), (
         "one remote's two buttons on one selector are the same answer, not rivals"
     )
 
@@ -5129,6 +5404,53 @@ async def test_a_real_capped_measurement_refuses_the_adopt_end_to_end(
 
     hass.config_entries.flow.async_abort(flow_id)
     await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_aborting_at_the_arm_to_stop_handoff_releases_every_bridge(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flow removed BETWEEN the two measurement phases must not keep the fleet.
+
+    ``_async_measure_arm`` returning "armed" deliberately leaves the session open
+    for the STOP phase to inherit, and Home Assistant advances to that phase from
+    a task it schedules when the arm task completes -- suppressing ``UnknownFlow``
+    if the flow has gone by the time that task runs. An abort processed in that
+    gap therefore left a session NO task would ever close: the per-bridge holders
+    keep re-arming their sniff windows, and every claim is held until Home
+    Assistant restarts, so no later wizard can listen anywhere in the house (#57).
+
+    Deterministic rather than raced: done-callbacks run in registration order, so
+    Home Assistant's own scheduling callback runs first and the abort below lands
+    before the task it created gets its turn.
+    """
+    _entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    flow = cast(
+        "config_flow_module.ZemismartBlindsConfigFlow",
+        hass.config_entries.flow._progress[flow_id],
+    )
+    arming = flow._measure_task
+    assert arming is not None, "the arm phase is in flight"
+    arming.add_done_callback(lambda _task: hass.config_entries.flow.async_abort(flow_id))
+
+    await fake.emit(
+        fake.rx_subscriptions()[-1],
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_DOWN_B1, "t": 1_000, "boot": 7}),
+    )
+    async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
+        await hass.async_block_till_done()
+
+    assert arming.result() == "armed", (
+        "the fixture must reach the handoff: the arm phase hands a LIVE session on"
+    )
+    assert config_flow_module._CAPTURE_OWNERS == {}, (
+        "the removed flow's session was closed, so no bridge is left claimed by it"
+    )
+    assert not [subscription for subscription in fake.rx_subscriptions() if subscription.active], (
+        "and nothing is still subscribed on its behalf"
+    )
 
 
 @pytest.mark.asyncio

@@ -231,9 +231,15 @@ _LEARN_SETTLE_SECONDS = TRAVEL_BURST_WINDOW_SECONDS
 # there was none (#57). Asserted against the firmware's cap in the tests.
 _LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_LEARN_SETTLE_SECONDS)
 # Bounds two things against a busy bus, neither of them the VERDICT: how many
-# recently-heard presses are remembered (the oldest go first, and a window can
-# only reach the newest), and how many rivals one screen NAMES. Two is already
-# ambiguous, so nothing this cap drops can make a contested capture look clean.
+# recently-heard presses are remembered, and how many rivals one screen NAMES.
+#
+# MUST be 2 or more. The press bound drops the oldest entry, and everything it
+# holds is inside one settle window, so a dropped press IS one the window about
+# to open could have reached. What saves the verdict is that the winner takes
+# the newest slot, leaving this many minus one for rivals -- at 1 the winner
+# evicts the only rival and the capture reads as unambiguous. The name bound is
+# safe at any size: a name is dropped only once that many are already in the
+# set, which is non-empty, so the screen loses a name and never the refusal.
 _LEARN_CANDIDATE_CAP: Final = 8
 # How long teardown gives every bridge's sniff stop before giving them up.
 # Teardown runs in a `finally` on the flow's own task, so an unbounded wait here
@@ -450,14 +456,22 @@ def _record_press(
         # Older than any window that can still open could look back to.
         del attempt.recent[stale]
     while len(attempt.recent) > _LEARN_CANDIDATE_CAP:
-        # Drop the OLDEST, which no window can reach that the newest cannot: a
-        # window looks back one settle window from its anchor, and its anchor is
-        # never earlier than the presses recorded before it. So this bound is
-        # unable to hide a rival, where a cap applied to the VERDICT would be --
-        # which is exactly the shape the earlier `overflowed_at` bookkeeping
-        # existed to compensate for, and why it is gone.
+        # Drop the OLDEST. Everything here is already inside one settle window,
+        # so a dropped entry IS reachable by the window about to open -- the
+        # bound cannot claim otherwise. What keeps it from deciding a VERDICT is
+        # arithmetic: the winner is recorded immediately before its own window
+        # opens, so it holds the newest slot and survives; the drop therefore
+        # leaves at least ``_LEARN_CANDIDATE_CAP - 1`` other presses, and any
+        # rival in window leaves the window non-empty. That is safe only for a
+        # bound of 2 or more, which `test_the_press_bound_leaves_room_for_a_rival`
+        # pins -- at 1 the winner evicts the only rival and the capture is
+        # adopted as unambiguous.
         del attempt.recent[min(attempt.recent, key=attempt.recent.__getitem__)]
-    for window in attempt.contested:
+    for window in (attempt.unrecognized_window, attempt.resolved_window):
+        # Both candidates keep collecting: either may still be adopted, and only
+        # the one belonging to the adopted capture is ever read.
+        if window is None:
+            continue
         if signature[:2] != window.press and abs(heard_at - window.anchor) <= _LEARN_SETTLE_SECONDS:
             _name_rival(window, signature)
 
@@ -466,19 +480,22 @@ def _open_contest_window(
     attempt: _SniffAttempt,
     signature: FrameSignature,
     heard_at: float,
-) -> None:
+) -> _ContestedWindow:
     """Open one candidate winner's window, judging what was already on air.
 
     Called at each of the two places that stamp ``resolved_at``, so the half of
     the window BEFORE the anchor is settled while that anchor is the current
     one. Nothing here is revisited: a later winner opens its own window and is
     judged against ``recent`` as it stands then.
+
+    Returned rather than appended to a list, so the caller stores it beside the
+    capture it judges -- see ``_SniffAttempt.resolved_window``.
     """
     window = _ContestedWindow(anchor=heard_at, press=signature[:2])
     for press, last_heard in attempt.recent.items():
         if press[:2] != window.press and abs(last_heard - heard_at) <= _LEARN_SETTLE_SECONDS:
             _name_rival(window, press)
-    attempt.contested.append(window)
+    return window
 
 
 def _name_rival(window: _ContestedWindow, signature: FrameSignature) -> None:
@@ -579,7 +596,7 @@ def _handle_sniff_message(
         return
     if inferred == attempt.action:
         attempt.resolved_at = heard_at
-        _open_contest_window(attempt, signature, heard_at)
+        attempt.resolved_window = _open_contest_window(attempt, signature, heard_at)
         attempt.future.set_result(capture)
         return
     if inferred is not None:
@@ -598,11 +615,12 @@ def _handle_sniff_message(
         # Stamped like a resolved winner: if the window closes with nothing
         # recognised, THIS is the capture that would be adopted, so it is the
         # one a competing press has to be judged against. A later recognised
-        # frame stamps its own anchor and opens its own window above, and THAT
-        # one is what the settle reads -- this window is simply abandoned with
-        # whatever it had judged, never re-measured against the new anchor.
+        # frame stamps its own anchor and opens its own window above, and
+        # whichever capture is adopted brings its OWN window to the settle --
+        # this one is abandoned with whatever it had judged, never re-measured
+        # against the new anchor and never mistaken for the new winner's.
         attempt.resolved_at = heard_at
-        _open_contest_window(attempt, signature, heard_at)
+        attempt.unrecognized_window = _open_contest_window(attempt, signature, heard_at)
         attempt.unrecognized = capture
 
 
@@ -2515,6 +2533,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self,
         attempt: _SniffAttempt,
         winner: _LearnCapture,
+        window: _ContestedWindow | None,
     ) -> bool:
         """Report whether the first capture of a run may be adopted.
 
@@ -2546,6 +2565,12 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         ``resolved_at`` moves and any float kept for later has to survive that
         move -- three review rounds each found a way it did not (#57). This
         sleeps out the window and reads the verdict.
+
+        ``window`` is the one stored beside THIS capture, passed in rather than
+        looked up, so the capture being adopted and the window being judged
+        cannot come apart. A missing window is an impossible state -- the two
+        are assigned together -- and it REFUSES rather than adopts: unchecked is
+        not the same as uncontested, and refusing is the recoverable direction.
         """
         anchor = attempt.resolved_at
         if anchor is None:
@@ -2556,12 +2581,14 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         remaining = anchor + _LEARN_SETTLE_SECONDS - self.hass.loop.time()
         if remaining > 0:
             await asyncio.sleep(remaining)
-        # The LAST window is this winner's: a window is opened by the same two
-        # statements that stamp `resolved_at`, so the final stamp owns the final
-        # window. Rivals kept accruing into it during the sleep above.
-        judged = attempt.contested[-1] if attempt.contested else None
-        rivals = sorted(judged.rivals) if judged is not None else []
-        if not rivals:
+        # Rivals kept accruing into this window during the sleep above.
+        if window is None:
+            _LOGGER.warning(
+                "Learn: the capture being adopted has no ambiguity window, which should not "
+                "be reachable; refusing it rather than adopting evidence nothing judged"
+            )
+        rivals = sorted(window.rivals) if window is not None else []
+        if window is not None and not rivals:
             return True
         winner_signature = press_signature(
             winner.prefix,
@@ -2631,7 +2658,13 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     _LOGGER.debug("Learn: no bridge of %s could be armed", self._learn_bridges)
                     return "timeout"
                 capture = await capture_future
-            if first_capture and not await self._async_settle_first_capture(attempt, capture):
+            # Each capture brings its OWN judging window: the recognised winner
+            # here, the held fallback below. Neither reads the other's.
+            if first_capture and not await self._async_settle_first_capture(
+                attempt,
+                capture,
+                attempt.resolved_window,
+            ):
                 return "ambiguous"
             return self._store_capture(session_id, capture)
         except TimeoutError:
@@ -2647,7 +2680,11 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             unrecognized = attempt.unrecognized
             if unrecognized is None:
                 return "timeout"
-            if first_capture and not await self._async_settle_first_capture(attempt, unrecognized):
+            if first_capture and not await self._async_settle_first_capture(
+                attempt,
+                unrecognized,
+                attempt.unrecognized_window,
+            ):
                 return "ambiguous"
             return self._store_capture(session_id, unrecognized)
         except asyncio.CancelledError:
@@ -2838,6 +2875,29 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @callback
     def async_remove(self) -> None:
-        """Invalidate callbacks while HA cancels the registered progress task."""
+        """Invalidate callbacks, and hand any OPEN listening session to cleanup.
+
+        A measurement spans two progress phases, so ``_async_measure_arm``
+        returning "armed" deliberately leaves the session open for the STOP
+        phase to inherit. Removing the flow in that gap left nobody to close it:
+        the progress task HA cancels has already finished, and the STOP task
+        that would have torn the session down is never created. The per-bridge
+        holders then keep re-arming their sniff windows for the life of the
+        process with every claim held, so no later wizard can listen anywhere in
+        the house without a restart (#57).
+
+        Detached before it is closed, so nothing can find the session again, and
+        closed from a task of its own because this is a sync callback. That task
+        needs no shield: only shutdown cancels it, and at shutdown the claims go
+        with the process anyway -- while `_async_stop_sniff_channels` already
+        owns its own deadline and releases every claim on the way out.
+        """
         self._sniff_session_id = None
+        session = self._measure_session
+        self._measure_session = None
+        if session is not None and not session.closed:
+            self.hass.async_create_task(
+                self._async_measure_session_close(session),
+                f"{DOMAIN} measure session cleanup",
+            )
         super().async_remove()

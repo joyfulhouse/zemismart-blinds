@@ -249,6 +249,36 @@ one exists, so the prescribed dual-timestamp patch was NOT written:
   (withdrawing a round-four pushback: this repo does assert string bodies).
 - `_SniffAttempt.candidates` → `recent`, with a comment that matches the rule.
 
+### Task 11: Sixth review round — the seams, not the shape
+
+Files: `config_flow.py`, `learn_session.py`, `tests/test_config_flow.py`, spec
+
+All three engines validated the round-5 `_ContestedWindow` refactor by executing
+its bookkeeping; the survivors were two production edges and the test quality
+that has to hold the invariant in place.
+
+- `async_remove` detaches an open measure session and closes it from a task of
+  its own. The arm→STOP handoff is the one path that hands a live session on
+  without a task owning it, so a flow removed there left the holders re-arming
+  and every bridge claimed until a restart.
+- The press bound's justification was false (everything it holds is in window, so
+  the dropped press IS reachable). Replaced with the real arithmetic — the winner
+  takes the newest slot — which makes the bound safe only at 2 or more; that
+  floor is now pinned by `test_the_press_bound_leaves_room_for_a_rival`, and the
+  suite no longer monkeypatches the bound to 1.
+- The before-half tests now record the winner FIRST, as the handler does, and run
+  at the bound's floor, so they exercise the interaction that made the old
+  justification wrong.
+- Four REAL fleet end-to-end tests (two refuse/adopt pairs) cover the two
+  refactor seams — the window's look-back and the recognised winner's stored
+  window — because the hand-built units stayed green when either was deleted.
+- Each candidate keeps its own judging window; the `contested` list and its
+  `contested[-1]` re-derivation are gone, and a capture reaching the settle with
+  no window refuses rather than adopts.
+- `test_more_rivals_than_can_be_named_still_refuse` and
+  `test_a_press_that_aged_out_is_never_a_rival` now drive the settle decision
+  instead of asserting internals.
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and
