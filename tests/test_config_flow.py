@@ -430,28 +430,15 @@ async def wait_for_sniff_starts(
             fake.changed.clear()
 
 
-async def advance_past_progress(hass: HomeAssistant, flow_id: str) -> ConfigFlowResult:
-    """Drive ONE flow until its progress task settles into the next step.
-
-    Unlike ``async_block_till_done`` this waits only on the flow asked about,
-    which is what a test with a second flow deliberately left mid-capture
-    needs: blocking on every task would wait out that flow's whole window.
-    """
-    async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
-        while True:
-            result = await hass.config_entries.flow.async_configure(flow_id)
-            if result["type"] is not FlowResultType.SHOW_PROGRESS:
-                return result
-            await asyncio.sleep(0)
-
-
 async def advance_to_step(hass: HomeAssistant, flow_id: str, step_id: str) -> ConfigFlowResult:
     """Drive ONE flow until it reaches ``step_id``.
 
     A measurement moves between two SHOW_PROGRESS steps, so "left progress"
-    is not the signal -- the step is. Bounded, so a run that never closes
-    fails the assertion it was written for instead of waiting out the flow's
-    own 30-second timeouts.
+    is not the signal -- the step is. Waiting on ONE flow is also what a test
+    with a second flow deliberately left mid-capture needs: blocking on every
+    task would wait out that flow's whole window. Bounded, so a run that never
+    closes fails the assertion it was written for instead of waiting out the
+    flow's own 30-second timeouts.
     """
     async with asyncio.timeout(_FLOW_WAIT_TIMEOUT_SECONDS):
         while True:
@@ -1207,7 +1194,7 @@ async def test_a_fleet_sniff_skips_a_bridge_another_session_owns(
     )
     # Not `async_block_till_done`: the holder's capture is deliberately still
     # pending here, and blocking on every task would wait out its whole window.
-    result = await advance_past_progress(hass, fleet_id)
+    result = await advance_to_step(hass, fleet_id, "learn_next")
     assert result["step_id"] == "learn_next", "the fleet sniff captured on the bridge it did claim"
 
     hass.config_entries.flow.async_abort(fleet_id)
