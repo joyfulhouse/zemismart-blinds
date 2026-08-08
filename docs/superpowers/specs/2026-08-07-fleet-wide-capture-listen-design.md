@@ -47,10 +47,10 @@ does: on every online bridge at once.
 | Decision | Choice |
 | --- | --- |
 | Subscription shape | One subscription **per target bridge**, not the `rf433/+/rx` wildcard — a flow-local wildcard would also hear bridges the user explicitly excluded via the override, and per-bridge subscriptions give each handler its `bridge_id` without re-parsing topics |
-| Dedup | A **signature-keyed sliding filter** ahead of the run, keyed and windowed like `state_sync`'s debounce — see below |
+| Dedup | A **signature-keyed sliding filter**, keyed and windowed like `state_sync`'s debounce, plus an unconditional rule that the run's opening signature can never re-anchor it — see below |
 | Timing across bridges | Bridge-clock subtraction only when the direction press and the STOP were heard by the **same** bridge; otherwise fall back to the monotonic receive times |
-| Ownership | Claim every target bridge in `_CAPTURE_OWNERS`; bridges already owned by another session are **skipped**, not fatal; zero claimable bridges is reported as a **conflict**, never as silence on air |
-| First learn capture | Refuses to adopt when a **second remote** was heard alongside it — see the trust boundary below |
+| Ownership | Claim **every** target bridge in `_CAPTURE_OWNERS` or none: any bridge another session holds refuses the whole claim as a **conflict**, never as silence on air and never as a quiet listen on the subset |
+| First learn capture | Refuses to adopt when a **second press** was heard alongside it, on the resolved and the timed-out path alike — see the trust boundary below |
 | Automatic | All online bridges from the flow-local discovery snapshot |
 | Explicit pick | Exactly that bridge — the previous behavior, now an override |
 | Learn wizard | Same treatment: `_learn_bridge` becomes `_learn_bridges`, `_async_capture` arms and listens on all of them |
@@ -71,30 +71,45 @@ button would collapse two different remotes — or one remote on two channel
 selectors — into a single press, which is precisely what fleet listening
 now puts on the same wire.
 
-`TravelRun._is_repeat` filters copies **before** `_open` or `_close` sees
-them, so those two only ever handle genuinely new presses. That separation is
-the fix. Previously one predicate — "same button, within 1.5 s of the run
-anchor" — served as both the dedup and the re-press detector, and the two
-want different windows:
+`TravelRun._is_repeat` stamps every copy on a **sliding** window: each copy
+re-stamps its signature, so a burst chains for as long as its copies keep
+arriving. A window anchored at the first copy expires mid-burst when a bridge
+delivers late, and the escaping copy then reads as a fresh press.
 
-- The window **slides**: every copy re-stamps its signature, so a burst chains
-  for as long as its copies keep arriving. A window anchored at the first copy
-  expires mid-burst when a bridge delivers late, and the escaping copy then
-  reads as a fresh press, **restarts the run, and stores a travel time short
-  by the whole spread** — the unsafe direction, since a short time leaves
-  "closed" visibly open.
-- Human re-presses are seconds apart and land outside the window either way,
-  so restart detection is unharmed.
+**A window cannot be the whole answer, though, and this is the correction the
+second review round forced.** An *isolated* copy from a bridge lagging by more
+than a whole burst has no chain to slide: it escapes any window, whatever its
+width. So the run's anchor is protected by the signature itself rather than by
+a clock —
+
+- `_open` refuses to replace an open run's start when the incoming press
+  carries the signature that opened it. Always, however late it arrives.
+  Re-anchoring stores a travel time short by the delivery spread, the unsafe
+  direction, since a short time leaves "closed" visibly open.
+- Nothing in the protocol identifies one physical press: there is no sequence
+  number and no per-press nonce, so a late copy and a genuine re-press of the
+  same button on the same channels are the same bytes. A restart keyed on
+  "same button, long enough after" is therefore a guess, and it guesses in the
+  unsafe direction. Keeping the first anchor errs long, and it is *right*
+  whenever the shade started moving on the first press.
+- A press of the **other** direction has its own signature and still restarts
+  the run. That is the user changing their mind, and it is the restart the
+  wizard actually needs.
+
+The window's remaining job is to keep a duplicate STOP from closing a run
+twice. It deliberately does **not** gate `_open`: a press with no run open
+cannot shorten anything, and filtering those swallowed a user's re-press after
+a run that closed too fast to store — the wizard then waited out its whole
+deadline having heard the user twice.
+
+The `recent` map needs no cap. `classify_frame` pins the remote identity and
+the channel set before a signature exists, so one run can only ever see UP,
+DOWN and STOP; an earlier draft's `_RECENT_CAP` eviction path was unreachable
+by construction and is gone.
 
 The `heard` mismatch list still dedups by value (`mismatch not in self.heard`)
 — identical frames decoded on different bridges produce equal `HeardPress`
 records — so fleet listening adds no duplicate mismatch rows.
-
-Residual: copies of one press separated by more than the 1.5 s window from
-*each other* (not merely from the run start) still read as a re-press. That
-needs a bridge whose MQTT path lags another's by longer than a whole burst.
-The bridges report no clock we could use instead — `t` is bridge-local with no
-shared epoch — so the receive clock is what there is.
 
 **Learn.** `_SniffAttempt.future` still resolves on the first acceptable
 capture; later copies from any bridge return at the `future.done()` gate. What
@@ -146,15 +161,52 @@ choice to make".
    already-measured actions, and on the first there are none — so any
    Zemismart remote satisfies it. It now keeps listening for
    `_LEARN_SETTLE_SECONDS` (one burst window) past its winner, collecting
-   every distinct remote heard. One candidate: proceed as before. More than
+   every distinct press heard. One candidate: proceed as before. More than
    one: refuse, name them, and offer retry (`learn_ambiguous`). Captures 2
    and 3 need no settle — the first capture has pinned the remote by then.
+
+   Three details decide whether that rule is honest, and the second review
+   round corrected all three:
+
+   - **Both winners.** A capture whose opcode byte is outside the codec's
+     action table cannot end the window early (nothing separates it from the
+     OEM trailer burst until the window closes with nothing recognised), so it
+     is adopted on the **timeout** path instead. That path pins the wizard's
+     remote exactly as hard, and an untabled remote's trailer burst from two
+     rooms away is precisely what reaches it. It settles and qualifies
+     identically; the settle is only as long as the winner has not already
+     outlasted, so a capture held twenty seconds ago sleeps not at all.
+   - **Around the winner, not across the window.** Competitors are counted
+     within one settle window either side of the winner's arrival, on the
+     event-loop clock. Collecting across the whole 30-second listen makes a
+     legitimate learn *impossible to complete* in a house where anyone else
+     touches a remote while the wizard is open: every attempt refuses, and the
+     screen's advice — press again while nobody else is — cannot be complied
+     with. The boundary is inclusive, because refusing is recoverable and
+     adopting the wrong remote is not.
+   - **Keyed by press, not by remote.** Candidates key on the full
+     `press_signature` — remote, channel set, action — not on the remote id.
+     The wizard stores the captured channel set as well as the identity (it
+     prefills the first cover with it), so one remote heard on two selectors
+     at once is two different answers to "which blind is this".
 
 2. **The measure mismatch screen's one-click adopt.** `cover_measure_use_heard`
    rewrites the device's stored identity from `heard[0]`. With the fleet
    listening, `heard` can hold several unrelated remotes, so adoption is now
    offered only when exactly one foreign remote was heard; otherwise the
-   screen names them all and asks for a retry.
+   screen names them all and asks for a retry. The step re-makes that
+   qualification itself rather than trusting the menu it was reached from —
+   defence in depth, since Home Assistant does validate a menu choice against
+   the options the step published, but the rule belongs where the identity is
+   actually rewritten.
+
+   The screen's own diagnosis is taken from **this device's remote wherever it
+   landed in `heard`**, not from `heard[0]`. Reading position zero made the
+   diagnosis a race between bridges: a stranger's remote arriving first hid
+   the fact that the device's own remote had been heard on the wrong channels,
+   and the screen then offered to replace a correct identity with the
+   stranger's. An identity match is the one exact diagnosis available — only
+   the channel selector can have rejected the press — so it wins outright.
 
 3. **Sharing a bridge between sessions.** Rejected — see below.
 
@@ -177,29 +229,55 @@ learned by both open wizards. That is the same silent misattribution this
 issue is about, arriving by another door.
 
 What the fleet widening does change is how *likely* a conflict is: Automatic
-now claims every bridge, so any second open wizard collides. Zero claimable
-bridges is therefore reported as its own outcome (`bridge_busy` →
-`learn_busy` / `cover_measure_busy`) naming the held bridges. It must never be
+now claims every bridge, so any second open wizard collides. A conflict is
+therefore reported as its own outcome (`bridge_busy` → `learn_busy` /
+`cover_measure_busy`) naming the bridges actually held. It must never be
 reported as "no press was detected": that screen sends the user off testing a
 remote, a channel selector and their standing position, none of which is the
 problem.
+
+The claim is **all-or-nothing**, which the second review round corrected from
+"claim what is free and skip the rest". A subset claim looks identical to a
+healthy fleet-wide session from the outside — the progress screen still names
+every bridge — while the bridge that could actually hear this remote may be
+precisely the excluded one. #57 exists because a session listened on too few
+bridges and reported the result as though it had listened on the right ones;
+reproducing that quietly inside the fix would be the same bug with a better
+excuse. The cost is that one open wizard now blocks another anywhere in the
+house, which is exactly what the busy screen says and what closing the other
+window fixes.
 
 ## Bounds
 
 Fleet-sized work needs fleet-independent limits:
 
-- **Arming** is concurrent across bridges in batches of `_SNIFF_FANOUT_LIMIT`,
-  because the MQTT bootstrap budget is a fixed 5 s however many bridges exist,
-  and serial SUBACK round trips grow with the house. Per bridge it stays
-  ordered — subscribe, then open the window — so no bridge's window is ever
-  open with nothing listening to it.
+- **Arming** is concurrent across bridges under a semaphore of
+  `_SNIFF_FANOUT_LIMIT`, sharing ONE absolute deadline with the
+  wait-for-client that precedes it: the MQTT bootstrap budget is a fixed 5 s
+  however many bridges exist, so neither serial batches nor a bigger house may
+  push the advertised capture window out. Per bridge it stays ordered —
+  subscribe, then open the window — so no bridge's window is ever open with
+  nothing listening to it.
+
+  A bridge that raises, or that has not finished by the deadline, is **skipped
+  rather than fatal**; zero armed bridges is what fails. The fan-out gathers
+  with `return_exceptions`, which is what makes skipping safe: propagating the
+  first exception leaves every sibling coroutine running behind the caller,
+  and a sibling finishing after teardown has walked the channel list leaves a
+  live subscription and a bridge sniffing with its owner key already released.
+  Only the bridges that actually subscribed get a re-arm hold, so no window is
+  held open on a bridge nobody is listening to.
 - **Re-arm holds** retry a failed publish `_SNIFF_REARM_FAILURE_LIMIT` times
   consecutively and then stop, logging at warning and error. A bridge that
   dropped off mid-run was previously republished to forever, silently; a
   broker refusing every publish looked exactly like a healthy hold. A success
-  resets the count, so an isolated hiccup costs nothing.
-- **Caches** are capped: `_RECENT_CAP` signatures in the repeat filter,
-  `_LEARN_CANDIDATE_CAP` competing remotes per attempt.
+  resets the count, so an isolated hiccup costs nothing. The `except` stays
+  **broad**: anything the publish can raise would otherwise escape the loop,
+  kill that bridge's hold and drop it out of the sniff for the rest of the run
+  with nothing said. The bounded retry is what stops a dead bridge being
+  republished to forever, so breadth costs nothing.
+- **Caches**: `_LEARN_CANDIDATE_CAP` competing presses per attempt. The repeat
+  filter needs no cap — see the dedup section.
 
 ## Session shape
 
@@ -224,18 +302,18 @@ class _SniffChannel:
 `closed` are shared: one run machine fed by all bridges is precisely what
 makes the dedup work.
 
-**Arming.** `_async_measure_arm` claims each target bridge in
-`_CAPTURE_OWNERS` (skipping ones another session owns — a Learn sniff on one
-bridge no longer blocks a fleet measure, it just excludes that bridge),
-subscribes each claimed bridge's `/rx` inside the existing bootstrap
-timeout, then starts one `_async_hold_sniff_open` holder task per bridge.
-Zero claimed bridges fails the arm.
+**Arming.** `_async_measure_arm` claims every target bridge in
+`_CAPTURE_OWNERS` (or none — a Learn sniff holding one bridge refuses the
+measure as busy rather than narrowing it), subscribes the claimed bridges'
+`/rx` inside the shared bootstrap deadline, then starts one
+`_async_hold_sniff_open` holder task per **subscribed** bridge. Zero
+subscribed bridges fails the arm.
 
-**Holding.** The per-bridge re-arm loop wraps its publish in a broad
-`except`: a broker hiccup or a bridge that dropped off mid-run must not kill
-the holder (nor, being separate tasks, the other bridges' holders). The
-firmware's `start_sniff` still takes the later of current and candidate
-deadlines, so the re-publish semantics are unchanged.
+**Holding.** The per-bridge re-arm loop wraps its publish in a broad `except`
+with a bounded retry: a broker hiccup or a bridge that dropped off mid-run
+must not kill the holder (nor, being separate tasks, the other bridges'
+holders). The firmware's `start_sniff` still takes the later of current and
+candidate deadlines, so the re-publish semantics are unchanged.
 
 **Teardown.** `_async_measure_session_close` walks every channel: cancel the
 holder, unsubscribe, publish `{"action":"sniff","seconds":0}`, and release
@@ -287,6 +365,13 @@ Pure machine (`tests/test_travel_capture.py`):
   anchored at the first copy.
 - A lagging bridge's copies, spread further apart than the window is wide from
   the run start, still never restart it — the short-travel regression.
+- An ISOLATED copy arriving one window plus a hair after the first, with no
+  chain to slide, still never re-anchors — the residual the second review
+  round closed.
+- A same-direction press seconds later does not restart the run either, and
+  says so: the frames are identical, so erring long is the only safe rule.
+- A re-press after a run closed too fast to store still opens a run — the
+  filter must not swallow a press that has nothing to shorten.
 - A STOP 1.4 s after the direction press closes the run rather than being
   swallowed as a repeat (the button is part of the key).
 - `press_signature` separates remotes, channel sets and buttons, and is
@@ -309,17 +394,31 @@ Flow (`tests/test_config_flow.py`):
 - Own-emission echoes are dropped on every subscribed bridge.
 - Two remotes pressed at once are refused and both named; ONE remote heard on
   two bridges is not ambiguous (the control that keeps the refusal honest).
-- A claim conflict reports busy, on both the learn and the measure path.
+- The window closing on a held unrecognised-opcode capture refuses under the
+  same rule, rather than adopting on the path with no gate.
+- A press OUTSIDE the settle window does not veto the learn — the control
+  that keeps the refusal compliable-with.
+- One remote heard on two channel selectors at once is two presses, not one.
+- A claim conflict reports busy, on both the learn and the measure path, and
+  a fleet claim is refused whole while any one bridge is held.
 - Several foreign remotes heard during a measurement withdraw the one-click
-  adopt, leaving the stored identity untouched.
-- The arm fan-out is batched and loses no bridge; a hold that keeps failing
+  adopt, leaving the stored identity untouched — and the adopt step re-makes
+  that refusal itself.
+- This device's own remote on the wrong channels is diagnosed wherever in the
+  heard list it arrived, not only when it arrived first.
+- The arm fan-out saturates its bound without exceeding it and loses no
+  bridge; one bridge raising strands no sibling behind the caller; one bridge
+  missing the deadline is skipped rather than fatal; a hold that keeps failing
   to re-arm gives up, and a success clears the failure count.
 - The confirm screen names the bridges that HEARD the remote, not the armed
   set.
 
-`tests/conftest.py` asserts at teardown that every test released its bridge
-claims, so a leak fails the test that caused it rather than some later test
-that inherits a claimed bridge.
+`tests/test_config_flow.py` asserts at teardown that every test released its
+bridge claims, so a leak fails the test that caused it rather than some later
+test that inherits a claimed bridge. It lives beside the flow tests rather
+than in `conftest.py`: the capture flows that claim bridges are all here, and
+a suite-wide autouse fixture would charge every unrelated test for an
+invariant it cannot break.
 
 Frames are synthesized through the codec; never pasted from house captures.
 Every new test must fail with the fleet-wide change reverted (mutation
@@ -358,3 +457,24 @@ been corrected rather than annotated:
 
 The per-bridge start-stamp map from the first draft is gone; the Timing
 section records why.
+
+### Revised after review round 2
+
+The round-1 fixes were on the right track and incomplete in the same shape
+twice: each closed one code path and left the second one open.
+
+- The trust boundary was wired into the future-resolved capture only. The
+  unrecognised-opcode TIMEOUT path adopted with no candidate check and no
+  settle, so a foreign remote's trailer burst could still pin the wizard.
+- The signature dedup protected the run through a *window*, and an isolated
+  late copy has no chain to slide. The anchor is now protected by the
+  signature itself, unconditionally, and the window no longer gates a press
+  that would open a run.
+
+Also corrected: the fleet claim is atomic rather than best-effort; the
+competing-press set is collected around the winner rather than across the
+whole listen; candidates key on the full press signature rather than the
+remote id; the arm fan-out gathers with `return_exceptions` and skips a bridge
+that misses the shared deadline; the mismatch screen's identity diagnosis no
+longer depends on which bridge delivered first; `_RECENT_CAP` is deleted as
+unreachable.

@@ -107,6 +107,33 @@ Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
 - Bounded arm fan-out; bounded re-arm retry on a narrow `HomeAssistantError`.
 - Teardown assertion that every test released its bridge claims.
 
+### Task 7: Second review round
+
+Files: `travel_capture.py`, `config_flow.py`, `learn_session.py`, strings,
+`tests/test_travel_capture.py`, `tests/test_config_flow.py`
+
+Each round-6 fix had a second code path it did not cover:
+
+- The trust boundary now also gates the unrecognised-opcode TIMEOUT path, and
+  its settle sleeps only the remainder of the window the winner has not
+  already outlasted.
+- `TravelRun._open` refuses to re-anchor on the opening signature with no
+  window at all; the repeat filter no longer gates a press that would OPEN a
+  run. `_RECENT_CAP` deleted as unreachable.
+- Competing presses are collected around the winner (settle window, inclusive)
+  rather than across the whole 30 s listen, and keyed by the full
+  `press_signature` rather than by remote id.
+- The fleet claim is atomic: any held bridge refuses the whole claim as busy,
+  naming the held bridges.
+- The arm fan-out is a semaphore-bounded `gather(return_exceptions=True)`
+  under one shared absolute deadline; a bridge that raises or misses it is
+  skipped, and only subscribed bridges get a re-arm hold.
+- The re-arm `except` goes back to broad, keeping the bounded retry.
+- The mismatch screen diagnoses this device's own remote wherever it arrived,
+  and `cover_measure_use_heard` re-makes the qualification itself.
+- The claim-release teardown fixture moves from `tests/conftest.py` into
+  `tests/test_config_flow.py` (write scope).
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and

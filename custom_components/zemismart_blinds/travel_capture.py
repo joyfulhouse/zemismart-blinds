@@ -45,9 +45,6 @@ __all__ = [
 ]
 
 _HEARD_CAP: Final = 8
-# One run sees three signatures (UP, DOWN, STOP) from one remote. The cap is a
-# runaway guard for a bus carrying traffic we reject, not a working set.
-_RECENT_CAP: Final = 32
 
 DIRECTIONS: Final = ("UP", "DOWN")
 BUTTONS: Final = ("UP", "DOWN", "STOP")
@@ -294,8 +291,13 @@ class TravelRun:
     channels: tuple[int, ...]
     wanted: frozenset[str]
     started: TimedPress | None = None
+    # Which press opened the run, so a later copy of that SAME press can never
+    # re-anchor it -- see `_open`.
+    started_signature: FrameSignature | None = None
     heard: list[HeardPress] = field(default_factory=list)
-    # When each signature was last heard, for the repeat filter below.
+    # When each signature was last heard, for the repeat filter below. Bounded
+    # by construction: `classify_frame` pins the remote and the channel set
+    # before a signature exists, so one run can only ever see UP, DOWN, STOP.
     recent: dict[FrameSignature, float] = field(default_factory=dict)
 
     def offer_payload(
@@ -316,8 +318,7 @@ class TravelRun:
             self.heard.append(mismatch)
         if button is None or signature is None:
             return None
-        if self._is_repeat(signature, received_at_monotonic):
-            return None
+        repeat = self._is_repeat(signature, received_at_monotonic)
         press = TimedPress(
             button=button,
             boot=_uint32(payload.get(MQTT_RX_FIELD_BOOT)),
@@ -326,7 +327,14 @@ class TravelRun:
             bridge_id=bridge_id,
         )
         if button in DIRECTIONS:
-            self._open(press)
+            # Deliberately NOT gated on `repeat`: a press that would OPEN a run
+            # can never shorten one, and dropping it would silently swallow a
+            # user's re-press after a discarded run. What a duplicate must
+            # never do is re-anchor an OPEN run, which `_open` enforces on the
+            # signature itself rather than on a window.
+            self._open(press, signature)
+            return None
+        if repeat:
             return None
         return self._close(press)
 
@@ -334,27 +342,44 @@ class TravelRun:
         """Report whether this is another copy of a press already counted.
 
         One physical press reaches this run many times over: 8 embedded OEM
-        frames on air, times every bridge that heard them. Filtering those out
-        HERE, ahead of the run, is what leaves ``_open`` and ``_close`` seeing
-        only genuinely new presses.
+        frames on air, times every bridge that heard them.
 
         The window slides -- each copy re-stamps its signature -- so a burst
         chains however long its copies keep arriving. A fixed window anchored
         at the first copy would expire mid-burst on a lagging bridge and let a
-        late copy through as a fresh press, restarting the run and silently
-        SHORTENING the stored travel time. Human re-presses are seconds apart
+        late copy through as a fresh press. Human re-presses are seconds apart
         and land well outside the window either way.
+
+        A sliding window alone is NOT enough to protect the run's anchor: an
+        isolated copy from a bridge lagging by more than a whole burst has no
+        chain to slide and escapes the window entirely. `_open` therefore
+        refuses to re-anchor on the opening signature regardless of what this
+        says, and the window's remaining job is to keep a duplicate STOP from
+        closing a run twice.
         """
-        previous = self.recent.pop(signature, None)
+        previous = self.recent.get(signature)
         self.recent[signature] = received_at_monotonic
-        while len(self.recent) > _RECENT_CAP:
-            del self.recent[next(iter(self.recent))]
         if previous is None:
             return False
         return 0.0 <= received_at_monotonic - previous <= TRAVEL_BURST_WINDOW_SECONDS
 
-    def _open(self, press: TimedPress) -> None:
-        """Start a run on a press the repeat filter already vouched is new."""
+    def _open(self, press: TimedPress, signature: FrameSignature) -> None:
+        """Start a run, unless this is another copy of the press that opened it.
+
+        The same signature while a run is open is a duplicate, ALWAYS -- no
+        window, however late it arrives. Nothing in the protocol identifies one
+        physical press (there is no sequence number and no per-press nonce), so
+        a second copy of one press and a genuine re-press of the same button on
+        the same channels are indistinguishable here. Re-anchoring on the wrong
+        one stores a travel time short by the delivery spread -- the unsafe
+        direction, since a short time leaves "closed" visibly open -- while
+        keeping the first anchor is at worst long, and is exactly right when
+        the shade started moving on the first press.
+
+        A press of the OTHER direction has its own signature and still
+        restarts the run: that is the user changing their mind, and it is the
+        restart the wizard actually needs.
+        """
         if press.button not in self.wanted:
             # The screen has asked for the other direction. Re-pressing the one
             # already measured is not an overwrite -- redo is a menu option.
@@ -366,6 +391,12 @@ class TravelRun:
             return
         started = self.started
         if started is not None:
+            if signature == self.started_signature:
+                _LOGGER.debug(
+                    "travel: absorbing another copy of the %s press that opened this run",
+                    press.button,
+                )
+                return
             _LOGGER.debug(
                 "travel: restarting the run on %s (was %s)",
                 press.button,
@@ -374,6 +405,7 @@ class TravelRun:
         else:
             _LOGGER.debug("travel: run opened on %s", press.button)
         self.started = press
+        self.started_signature = signature
 
     def _close(self, press: TimedPress) -> TravelMeasurement | None:
         """Resolve a STOP against the open run, if there is one.
@@ -391,6 +423,7 @@ class TravelRun:
             )
             return None
         self.started = None
+        self.started_signature = None
         elapsed = interval_seconds(started, press)
         if elapsed is None:
             _LOGGER.debug(

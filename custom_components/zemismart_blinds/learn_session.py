@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from homeassistant.components.mqtt.models import ReceiveMessage
     from homeassistant.core import HomeAssistant
 
+    from .command_ledger import FrameSignature
+
     type Unsubscriber = Callable[[], None]
     type MessageCallback = Callable[
         [ReceiveMessage],
@@ -113,11 +115,6 @@ class _LearnCapture:
     # given remote is the useful half of what #57 measured.
     bridge_id: str | None = None
 
-    @property
-    def remote_key(self) -> tuple[int, int]:
-        """Identify the physical remote this capture came from."""
-        return self.prefix, self.remote_id
-
 
 @dataclass(slots=True)
 class _SniffAttempt:
@@ -126,12 +123,25 @@ class _SniffAttempt:
     action: str
     measured: dict[str, _LearnCapture]
     future: asyncio.Future[_LearnCapture]
-    # Every distinct remote heard pressing this action, not just the winner.
-    # The first capture of a wizard run has no calibrated identity to gate on,
-    # so with the whole fleet listening ANY remote pressed anywhere in the
-    # house lands here; adopting one while another was heard too would be a
-    # silent guess (#57).
-    candidates: dict[tuple[int, int], _LearnCapture] = field(default_factory=dict)
+    # Every distinct press heard for this action, mapped to when its LAST copy
+    # arrived. The first capture of a wizard run has no calibrated identity to
+    # gate on, so with the whole fleet listening ANY remote pressed anywhere in
+    # the house lands here; adopting one while another was pressed alongside it
+    # would be a silent guess (#57).
+    #
+    # Keyed by the FULL press signature -- remote, channel set and action --
+    # the same key `state_sync` and the travel run dedup on: two channel sets
+    # from one remote are two different presses, and collapsing them by remote
+    # id would hide the second. Last-heard rather than first, because a remote
+    # that was also pressed minutes earlier still competes if it is pressed
+    # again alongside ours.
+    candidates: dict[FrameSignature, float] = field(default_factory=dict)
+    # When the capture that WON this attempt arrived, on the event loop clock.
+    # The competing-press window is measured from here, not from the start of
+    # the 30-second listen: a press heard 20 seconds before ours is ordinary
+    # house traffic, and vetoing on it would make a legitimate learn
+    # impossible to complete in a house with more than one remote.
+    resolved_at: float | None = None
     # A structurally valid capture whose opcode byte is not in the codec's
     # action table. That table is a 10-sample empirical fit, not protocol, so
     # an unrecognised opcode is not evidence of a bad capture -- it is held

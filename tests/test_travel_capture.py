@@ -14,6 +14,7 @@ from custom_components.zemismart_blinds.codec import (
     make_payload,
 )
 from custom_components.zemismart_blinds.config_models import MAX_TRAVEL_SECONDS, RemoteIdentity
+from custom_components.zemismart_blinds.const import TRAVEL_BURST_WINDOW_SECONDS
 from custom_components.zemismart_blinds.travel_capture import (
     TimedPress,
     TravelRun,
@@ -239,12 +240,64 @@ def test_burst_repeats_neither_restart_nor_close_the_run() -> None:
     assert measurement.measured_seconds == 14.31, "the FIRST frame must stamp the start"
 
 
-def test_a_later_press_restarts_the_run() -> None:
-    """A direction press outside the burst window is the user starting over."""
+def test_a_later_press_of_the_same_direction_never_restarts_the_run() -> None:
+    """Nothing distinguishes a late copy of one press from a genuine re-press.
+
+    The frames are identical -- the protocol carries no sequence number and no
+    per-press nonce -- so "same button, long enough after" is the only rule
+    available, and a bridge lagging by more than a burst satisfies it. Keeping
+    the first anchor is therefore the only safe rule: the shade started moving
+    on the first press, and erring long stalls a motor against its own limit
+    switch where erring short leaves "closed" visibly open.
+    """
     run = run_for()
     run.offer_payload(rx("DOWN", 1_000), 100.0)
     run.offer_payload(rx("DOWN", 5_000), 104.0)
     measurement = run.offer_payload(rx("STOP", 19_000), 118.0)
+    assert measurement is not None
+    assert measurement.measured_seconds == 18.0, "the run stays anchored at the FIRST press"
+
+
+def test_an_isolated_late_copy_never_reanchors_the_run() -> None:
+    """One copy arriving just past the window has no chain to slide.
+
+    The sliding window absorbs a burst whose copies keep coming, but a bridge
+    that delivers a single copy of the press more than a whole window after
+    the last one escapes it entirely. Accepting that copy as a fresh press
+    re-anchors the run and stores a travel time short by the delivery lag --
+    the unsafe direction. `_open` refuses on the SIGNATURE, so no window can
+    be too narrow for it.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    late = 100.0 + TRAVEL_BURST_WINDOW_SECONDS + 0.01
+    assert run.offer_payload(rx("DOWN", 700_000), late, bridge_id="bridge-b") is None
+    assert run.started is not None
+    assert run.started.bridge_id == "bridge-a", "the first copy still owns the run"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, (
+        "re-anchoring on the late copy would have stored 12.8s -- 1.5 seconds short"
+    )
+
+
+def test_a_rapid_repress_after_a_discarded_run_still_registers() -> None:
+    """A press that would OPEN a run is never swallowed as a duplicate.
+
+    A double-tap closes a run too fast to store, and the user immediately
+    presses again -- inside the repeat window of their own first press.
+    Filtering copies ahead of the run swallowed that second press, and with
+    no run open the wizard then waited out its whole deadline having heard
+    the user twice. A press with no run to shorten cannot be unsafe.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    assert run.offer_payload(rx("STOP", 1_400), 100.4) is None, "too fast to be a real run"
+    assert run.started is None
+
+    run.offer_payload(rx("DOWN", 2_000), 101.0)
+    assert run.started is not None, "the re-press must open a run"
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0)
     assert measurement is not None
     assert measurement.measured_seconds == 14.0
 

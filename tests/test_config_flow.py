@@ -67,7 +67,7 @@ from tests.synthetic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable, Coroutine, Iterator
 
     from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
     from homeassistant.core import HomeAssistant
@@ -153,6 +153,35 @@ TRUNCATED_TRAILER_UP_B1 = (
     "192929292A192A1A1929292929292A1A1A1A1A1A1A1A1A1A1A1A192A192929292A192A192A"
     "1A1955"
 )
+
+
+@pytest.fixture(autouse=True)
+def capture_owners_are_released() -> Iterator[None]:
+    """Fail the test that leaks a bridge claim, not the one that inherits it.
+
+    ``_CAPTURE_OWNERS`` is module state keyed by ``id(hass)``, and CPython
+    reuses the addresses of the short-lived HomeAssistant objects these tests
+    build. A leaked claim therefore lands on some LATER test, which now sees
+    an outright "the bridges are busy" refusal -- a failure arbitrarily far
+    from its cause.
+
+    Asserting rather than quietly clearing, deliberately: every capture path
+    releases its claim in a `finally`, so a leak is a production bug in that
+    discipline and the suite should say so. The reset still runs either way,
+    so one leak cannot cascade through the rest of the session.
+
+    Local to this module rather than `conftest.py`: the capture flows that
+    claim bridges are tested here, and a suite-wide autouse fixture would
+    charge every unrelated test for an invariant it cannot break.
+    """
+    config_flow_module._CAPTURE_OWNERS.clear()
+    try:
+        yield
+        assert not config_flow_module._CAPTURE_OWNERS, (
+            f"the test left bridge claims behind: {config_flow_module._CAPTURE_OWNERS}"
+        )
+    finally:
+        config_flow_module._CAPTURE_OWNERS.clear()
 
 
 @dataclass
@@ -1150,28 +1179,115 @@ async def test_learn_on_automatic_captures_off_whichever_bridge_heard_it(
     await hass.async_block_till_done()
 
 
-def test_the_arm_fanout_is_bounded_and_loses_nobody() -> None:
-    """A bigger fleet arms in more rounds, never in one unbounded burst.
-
-    Arming happens inside a fixed 5-second bootstrap budget, so it cannot be
-    serial per bridge; but an unbounded burst would put a whole house's SUBACK
-    round trips in flight at once. Every bridge must still be armed exactly
-    once, in order.
-    """
-    channels = [
+def sniff_channels(count: int) -> list[Any]:
+    """Build ``count`` unclaimed sniff channels for the fan-out tests."""
+    return [
         config_flow_module._SniffChannel(
             bridge_id=f"bridge-{index}",
             owner_key=(0, f"bridge-{index}"),
             command_topic=f"rf433/bridge-{index}/cmd",
         )
-        for index in range(19)
+        for index in range(count)
     ]
-    limit = config_flow_module._SNIFF_FANOUT_LIMIT
-    batches = list(config_flow_module._sniff_batches(channels, limit))
 
-    assert [len(batch) for batch in batches] == [limit, limit, 19 - 2 * limit]
-    assert [channel for batch in batches for channel in batch] == channels
-    assert list(config_flow_module._sniff_batches([], limit)) == []
+
+@pytest.mark.asyncio
+async def test_the_arm_fanout_is_bounded_and_loses_nobody(hass: HomeAssistant) -> None:
+    """A bigger fleet arms concurrently, never in one unbounded burst.
+
+    Arming happens inside a fixed 5-second bootstrap budget, so it cannot be
+    serial per bridge -- a house that grows a bridge would spend another SUBACK
+    round trip of the budget. An unbounded burst would put a whole house's
+    round trips in flight at once instead. Every bridge must still be armed
+    exactly once.
+    """
+    channels = sniff_channels(19)
+    limit = config_flow_module._SNIFF_FANOUT_LIMIT
+    in_flight = 0
+    peak = 0
+    armed_order: list[str] = []
+
+    async def arm(channel: Any) -> None:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        # Two suspension points, so a serial implementation cannot reach the
+        # limit by accident and an unbounded one exceeds it.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        armed_order.append(channel.bridge_id)
+
+    armed = await config_flow_module._async_arm_sniff_channels(
+        channels,
+        hass.loop.time() + 5.0,
+        arm,
+    )
+
+    assert armed == channels, "every bridge armed, and the caller sees them all"
+    assert sorted(armed_order) == sorted(channel.bridge_id for channel in channels)
+    assert peak == limit, "the fan-out saturates the bound without exceeding it"
+    assert await config_flow_module._async_arm_sniff_channels([], hass.loop.time() + 5.0, arm) == []
+
+
+@pytest.mark.asyncio
+async def test_one_bridge_failing_to_arm_strands_no_sibling(hass: HomeAssistant) -> None:
+    """One bridge raising must not leave its siblings running behind the caller.
+
+    A fan-out that propagates the first exception leaves every sibling
+    coroutine in flight. The caller has already gone to its teardown, which
+    walks the channel list and finds nothing to release -- and the sibling then
+    finishes, subscribing a topic nobody will unsubscribe and opening a sniff
+    window on a bridge whose owner key is already released.
+
+    A failed bridge is skipped rather than fatal: one misbehaving bridge must
+    not cost the user the fleet.
+    """
+    channels = sniff_channels(3)
+    finished: list[str] = []
+
+    async def arm(channel: Any) -> None:
+        if channel.bridge_id == "bridge-1":
+            raise RuntimeError("this bridge is not answering")
+        await asyncio.sleep(0)
+        finished.append(channel.bridge_id)
+
+    armed = await config_flow_module._async_arm_sniff_channels(
+        channels,
+        hass.loop.time() + 5.0,
+        arm,
+    )
+
+    assert [channel.bridge_id for channel in armed] == ["bridge-0", "bridge-2"]
+    assert finished == ["bridge-0", "bridge-2"], (
+        "every sibling finished BEFORE the fan-out returned, so teardown can see them"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_bridge_that_misses_the_arm_deadline_is_skipped_not_fatal(
+    hass: HomeAssistant,
+) -> None:
+    """A slow bridge costs itself, not the whole listening session.
+
+    The bootstrap budget is shared and absolute, so a bridge whose SUBACK
+    never arrives cannot push the advertised capture window out -- and
+    dropping the session because of it would hand the user "nothing was
+    heard" for a fleet that was ready to listen.
+    """
+    channels = sniff_channels(2)
+
+    async def arm(channel: Any) -> None:
+        if channel.bridge_id == "bridge-1":
+            await asyncio.Event().wait()
+
+    armed = await config_flow_module._async_arm_sniff_channels(
+        channels,
+        hass.loop.time() + 0.05,
+        arm,
+    )
+
+    assert [channel.bridge_id for channel in armed] == ["bridge-0"]
 
 
 @pytest.mark.asyncio
@@ -1258,10 +1374,10 @@ async def test_two_remotes_pressed_at_once_are_never_silently_adopted(
     placeholders = result["description_placeholders"]
     assert placeholders is not None
     assert placeholders["action"] == "UP"
-    assert set(placeholders["remotes"].split(", ")) == {
-        f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}",
-        f"{REF_PREFIX:06x}:{REF_REMOTE_ID:02x}",
-    }, "both remotes are named so the user knows what happened"
+    for prefix, remote_id in ((TEST_PREFIX, TEST_REMOTE_ID), (REF_PREFIX, REF_REMOTE_ID)):
+        assert f"{prefix:06x}:{remote_id:02x} on channels 1,2" in placeholders["remotes"], (
+            "both remotes are named so the user knows what happened"
+        )
     assert "learn_retry" in result["menu_options"]
 
     hass.config_entries.flow.async_abort(flow_id)
@@ -1316,6 +1432,151 @@ async def test_one_remote_heard_on_two_bridges_is_not_ambiguous(
     await hass.async_block_till_done()
 
 
+async def start_fleet_learn(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    fake: FakeMqtt,
+    *,
+    settle: float,
+) -> str:
+    """Arm one Learn wizard on Automatic with an explicit settle window."""
+    prepare_config_flow(hass, monkeypatch)
+    install_mqtt(monkeypatch, fake)
+    monkeypatch.setattr(config_flow_module, "_LEARN_SETTLE_SECONDS", settle)
+    result = await start_user_flow(hass)
+    flow_id = result["flow_id"]
+    await advance_to_learn_setup(hass, flow_id)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            CONF_NAME: "Kaelyn shade",
+            CONF_AREA_ID: "living_room",
+            CONF_BRIDGE: config_flow_module._AUTOMATIC_BRIDGE,
+        },
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    await wait_for_sniff_starts(fake, 1)
+    await wait_for_sniff_starts(fake, 1, "bridge-b")
+    return flow_id
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognised_opcode_is_held_to_the_same_trust_boundary(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window closing on a held capture adopts a remote just as hard (#57).
+
+    An unrecognised opcode cannot end the window early -- nothing separates it
+    from the OEM trailer burst until the window closes with no recognised
+    frame -- so it is adopted on the TIMEOUT path instead. That path pins the
+    wizard's remote exactly like a resolved capture, and an untabled remote's
+    trailer burst from two rooms away is precisely what reaches it, so it owes
+    the user the same refusal rather than a silent guess.
+    """
+    fake = FakeMqtt()
+    monkeypatch.setattr(config_flow_module, "_CAPTURE_TIMEOUT_SECONDS", 0.2, raising=False)
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    # Neither frame's opcode is in the action table, so neither can resolve
+    # the attempt: the first is HELD and the window runs out.
+    for bridge, frame in (
+        ("bridge-a", UNTABLED_UP_B1),
+        ("bridge-b", FOREIGN_UNTABLED_UP_B1),
+    ):
+        await fake.emit(
+            active_rx(fake, bridge),
+            f"rf433/{bridge}/rx",
+            json.dumps({"frame": frame, "t": 3}),
+        )
+    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    for prefix in (UNTABLED_PREFIX, FOREIGN_UNTABLED_PREFIX):
+        assert f"{prefix:06x}:{UNTABLED_REMOTE_ID:02x} on channels 1" in placeholders["remotes"]
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_a_press_outside_the_settle_window_does_not_veto_the_learn(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the refusal: only an OVERLAPPING press competes.
+
+    Collecting competitors across the whole 30-second listen makes a
+    legitimate learn impossible to complete in a house where anyone else
+    touches a remote while the wizard is open -- every attempt refuses, and
+    the screen's advice ("press again while nobody else is") cannot be
+    complied with. One burst window around the winner is what "pressed at the
+    same time" means; a press seconds earlier is ordinary house traffic.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.02)
+
+    # Untabled, so it cannot resolve the attempt -- it only competes.
+    await fake.emit(
+        active_rx(fake, "bridge-b"),
+        "rf433/bridge-b/rx",
+        json.dumps({"frame": FOREIGN_UNTABLED_UP_B1, "t": 3}),
+    )
+    await asyncio.sleep(0.05)
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 4}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_next")
+
+    assert result["description_placeholders"] == {
+        "captured": "UP",
+        "measured": "UP",
+        "action": "DOWN",
+    }
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.asyncio
+async def test_one_remote_on_two_channel_selectors_is_two_presses(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Competitors are counted per PRESS, not per remote id (#57).
+
+    The wizard stores the captured channel set as well as the identity -- it
+    prefills the first cover with it -- so one remote heard on two selectors
+    at once is two different answers to "which blind is this", and collapsing
+    them by remote id would adopt whichever arrived first without a word.
+    """
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.2)
+
+    other_selector = b0_to_b1(
+        encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", bases=TEST_BASES))
+    )
+    for bridge, frame in (("bridge-a", REFERENCE_UP_B1), ("bridge-b", other_selector)):
+        await fake.emit(
+            active_rx(fake, bridge),
+            f"rf433/{bridge}/rx",
+            json.dumps({"frame": frame, "t": 5}),
+        )
+    result = await advance_to_step(hass, flow_id, "learn_ambiguous")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    remote = f"{TEST_PREFIX:06x}:{TEST_REMOTE_ID:02x}"
+    assert f"{remote} on channels 1,2" in placeholders["remotes"]
+    assert f"{remote} on channels 3" in placeholders["remotes"]
+
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
+
+
 @pytest.mark.asyncio
 async def test_a_measurement_reports_a_held_bridge_as_busy_not_silent(
     hass: HomeAssistant,
@@ -1363,15 +1624,18 @@ async def test_a_measurement_reports_a_held_bridge_as_busy_not_silent(
 
 
 @pytest.mark.asyncio
-async def test_a_fleet_sniff_skips_a_bridge_another_session_owns(
+async def test_a_fleet_sniff_is_refused_while_one_bridge_is_held(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A busy bridge narrows a fleet-wide sniff; it never blocks one.
+    """A fleet claim is all-or-nothing, and a partial claim is reported as busy.
 
-    Serialization stays per bridge (#26's contract), but with Automatic now
-    claiming every bridge, treating one busy bridge as fatal would let a
-    single open wizard veto every capture in the house.
+    Claiming what is free and listening on the rest looks identical to a
+    healthy fleet-wide session from the outside -- the progress screen still
+    names every bridge -- while the bridge that could actually hear the remote
+    may be precisely the excluded one. #57 exists because a session listened
+    on too few bridges and reported the result as though it had listened on
+    the right ones, so a subset is refused and named instead.
     """
     prepare_config_flow(hass, monkeypatch)
     fake = FakeMqtt()
@@ -1403,18 +1667,16 @@ async def test_a_fleet_sniff_skips_a_bridge_another_session_owns(
         },
     )
     assert result["type"] is FlowResultType.SHOW_PROGRESS
-    await wait_for_sniff_starts(fake, 1, "bridge-b")
-
-    assert sniff_starts(fake, "bridge-a") == 1, "the holder's bridge is not re-armed"
-    await fake.emit(
-        active_rx(fake, "bridge-b"),
-        "rf433/bridge-b/rx",
-        json.dumps({"frame": REFERENCE_UP_B1, "t": 11}),
-    )
     # Not `async_block_till_done`: the holder's capture is deliberately still
     # pending here, and blocking on every task would wait out its whole window.
-    result = await advance_to_step(hass, fleet_id, "learn_next")
-    assert result["step_id"] == "learn_next", "the fleet sniff captured on the bridge it did claim"
+    result = await advance_to_step(hass, fleet_id, "learn_busy")
+
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert placeholders["bridge"] == "bridge-a", "the HELD bridge is named, not the whole fleet"
+    assert sniff_starts(fake, "bridge-a") == 1, "the holder's bridge is not re-armed"
+    assert sniff_starts(fake, "bridge-b") == 0, "no bridge listens for a session that was refused"
+    assert "learn_retry" in result["menu_options"]
 
     hass.config_entries.flow.async_abort(fleet_id)
     hass.config_entries.flow.async_abort(holder_id)
@@ -3928,6 +4190,101 @@ async def test_several_foreign_remotes_are_never_one_click_adopted(
         assert f"{prefix:06x}:{remote_id:02x}" in placeholders["detail"]
 
     # The stored identity is untouched by a screen that refused to adopt.
+    unchanged = RemoteConfig.from_entry(entry.data).remote
+    assert (unchanged.prefix, unchanged.remote_id) == (TEST_PREFIX, TEST_REMOTE_ID)
+
+    hass.config_entries.flow.async_abort(flow_id)
+
+
+def heard_press(frame: str, prefix: int, remote_id: int) -> Any:
+    """Decode one synthesized frame into the mismatch screen's heard record."""
+    from custom_components.zemismart_blinds.codec import decode_rx_capture
+    from custom_components.zemismart_blinds.travel_capture import HeardPress
+
+    decoded = decode_rx_capture(frame)
+    return HeardPress(
+        frame=frame,
+        prefix=prefix,
+        remote_id=remote_id,
+        channels=tuple(decoded["chans"]),
+        command=decoded["cmd"],
+        button="UP",
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_adopt_step_refuses_what_its_menu_would_not_offer(hass: HomeAssistant) -> None:
+    """The identity swap re-makes the refusal instead of trusting its caller.
+
+    Driven at the step rather than through the flow deliberately: Home
+    Assistant validates a menu choice against the options the step published,
+    so this is defence in depth rather than a reachable bypass today. It is
+    cheap and it keeps the rule where the damage is done -- the step rewrites
+    the device's stored identity from ``heard[0]``, and every reason not to
+    lives one screen away in code that only decides which buttons to draw.
+    """
+    flow = config_flow_module.ZemismartBlindsConfigFlow()
+    flow.hass = hass
+    flow.flow_id = "adopt-guard"
+    flow.handler = DOMAIN
+    flow.context = {}
+    flow._identity = RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES)
+    flow._pending_measure = config_flow_module._PendingMeasure(
+        origin="wizard",
+        name="Slider",
+        channels=(1, 2),
+    )
+    flow._measure_heard = (
+        heard_press(_foreign_rx_frame("UP"), REF_PREFIX, REF_REMOTE_ID),
+        heard_press(_third_rx_frame("UP"), THIRD_PREFIX, THIRD_REMOTE_ID),
+    )
+
+    result = await flow.async_step_cover_measure_use_heard()
+
+    assert result["step_id"] == "cover_measure_mismatch", "the refusal is re-made, not bypassed"
+    assert "cover_measure_use_heard" not in result["menu_options"]
+    assert flow._identity == RemoteIdentity(TEST_PREFIX, TEST_REMOTE_ID, TEST_BASES), (
+        "no identity was adopted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_own_remote_is_diagnosed_wherever_it_arrived(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Which bridge delivered first must not decide what the screen says.
+
+    Reading the diagnosis off ``heard[0]`` made it a race: a stranger's remote
+    arriving first hid the fact that this device's OWN remote was heard on the
+    wrong channels, and the screen then offered to replace a correct identity
+    with the stranger's. The channel-selector diagnosis is exact -- the
+    identity matched -- so it is taken wherever in the list it landed.
+    """
+    monkeypatch.setattr(config_flow_module, "TRAVEL_ARM_TIMEOUT_SECONDS", 0.5)
+    entry, flow_id, fake = await _start_remeasure_listening(hass, monkeypatch)
+    rx = fake.rx_subscriptions()[-1]
+    own_wrong_channel = b0_to_b1(
+        encode_b0(make_payload(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", bases=TEST_BASES))
+    )
+    for frame, millis in ((_foreign_rx_frame("UP"), 1_000), (own_wrong_channel, 2_000)):
+        await fake.emit(
+            rx,
+            "rf433/bridge-a/rx",
+            json.dumps({"frame": frame, "t": millis, "boot": 7}),
+        )
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.flow.async_configure(flow_id)
+
+    assert result["step_id"] == "cover_measure_mismatch"
+    assert result["menu_options"] == ["cover_measure_run", "cover_measure_manual"], (
+        "the identity is right; replacing it with the remote that arrived first is not the fix"
+    )
+    placeholders = result["description_placeholders"]
+    assert placeholders is not None
+    assert "channels 3" in placeholders["detail"]
+    assert "channels 1,2" in placeholders["detail"]
     unchanged = RemoteConfig.from_entry(entry.data).remote
     assert (unchanged.prefix, unchanged.remote_id) == (TEST_PREFIX, TEST_REMOTE_ID)
 

@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntries
 from homeassistant.core import HomeAssistant
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -32,31 +32,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """
     del session, exitstatus
     gc.freeze()
-
-
-@pytest.fixture(autouse=True)
-def capture_owners_are_released() -> Iterator[None]:
-    """Fail the test that leaks a bridge claim, not the one that inherits it.
-
-    ``_CAPTURE_OWNERS`` is module state keyed by ``id(hass)``, and CPython
-    reuses the addresses of the short-lived HomeAssistant objects these tests
-    build. A leaked claim therefore lands on some LATER test, which now sees
-    an outright "the bridges are busy" refusal -- a failure arbitrarily far
-    from its cause.
-
-    Asserting rather than quietly clearing, deliberately: every capture path
-    releases its claim in a `finally`, so a leak is a production bug in that
-    discipline and the suite should say so. The reset still runs either way,
-    so one leak cannot cascade through the rest of the session.
-    """
-    from custom_components.zemismart_blinds.config_flow import _CAPTURE_OWNERS
-
-    _CAPTURE_OWNERS.clear()
-    try:
-        yield
-        assert not _CAPTURE_OWNERS, f"the test left bridge claims behind: {_CAPTURE_OWNERS}"
-    finally:
-        _CAPTURE_OWNERS.clear()
 
 
 @pytest_asyncio.fixture
