@@ -2257,39 +2257,48 @@ async def test_a_capture_with_no_window_is_refused_rather_than_adopted(
 @pytest.mark.asyncio
 async def test_an_unchecked_capture_gets_its_own_screen_not_the_ambiguity_one(
     hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A refusal with nobody to name must not borrow the "two remotes" screen.
 
-    The fail-safe refusal for a capture nothing judged has no rivals, so routing
-    it to `learn_ambiguous` rendered "More than one press arrived … : <one name>"
-    -- false, and it sends the user off to press again somewhere else when as far
-    as anything knows their press was fine. This checks the outcome reaches its
-    own step and that the step renders.
+    The fail-safe refuses a capture nothing judged, which has no rivals -- so
+    routing it to `learn_ambiguous` rendered "More than one press arrived … :
+    <one name>": false, and the wrong instruction, since it sends the user off to
+    press again somewhere else when as far as anything knows their press was fine.
+
+    Driven through the real path rather than a stubbed outcome: a real fleet
+    learn, a real press, the real `_async_settle_first_capture` reaching its
+    `window is None` branch, and the real routing to a screen. Only the state
+    itself is simulated, at its source -- `_open_contest_window` returning nothing,
+    so the anchor is stamped with no window beside it -- because production
+    assigns the two together and cannot reach this on its own.
     """
-    flow = config_flow_module.ZemismartBlindsConfigFlow()
-    flow.hass = hass
-    flow.flow_id = "unchecked-screen"
-    flow.handler = DOMAIN
-    flow.context = {}
-    flow._learn_action = "UP"
+    fake = FakeMqtt()
+    flow_id = await start_fleet_learn(hass, monkeypatch, fake, settle=0.05)
 
-    async def unchecked() -> config_flow_module._CaptureOutcome:
-        return "unchecked"
+    def no_window(*_args: object) -> Any:
+        return None
 
-    flow._sniff_task = hass.async_create_task(unchecked())
-    await flow._sniff_task
+    monkeypatch.setattr(config_flow_module, "_open_contest_window", no_window)
 
-    result = await flow.async_step_learn_sniff()
-    assert result["type"] is FlowResultType.SHOW_PROGRESS_DONE
-    assert result["step_id"] == "learn_unchecked", (
-        "the outcome has to reach a screen of its own, not the timeout catch-all"
+    await fake.emit(
+        active_rx(fake),
+        "rf433/bridge-a/rx",
+        json.dumps({"frame": REFERENCE_UP_B1, "t": 3}),
+    )
+    result = await advance_to_step(hass, flow_id, "learn_unchecked")
+
+    assert result["type"] is FlowResultType.MENU
+    assert "learn_retry" in result["menu_options"]
+    assert result["description_placeholders"] == {"action": "UP"}, (
+        "the unchecked screen names the action and nothing else -- there is no rival list"
+    )
+    assert "remotes" not in (result["description_placeholders"] or {}), (
+        "and it is NOT the ambiguity screen, which would render a list of one name"
     )
 
-    result = await flow.async_step_learn_unchecked()
-    assert result["type"] is FlowResultType.MENU
-    assert result["step_id"] == "learn_unchecked"
-    assert "learn_retry" in result["menu_options"]
-    assert result["description_placeholders"] == {"action": "UP"}
+    hass.config_entries.flow.async_abort(flow_id)
+    await hass.async_block_till_done()
 
 
 @pytest.mark.asyncio
@@ -2340,6 +2349,7 @@ async def test_the_press_bound_leaves_room_for_a_rival(
         "one below, the winner's own presses evict the rival -- which is WHY the floor "
         "is where it is, not behaviour worth keeping"
     )
+    assert rivals_at(2) == set(), "and every bound below the floor loses it, not just one"
 
 
 @pytest.mark.asyncio

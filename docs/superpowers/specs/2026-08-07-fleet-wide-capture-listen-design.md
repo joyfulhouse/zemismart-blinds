@@ -697,8 +697,8 @@ Flow (`tests/test_config_flow.py`):
   adopts according to which capture is being adopted; a capture with no window
   refuses.
 - The remembered-press bound drops the oldest and still leaves a rival named, at
-  the smallest bound production allows; the bound's floor of two is pinned; and
-  more rivals than can be NAMED still refuse.
+  the smallest bound production allows; and more rivals than can be NAMED still
+  refuse. (The floor itself is the bullet above.)
 - A flow removed at the arm→STOP handoff releases every bridge it had claimed.
 - A rival pressed again outside the settle window still refuses the capture it
   competed with — at the handler and through the whole flow.
@@ -715,8 +715,6 @@ Flow (`tests/test_config_flow.py`):
   session, instead of discarding the run it is about to report.
 - One remote's OTHER button is counted as its own press and does not veto the
   capture it agrees with.
-- A bridge queued behind a saturated arm fan-out is cancelled where it waits
-  rather than arming after the shared deadline.
 - An arm cancelled while waiting for its SUBACK leaves no live subscription.
 - Automatic names its listening set in a stable, sorted order.
 
@@ -956,6 +954,27 @@ decision but not about its reason.
 - **Stale doc claims corrected**: the round-three addendum still said the arm
   fan-out keeps its semaphore, which round five deleted, and the test inventory
   still described saturation and queueing.
+
+### Revised after review round 8
+
+No behaviour findings: all three engines re-verified the logic, and the round's
+own previous findings were closed by their author. What was left was one test
+reaching the right conclusion by the wrong route, and four places where prose had
+drifted from the code it describes:
+
+- The `learn_unchecked` routing test stubbed the outcome instead of producing it,
+  so it locked the step map without ever entering the settle's `window is None`
+  branch. It now drives a real fleet learn and a real press, simulating only the
+  impossible state at its source, and both reverts of the fail-safe (refuse as
+  ambiguous, or adopt) redden it.
+- The constant's derivation enumerated four signatures plus a rival and called it
+  a floor of 4 — the winner's own press IS one of those signatures. Reworded.
+- "Verified at 2 and at 3" was true of the round-seven investigation but not of
+  anything durable; the guard test now exercises both.
+- Two live test-inventory bullets were stale: one still called the press bound's
+  floor two, and one still described a bridge queueing behind a saturated arm
+  fan-out, whose bound and whose test were both deleted in round five. The
+  guarantee that replaced it is in the fan-out bullet above it.
 
 Three low-severity addenda from round three closed without code changes:
 

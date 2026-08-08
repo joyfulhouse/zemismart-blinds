@@ -242,10 +242,11 @@ _LEARN_SNIFF_WINDOW_SECONDS: Final = DEFAULT_SNIFF_WINDOW_SECONDS + math.ceil(_L
 # The winner's own other buttons on its own selector therefore occupy slots that
 # can never refuse anything: one remote on one selector can produce a signature
 # per action the codec can name, and an untabled opcode falls back into that same
-# set, so three of them plus the winner's own press plus one rival is the floor.
-# Below it the user's own DOWN and STOP evict the stranger who pressed alongside
-# them and the capture reads as unambiguous -- verified at 2 and at 3, and pinned
-# by `test_the_press_bound_leaves_room_for_a_rival`.
+# set, so the floor is the winner's own press, its two other buttons, and room
+# for one rival. Below it the user's own DOWN and STOP evict the stranger who
+# pressed alongside them and the capture reads as unambiguous -- verified at 2
+# and at 3 by `test_the_press_bound_leaves_room_for_a_rival`, which also pins
+# this floor.
 #
 # The name bound is safe at any size: a name is dropped only once that many are
 # already in the set, which is non-empty, so the screen loses a name and never

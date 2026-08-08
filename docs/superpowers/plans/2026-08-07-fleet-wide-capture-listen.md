@@ -302,6 +302,19 @@ No blockers, no highs; both engines re-verified the round-six fixes.
   (deleted in round five) and the test inventory still described saturation and
   queueing.
 
+Round-8 addendum (no behaviour findings; one test seam and four prose
+corrections):
+
+- The `learn_unchecked` test drives the real `_async_settle_first_capture`
+  `window is None` branch through a real fleet learn instead of stubbing the
+  outcome, so the screen routing is locked to the production path.
+- The floor derivation counted the winner's own press twice (4 signatures + a
+  rival read as 5); "verified at 2 and at 3" is now actually exercised by the
+  guard test.
+- Two live test-inventory bullets in the spec were stale: the press bound's
+  "floor of two", and a bridge queueing behind a saturated arm fan-out whose
+  bound and test were deleted in round 5.
+
 ## Status
 
 Implemented on `feat/fleet-wide-capture-listen`; see PR for gate output and
