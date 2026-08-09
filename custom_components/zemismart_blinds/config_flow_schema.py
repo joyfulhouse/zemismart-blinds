@@ -68,6 +68,17 @@ MEASURE_REQUESTED: Final = "measure_requested"
 _ADVANCED_SECTION = "advanced"
 _AUTOMATIC_BRIDGE = "automatic"
 _PENDING_COVER_ID = "pending"
+# One travel-seconds field, shared by every form that offers one, so a typed
+# time and a measured one are never accepted on different terms.
+_TRAVEL_SELECTOR: Final = selector.NumberSelector(
+    selector.NumberSelectorConfig(
+        min=0.1,
+        max=600,
+        step=0.1,
+        mode=selector.NumberSelectorMode.BOX,
+        unit_of_measurement="s",
+    )
+)
 
 
 def _float_value(value: object, fallback: float) -> float:
@@ -214,15 +225,6 @@ def _reconfigure_edit_schema(suggested: Mapping[str, object]) -> vol.Schema:
 def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
     """Build one wizard cover form: name, channels, optional travel times."""
     values = suggested or {}
-    travel_selector = selector.NumberSelector(
-        selector.NumberSelectorConfig(
-            min=0.1,
-            max=600,
-            step=0.1,
-            mode=selector.NumberSelectorMode.BOX,
-            unit_of_measurement="s",
-        )
-    )
     fields: dict[vol.Marker, object] = {
         vol.Required(CONF_NAME, default=str(values.get(CONF_NAME, ""))): selector.TextSelector(),
         vol.Required(
@@ -232,8 +234,8 @@ def _cover_schema(suggested: Mapping[str, object] | None) -> vol.Schema:
         # Travel fields carry NO defaults, ever: a default harvested from a
         # previous (failed) submission would silently backfill an omitted
         # field on the next attempt and defeat the travel_required check.
-        vol.Optional(CONF_TRAVEL_UP): travel_selector,
-        vol.Optional(CONF_TRAVEL_DOWN): travel_selector,
+        vol.Optional(CONF_TRAVEL_UP): _TRAVEL_SELECTOR,
+        vol.Optional(CONF_TRAVEL_DOWN): _TRAVEL_SELECTOR,
     }
     return vol.Schema(fields)
 
@@ -351,19 +353,10 @@ def _learn_setup_schema(
 
 def _measure_confirm_schema(measured: Mapping[str, int]) -> vol.Schema:
     """Build the confirm form, pre-filled with the rounded measurements."""
-    travel_selector = selector.NumberSelector(
-        selector.NumberSelectorConfig(
-            min=0.1,
-            max=600,
-            step=0.1,
-            mode=selector.NumberSelectorMode.BOX,
-            unit_of_measurement="s",
-        )
-    )
     return vol.Schema(
         {
-            vol.Required(CONF_TRAVEL_UP, default=measured["UP"]): travel_selector,
-            vol.Required(CONF_TRAVEL_DOWN, default=measured["DOWN"]): travel_selector,
+            vol.Required(CONF_TRAVEL_UP, default=measured["UP"]): _TRAVEL_SELECTOR,
+            vol.Required(CONF_TRAVEL_DOWN, default=measured["DOWN"]): _TRAVEL_SELECTOR,
         }
     )
 

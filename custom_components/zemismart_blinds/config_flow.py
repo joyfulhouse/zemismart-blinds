@@ -2074,7 +2074,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return await self._async_measure_abandoned()
         if not pending.wanted:
             return await self.async_step_cover_measure_confirm()
-        last = next(reversed(list(pending.measured.values())))
+        last = next(reversed(pending.measured.values()))
         return self.async_show_menu(
             step_id="cover_measure_next",
             menu_options=["cover_measure_run", "cover_measure_redo"],
@@ -2095,7 +2095,7 @@ class ZemismartBlindsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         pending = self._pending_measure
         if pending is None or not pending.measured:
             return await self._async_measure_abandoned()
-        pending.measured.pop(next(reversed(list(pending.measured))), None)
+        pending.measured.pop(next(reversed(pending.measured)), None)
         self._measure_task = None
         self._sniff_session_id = None
         return await self.async_step_cover_measure_run()
