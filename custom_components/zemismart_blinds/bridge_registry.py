@@ -37,7 +37,12 @@ class BridgeInfo:
 
 
 class BridgeRegistry:
-    """Track retained bridge availability/info and resolve one TX target."""
+    """Track retained bridge availability/info and resolve who a flow talks to.
+
+    Two different questions, deliberately two methods: ``resolve`` picks the ONE
+    bridge a command transmits from, while ``online_bridge_ids`` returns every
+    bridge a capture flow listens on (#57).
+    """
 
     def __init__(self) -> None:
         """Initialize an empty registry."""
@@ -149,6 +154,25 @@ class BridgeRegistry:
             return online[0]
         msg = "no RF433 bridge is online"
         raise NoOnlineBridgeError(msg)
+
+    def online_bridge_ids(self) -> tuple[str, ...]:
+        """Return every online bridge, for a fleet-wide listening session.
+
+        A single bridge hears a remote only ~30% of the time while its peers
+        hear nearly every press (#57), so capture flows listen on all of
+        them; TX still resolves exactly one bridge through ``resolve``.
+
+        Sorted here rather than only by ``bridges``, whose snapshot is already
+        ordered: the set is joined into the screens that name which bridges are
+        listening, and a text that reorders itself between two visits to the
+        same form reads as a changed fleet, so the order is this method's own
+        promise rather than a property inherited from how it happens to read.
+        """
+        online = tuple(sorted(bridge.bridge_id for bridge in self.bridges if bridge.online))
+        if not online:
+            msg = "no RF433 bridge is online"
+            raise NoOnlineBridgeError(msg)
+        return online
 
     def is_known_offline(self, bridge_id: str) -> bool:
         """Return whether this bridge has EXPLICITLY reported itself offline.

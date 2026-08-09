@@ -8,17 +8,21 @@ real remote's replayable command material entering the repository.
 from __future__ import annotations
 
 from custom_components.zemismart_blinds.codec import (
+    DEFAULT_BUCKETS,
     CommandBases,
     encode_b0,
     infer_action_button,
     make_payload,
 )
 from custom_components.zemismart_blinds.config_models import MAX_TRAVEL_SECONDS, RemoteIdentity
+from custom_components.zemismart_blinds.const import TRAVEL_BURST_WINDOW_SECONDS
 from custom_components.zemismart_blinds.travel_capture import (
+    _HEARD_CAP,
     TimedPress,
     TravelRun,
     identify_button,
     interval_seconds,
+    press_signature,
     stored_value,
 )
 from tests.synthetic import (
@@ -37,10 +41,28 @@ def b1_frame(
     channels: tuple[int, ...],
     button: str,
     bases: CommandBases,
+    *,
+    buckets: str = DEFAULT_BUCKETS,
 ) -> str:
-    """Synthesize one bridge RX capture for a press we choose."""
-    body = encode_b0(make_payload(prefix, remote_id, channels, button, bases=bases))[6:-2]
+    """Synthesize one bridge RX capture for a press we choose.
+
+    ``buckets`` are the pulse widths the receiving bridge MEASURED, so two
+    bridges' captures of one physical press differ here and nowhere else --
+    which is the whole reason a raw-frame comparison cannot deduplicate them.
+    """
+    payload = make_payload(prefix, remote_id, channels, button, bases=bases)
+    body = encode_b0(payload, buckets)[6:-2]
     return f"AAB1{body[:2]}{body[4:]}3855"
+
+
+def as_measured_by(index: int) -> str:
+    """Return one bridge's own reading of the standard OEM pulse widths.
+
+    Real captures of one burst differ by a few microseconds per bridge; only
+    the long-bit bucket is varied here, well inside the codec's short/long
+    thresholds, so every variant decodes to the same press.
+    """
+    return f"1414{0x0264 + index:04X}01181414"
 
 
 def test_identify_button_matches_each_calibrated_base() -> None:
@@ -238,12 +260,64 @@ def test_burst_repeats_neither_restart_nor_close_the_run() -> None:
     assert measurement.measured_seconds == 14.31, "the FIRST frame must stamp the start"
 
 
-def test_a_later_press_restarts_the_run() -> None:
-    """A direction press outside the burst window is the user starting over."""
+def test_a_later_press_of_the_same_direction_never_restarts_the_run() -> None:
+    """Nothing distinguishes a late copy of one press from a genuine re-press.
+
+    The frames are identical -- the protocol carries no sequence number and no
+    per-press nonce -- so "same button, long enough after" is the only rule
+    available, and a bridge lagging by more than a burst satisfies it. Keeping
+    the first anchor is therefore the only safe rule: the shade started moving
+    on the first press, and erring long stalls a motor against its own limit
+    switch where erring short leaves "closed" visibly open.
+    """
     run = run_for()
     run.offer_payload(rx("DOWN", 1_000), 100.0)
     run.offer_payload(rx("DOWN", 5_000), 104.0)
     measurement = run.offer_payload(rx("STOP", 19_000), 118.0)
+    assert measurement is not None
+    assert measurement.measured_seconds == 18.0, "the run stays anchored at the FIRST press"
+
+
+def test_an_isolated_late_copy_never_reanchors_the_run() -> None:
+    """One copy arriving just past the window has no chain to slide.
+
+    The sliding window absorbs a burst whose copies keep coming, but a bridge
+    that delivers a single copy of the press more than a whole window after
+    the last one escapes it entirely. Accepting that copy as a fresh press
+    re-anchors the run and stores a travel time short by the delivery lag --
+    the unsafe direction. `_open` refuses on the SIGNATURE, so no window can
+    be too narrow for it.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    late = 100.0 + TRAVEL_BURST_WINDOW_SECONDS + 0.01
+    assert run.offer_payload(rx("DOWN", 700_000), late, bridge_id="bridge-b") is None
+    assert run.started is not None
+    assert run.started.bridge_id == "bridge-a", "the first copy still owns the run"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, (
+        "re-anchoring on the late copy would have stored 12.8s -- 1.5 seconds short"
+    )
+
+
+def test_a_rapid_repress_after_a_discarded_run_still_registers() -> None:
+    """A press that would OPEN a run is never swallowed as a duplicate.
+
+    A double-tap closes a run too fast to store, and the user immediately
+    presses again -- inside the repeat window of their own first press.
+    Filtering copies ahead of the run swallowed that second press, and with
+    no run open the wizard then waited out its whole deadline having heard
+    the user twice. A press with no run to shorten cannot be unsafe.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0)
+    assert run.offer_payload(rx("STOP", 1_400), 100.4) is None, "too fast to be a real run"
+    assert run.started is None
+
+    run.offer_payload(rx("DOWN", 2_000), 101.0)
+    assert run.started is not None, "the re-press must open a run"
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0)
     assert measurement is not None
     assert measurement.measured_seconds == 14.0
 
@@ -374,3 +448,285 @@ def test_the_own_trailer_burst_is_not_recorded() -> None:
     }
     assert run.offer_payload(trailer, 100.0) is None
     assert run.heard == []
+
+
+def test_a_second_bridge_copy_of_the_press_does_not_reanchor_the_run() -> None:
+    """The same physical press heard by two bridges opens ONE run.
+
+    Fleet listening delivers a press once per bridge that heard it. A later
+    copy from another bridge lands inside the burst window and must be
+    absorbed exactly like the burst's own repeats -- re-anchoring on it would
+    silently shorten the measurement by the inter-bridge delivery skew.
+    """
+    run = run_for()
+    assert run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a") is None
+    assert run.offer_payload(rx("DOWN", 40_500), 100.04, bridge_id="bridge-b") is None
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, "bridge-a's own clock must time the run"
+
+
+def test_a_stop_heard_only_by_another_bridge_falls_back_to_monotonic() -> None:
+    """The Kaelyn case: the opening bridge never hears the STOP.
+
+    The STOP bridge carries a ``t`` and even the same ``boot`` number, but its
+    clock shares no epoch with the bridge that heard the press, so the run
+    must be timed on the monotonic receive times instead.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    measurement = run.offer_payload(rx("STOP", 900_000), 114.5, bridge_id="bridge-b")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.5, "cross-bridge t subtraction is meaningless"
+
+
+def test_one_press_heard_by_every_bridge_is_counted_once() -> None:
+    """A press the whole fleet heard opens ONE run, timed from the first copy.
+
+    Seven bridges each delivering the 8-frame burst is 56 copies of one
+    physical press. Every copy after the first must be filtered out ahead of
+    the run: the measurement is bounded by when the press HAPPENED, not by
+    which bridge's delivery happened to arrive last.
+    """
+    run = run_for()
+    # Every bridge reports its own `t`; only the receive clock relates them.
+    # Copies interleave across bridges, so they are offered in arrival order.
+    arrivals = sorted(
+        (repeat * 0.076 + index * 0.011, index, bridge, repeat)
+        for index, bridge in enumerate(f"bridge-{letter}" for letter in "abcdefg")
+        for repeat in range(8)
+    )
+    for offset, index, bridge, repeat in arrivals:
+        assert (
+            run.offer_payload(
+                rx("DOWN", 1_000 + index * 40_000 + repeat * 76),
+                100.0 + offset,
+                bridge_id=bridge,
+            )
+            is None
+        )
+    assert run.started is not None
+    assert run.started.bridge_id == "bridge-a", "the first copy heard opens the run"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, "56 copies of one press are one press"
+
+
+def test_a_lagging_bridges_spread_copies_never_shorten_the_run() -> None:
+    """Copies that keep arriving must not expire into a phantom re-press.
+
+    A bridge under broker backpressure delivers its share of the burst
+    stretched out, so the LAST copy of one press can land more than a burst
+    window after the FIRST. Treating that copy as a new press restarts the
+    run and stores a travel time short by the whole spread -- the unsafe
+    direction, since a short time leaves "closed" visibly open. The filter
+    slides per signature, so the chain holds however long it runs.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    for step in (1.0, 2.0, 3.0):
+        assert (
+            run.offer_payload(rx("DOWN", 500_000 + int(step * 1_000)), 100.0 + step, "bridge-b")
+            is None
+        ), f"the copy {step}s in is still one press, not a re-press"
+    measurement = run.offer_payload(rx("STOP", 15_310), 114.31, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.31, (
+        "a re-anchor on the 3.0s copy would have stored 11.31s -- 3 seconds short"
+    )
+
+
+def test_a_stop_inside_the_window_is_not_swallowed_as_a_repeat() -> None:
+    """The button is part of the dedup key, so a fast STOP still closes.
+
+    A user who stops the shade 1.4 s after starting it presses inside the
+    repeat window. Keying the filter on the remote and channels alone would
+    read that STOP as another copy of the DOWN and never close the run.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    measurement = run.offer_payload(rx("STOP", 2_400), 101.4, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "DOWN"
+    assert measurement.measured_seconds == 1.4
+
+
+def test_a_signature_separates_remotes_and_channels_not_just_buttons() -> None:
+    """Two presses collapse only when they are copies of ONE press on air.
+
+    The measure run gates on a calibrated identity before the filter sees a
+    frame, so within one run the signature can only vary by button. The Learn
+    wizard has no such gate -- it is the reason the key carries the remote and
+    the channel set as well.
+    """
+    base = press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "DOWN")
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (2, 1), "DOWN") == base, (
+        "one selector, whatever order the channels decode in"
+    )
+    assert press_signature(UNTABLED_PREFIX, TEST_REMOTE_ID, (1, 2), "DOWN") != base
+    assert press_signature(TEST_PREFIX, UNTABLED_REMOTE_ID, (1, 2), "DOWN") != base
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 3), "DOWN") != base
+    assert press_signature(TEST_PREFIX, TEST_REMOTE_ID, (1, 2), "UP") != base
+
+
+def test_a_stale_stop_copy_cannot_close_a_newly_reopened_run() -> None:
+    """A lagging copy of an OLD stop must not close the run that replaced it.
+
+    After the close, ``started`` is None, so a duplicate STOP arriving with
+    nothing open is refused by the run machine whatever the repeat filter says.
+    The filter's real job is this: a run too fast to store closes, the user
+    presses again, and a bridge under backpressure then delivers its copy of
+    the FIRST stop into the second run -- which would end it after the fraction
+    of a second between the two presses and hand the wizard nothing again.
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    assert run.offer_payload(rx("STOP", 1_500), 100.5, bridge_id="bridge-a") is None, (
+        "half a second is too fast to store, so the run closes with no measurement"
+    )
+    assert run.offer_payload(rx("DOWN", 2_000), 101.0, bridge_id="bridge-a") is None
+    assert run.started is not None, "the re-press must open a second run"
+    assert run.offer_payload(rx("STOP", 900_000), 101.6, bridge_id="bridge-b") is None
+    assert run.started is not None, "the lagging copy of the FIRST stop closes nothing"
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.measured_seconds == 14.0, "the second run is timed from its own press"
+
+
+def test_a_superseded_directions_late_copy_never_reanchors_the_run() -> None:
+    """A direction the run has ALREADY been anchored on cannot anchor it again.
+
+    The user starts the shade DOWN, changes their mind and presses UP, and a
+    bridge lagging by seconds -- the observed envelope -- then delivers its copy
+    of the DOWN burst that UP replaced. Nothing in the frames separates that
+    copy from a fresh press, so re-anchoring on it times a run the shade never
+    made and stores it under the WRONG DIRECTION (#57).
+    """
+    run = run_for()
+    run.offer_payload(rx("DOWN", 1_000), 100.0, bridge_id="bridge-a")
+    assert run.offer_payload(rx("UP", 3_000), 102.0, bridge_id="bridge-a") is None
+    assert run.started is not None
+    assert run.started.button == "UP", "the mind-change restart is the one the wizard needs"
+    assert run.offer_payload(rx("DOWN", 600_000), 102.5, bridge_id="bridge-b") is None
+    measurement = run.offer_payload(rx("STOP", 16_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "UP", "the shade ran UP; the stale DOWN copy is not a run"
+    assert measurement.measured_seconds == 13.0
+
+
+def test_both_directions_bursts_arriving_interleaved_keep_the_second_press() -> None:
+    """The fleet delivers both bursts mixed together; the run stays on the last.
+
+    Every bridge that heard the abandoned DOWN press and the UP press that
+    replaced it delivers its own copies, so the two bursts arrive interleaved
+    and the last frame in is a DOWN. The run must still be the UP one, anchored
+    at the FIRST copy of that press.
+    """
+    run = run_for()
+    arrivals = (
+        ("DOWN", "bridge-a", 100.0),
+        ("DOWN", "bridge-b", 100.1),
+        ("UP", "bridge-a", 100.6),
+        ("DOWN", "bridge-c", 100.7),
+        ("UP", "bridge-b", 100.8),
+        ("DOWN", "bridge-b", 101.4),
+        ("UP", "bridge-c", 102.2),
+        ("DOWN", "bridge-c", 103.9),
+    )
+    for button, bridge, received_at in arrivals:
+        assert (
+            run.offer_payload(
+                rx(button, round(received_at * 1_000)),
+                received_at,
+                bridge_id=bridge,
+            )
+            is None
+        )
+    assert run.started is not None
+    assert run.started.button == "UP"
+    assert run.started.received_at_monotonic == 100.6, "anchored at the first UP copy"
+    measurement = run.offer_payload(rx("STOP", 115_000), 115.0, bridge_id="bridge-a")
+    assert measurement is not None
+    assert measurement.direction == "UP"
+    assert measurement.measured_seconds == 14.4
+
+
+def test_one_foreign_press_heard_by_the_fleet_leaves_room_for_the_next() -> None:
+    """Fleet copies of ONE press must not fill the mismatch list (#57).
+
+    Each bridge reports the pulse widths it measured, so their captures of one
+    press differ byte for byte while decoding identically. Deduplicating on the
+    raw frame therefore counted every bridge's copy as a new press: nine copies
+    exhausted the cap, the NEXT remote to press was dropped, and the timeout
+    screen offered one-click adoption of the only remote it could still see.
+    """
+    run = run_for()
+    for index in range(_HEARD_CAP + 1):
+        heard_by_one_bridge = {
+            "frame": b1_frame(
+                UNTABLED_PREFIX,
+                UNTABLED_REMOTE_ID,
+                (1, 2),
+                "DOWN",
+                UNTABLED_BASES,
+                buckets=as_measured_by(index),
+            ),
+            "t": 1_000 + index,
+            "boot": 7,
+        }
+        assert (
+            run.offer_payload(heard_by_one_bridge, 100.0 + index * 0.05, f"bridge-{index}") is None
+        )
+    assert len(run.heard) == 1, "one press, however many bridges measured it"
+
+    second_remote = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (3,), "UP", TEST_BASES),
+        "t": 2_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(second_remote, 101.0, "bridge-0") is None
+    assert [(press.prefix, press.remote_id) for press in run.heard] == [
+        (UNTABLED_PREFIX, UNTABLED_REMOTE_ID),
+        (TEST_PREFIX, TEST_REMOTE_ID),
+    ], "the remote that pressed next is still there to be named"
+    assert not run.heard_overflowed, "two presses fit; nothing was dropped"
+
+
+def test_a_dropped_mismatch_is_reported_not_silently_forgotten() -> None:
+    """A full `heard` list must say so, because of what reads it (#57).
+
+    The mismatch screen offers to REWRITE this device's stored identity when
+    exactly one foreign remote was heard and this device's own was not. Both
+    halves of that are claims about a list with a cap: one stranger's remote
+    worked across enough selector positions fills it on its own, and the press
+    dropped for want of room is then the user's own remote -- so the screen
+    would read "one foreign remote, ours never heard" off evidence that proves
+    neither, and overwrite a correct identity with a stranger's.
+    """
+    run = run_for()
+    for channel in range(1, _HEARD_CAP + 1):
+        one_selector = {
+            "frame": b1_frame(
+                UNTABLED_PREFIX,
+                UNTABLED_REMOTE_ID,
+                (channel,),
+                "DOWN",
+                UNTABLED_BASES,
+            ),
+            "t": 1_000 + channel,
+            "boot": 7,
+        }
+        assert run.offer_payload(one_selector, 100.0 + channel * 0.1, "bridge-a") is None
+    assert len(run.heard) == _HEARD_CAP
+    assert not run.heard_overflowed, "the cap is reached, but nothing has been turned away yet"
+
+    own_on_other_channels = {
+        "frame": b1_frame(TEST_PREFIX, TEST_REMOTE_ID, (7,), "UP", TEST_BASES),
+        "t": 5_000,
+        "boot": 7,
+    }
+    assert run.offer_payload(own_on_other_channels, 102.0, "bridge-a") is None
+    assert all(
+        (press.prefix, press.remote_id) != (TEST_PREFIX, TEST_REMOTE_ID) for press in run.heard
+    ), "the fixture must exercise the case where OUR press is the one dropped"
+    assert run.heard_overflowed, "the list has to admit it could not hold everything"

@@ -24,7 +24,7 @@
           "bridge": "RF bridge"
         },
         "data_description": {
-          "bridge": "Automatic matches the selected area, then the configured default, then the first online bridge. Choose a named online bridge to override it."
+          "bridge": "Automatic listens on every online bridge at once — a single bridge hears a remote only part of the time. Choose a named online bridge to listen on that bridge alone."
         }
       },
       "learn_unavailable": {
@@ -58,7 +58,7 @@
       },
       "learn_confirm": {
         "title": "Confirm the detected remote",
-        "description": "Detected prefix {prefix}, remote ID {remote_id}, and channels {channels} for {name} through {bridge}. Measured from a real press: {measured}. Calculated rather than measured: {derived}. A calculated base can be wrong for remotes outside the common command layout — test those actions, and correct them under Edit remote settings if a blind does not respond.",
+        "description": "Detected prefix {prefix}, remote ID {remote_id}, and channels {channels} for {name}, heard on {bridge}. Measured from a real press: {measured}. Calculated rather than measured: {derived}. A calculated base can be wrong for remotes outside the common command layout — test those actions, and correct them under Edit remote settings if a blind does not respond.",
         "menu_options": {
           "remote_settings": "Continue",
           "learn_retry": "Try again",
@@ -213,7 +213,7 @@
       },
       "cover_measure_setup": {
         "title": "Measure travel time",
-        "description": "Pick the bridge that will listen while you run {name} with its remote. Automatic uses the bridge for this device's area.",
+        "description": "Pick which bridges will listen while you run {name} with its remote. Automatic listens on every online bridge at once; choosing a named bridge listens on that bridge alone.",
         "data": {
           "bridge": "Bridge"
         }
@@ -255,6 +255,38 @@
         "menu_options": {
           "cover_measure_use_heard": "Update this device to the heard remote",
           "cover_measure_run": "Try again",
+          "cover_measure_manual": "Type the times instead"
+        }
+      },
+      "learn_busy": {
+        "title": "The bridges are busy",
+        "description": "Another Zemismart setup window is already listening on {bridge}. A capture claims every bridge it listens on, and one press must be learned by one window rather than both, so it cannot start while any of them is held. Finish or close the other window, then try again.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
+      "learn_ambiguous": {
+        "title": "More than one press was heard",
+        "description": "More than one press arrived while listening for {action}: {remotes}. Any remote pressed within range of the listening bridges is heard here, and adopting the wrong one would misconfigure this device silently. Try again, pressing only the remote you are setting up, once, on the channel selector this blind uses.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
+      "learn_unchecked": {
+        "title": "The capture could not be checked",
+        "description": "The {action} press was heard, but the wizard could not check it against what else was on air at the time, so it has not been adopted. Nothing is known to be wrong with the press itself. Try again, and if this keeps happening please report it.",
+        "menu_options": {
+          "learn_retry": "Try again",
+          "advanced": "Advanced"
+        }
+      },
+      "cover_measure_busy": {
+        "title": "The bridges are busy",
+        "description": "Another Zemismart setup window is already listening on {bridge}. A measurement claims every bridge it listens on, so it cannot start while any of them is held. Finish or close the other window, then measure again.",
+        "menu_options": {
+          "cover_measure_run": "Try {wanted} again",
           "cover_measure_manual": "Type the times instead"
         }
       }
