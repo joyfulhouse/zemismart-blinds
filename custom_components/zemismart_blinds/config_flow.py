@@ -903,7 +903,7 @@ async def _async_arm_sniff_channels(
     released -- exactly the state the claim discipline exists to prevent.
     """
 
-    async def _arm_one(channel: _SniffChannel) -> _SniffChannel | None:
+    async def _arm_one(channel: _SniffChannel) -> _SniffChannel:
         async with asyncio.timeout_at(deadline):
             await arm(channel)
         return channel
@@ -919,8 +919,7 @@ async def _async_arm_sniff_channels(
         if isinstance(result, BaseException):
             _LOGGER.debug("Arming one bridge of the sniff failed", exc_info=result)
             continue
-        if result is not None:
-            armed.append(result)
+        armed.append(result)
     return armed
 
 

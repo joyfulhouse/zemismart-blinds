@@ -163,14 +163,21 @@ def press_signature(
     channels: tuple[int, ...],
     button: str,
 ) -> FrameSignature:
-    """Identify one physical press: which remote, which channels, which button.
+    """Key one press by what it is: which remote, which channels, which button.
 
     The same shape and key order ``state_sync`` debounces its fleet-wide
-    captures on, because it answers the same question: two captures share a
-    signature exactly when they are copies of one press on air. Channels and
-    remote are part of the key deliberately -- a bare button would collapse
-    two different remotes, or one remote on two channel selectors, into a
-    single press.
+    captures on, because it answers the same question.
+
+    An EQUIVALENCE key, though, not an identifier for one physical press: the
+    protocol carries no sequence number and no per-press nonce, so a genuine
+    re-press of the same button on the same channels shares its signature with
+    every copy of the earlier one. Telling those two apart is left to the
+    callers that have time and run state to reason with -- ``_is_repeat`` for a
+    STOP, and ``_open``'s ``anchored`` set for a direction press.
+
+    Channels and remote are part of the key deliberately -- a bare button would
+    collapse two different remotes, or one remote on two channel selectors,
+    into a single press.
     """
     return f"{prefix:06x}:{remote_id:02x}", frozenset(channels), button
 
@@ -417,9 +424,15 @@ class TravelRun:
         A sliding window alone is NOT enough to protect the run's anchor: an
         isolated copy from a bridge lagging by more than a whole burst has no
         chain to slide and escapes the window entirely. `_open` therefore
-        refuses to re-anchor on the opening signature regardless of what this
-        says, and the window's remaining job is to keep a duplicate STOP from
-        closing a run twice.
+        refuses to re-anchor on any signature already in `anchored`, regardless
+        of what this says.
+
+        What that leaves this filter is narrower than "stop a duplicate STOP
+        closing a run twice": `_close` clears `started`, so a second STOP
+        arriving with no run open is refused there whatever this returns. The
+        case only this filter catches is a stale copy of an EARLIER STOP
+        arriving after the user re-opened a run, which would otherwise close
+        that new run at the gap between their two presses.
         """
         previous = self.recent.get(signature)
         self.recent[signature] = received_at_monotonic

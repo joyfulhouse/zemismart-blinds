@@ -64,8 +64,14 @@ that problem, so they answer it the same way rather than inventing a second
 one.
 
 `press_signature(prefix, remote_id, channels, button)` produces the same
-`(remote_key, frozenset(chans), button)` shape `state_sync` keys on. Two
-captures share a signature exactly when they are copies of one press on air.
+`(remote_key, frozenset(chans), button)` shape `state_sync` keys on. It is an
+**equivalence key, not an identifier for one physical press**: captures sharing
+a signature are indistinguishable in the frame bytes, and that covers the copies
+of one press *and* a genuine re-press of the same button on the same channels.
+Separating those two is not the key's job — the temporal window and the run's own
+state do it (`_is_repeat` for a STOP, `_open`'s `anchored` set for a direction
+press), for the reasons the anchor rules below give.
+
 The remote and the channel set are part of the key deliberately: a bare
 button would collapse two different remotes — or one remote on two channel
 selectors — into a single press, which is precisely what fleet listening
@@ -108,11 +114,15 @@ a clock —
 - The set of anchors is cleared when a run closes, so a user re-pressing the
   same direction after a run too fast to store is heard as a new run.
 
-The window's remaining job is to keep a duplicate STOP from closing a run
-twice. It deliberately does **not** gate `_open`: a press with no run open
-cannot shorten anything, and filtering those swallowed a user's re-press after
-a run that closed too fast to store — the wizard then waited out its whole
-deadline having heard the user twice.
+The window's remaining job is narrower than "keep a duplicate STOP from closing
+a run twice": `_close` clears `started`, so a second STOP arriving while no run
+is open is already refused by the run machine, filter or no filter. The case
+only this filter catches is a stale copy of an EARLIER STOP arriving after the
+user re-opened a run — see the residual-risk subsection below, which sets out
+what that leaves open. It deliberately does **not** gate `_open`: a press with
+no run open cannot shorten anything, and filtering those swallowed a user's
+re-press after a run that closed too fast to store — the wizard then waited out
+its whole deadline having heard the user twice.
 
 ### Residual risk: the protection is asymmetric, and deliberately so
 
@@ -1020,9 +1030,10 @@ described as deleted.
 That sweep is the point. Written round by round, this file accumulated prose
 that was true when a round wrote it and orphaned by the round after — the
 repeat filter credited with a guarantee `anchored` took over, a teardown
-paragraph describing a release discipline deleted two rounds earlier, a cache
-note still carrying the false invariant round seven replaced, a test-inventory
-bullet for a test round three replaced and another for one round five deleted.
+paragraph describing a release discipline deleted four rounds earlier in round
+five, a cache note still carrying the invariant round six replaced (and missing
+the floor round seven corrected), a test-inventory bullet for a test round three
+replaced and another for one round five deleted.
 None of it was a code defect; all of it would have re-surfaced as a finding.
 
 Two structural fixes rather than word changes:
