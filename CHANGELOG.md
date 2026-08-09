@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-08-08
+
+### Fixed
+
+- **A capture no longer times out because the one bridge it was bound to could not hear the
+  remote.** Travel measurement and the Learn wizard now subscribe to *every* online bridge's
+  `/rx` at once and collapse the copies of one press into one press — the same fleet-wide
+  listening, keyed on the same press signature (remote, channel set, button), that state sync
+  already uses. A single bridge hears a given remote only part of the time: live taps measured
+  the bridge sitting in the same room as a remote catching 3 of 11 and then 2 of 6 physical
+  presses (~30%) while three to four of its peers heard nearly every one. A reconfigure bound to
+  that bridge alone never heard the STOPs the shade visibly obeyed, and went on measuring as
+  though the button had never been pressed. Which bridges are near which remotes now stops
+  mattering. A bridge that cannot be armed — offline, slow, or refusing its subscription — is
+  skipped rather than fatal, and arming the whole fleet shares one bootstrap budget, so adding a
+  bridge to the house never eats into the listening window that follows.
+
+- **A run is timed on one bridge's clock or none.** The millisecond interval a measurement stores
+  is taken from the bridge's own counter only when the opening press and the STOP were heard by
+  the *same* bridge; a run whose two ends arrived via different bridges falls back to Home
+  Assistant's receive times, exactly as a frame carrying no bridge clock already did. Two
+  bridges' counters share no epoch and their boot numbers can collide by coincidence, so
+  subtracting across them was never meaningful — it just was not reachable while one bridge did
+  all the listening.
+
+- **A press that has already started a run can never restart it.** With several bridges relaying,
+  a copy of one press can arrive seconds after the first — after the user has changed
+  direction — and restarting the clock on it would store an interval the shade never travelled,
+  filed under the direction it did not run. Every press that anchored the current run is kept for
+  the life of that run, so only a genuinely different press (the other direction, the user
+  changing their mind) restarts it. The cost is that DOWN, then UP, then DOWN again inside one
+  measurement stays anchored on the UP press; the screen's redo is the remedy, and the trade
+  errs long rather than short, because a short travel time is the one that leaves a "closed"
+  shade visibly open.
+
+- **The timeout screen names distinct remotes again.** The list of presses it could not match is
+  now deduplicated by what was pressed rather than by the raw frame — two bridges' captures of
+  one press differ in their bucket timings, so on a listening fleet a single remote's repeats
+  would otherwise fill the list and crowd out the *other* remote the screen exists to name. The
+  one-click offer to adopt a heard remote is withheld when more than one foreign remote was
+  heard, or when more presses arrived than the list can hold: the bridges report no signal
+  strength, so which of them drives this shade cannot be ranked, and that offer rewrites the
+  device's stored identity.
+
+### Changed
+
+- **"Automatic" now means every online bridge, in both flows.** It is the default for travel
+  measurement and for the Learn wizard, and the bridge pickers say so. Choosing a named bridge
+  remains an explicit override that listens on that bridge alone — useful for finding out what a
+  single bridge can actually hear. The confirm screen at the end of a learn now names the bridges
+  that *heard* the remote rather than the ones that were armed.
+
+- **The Learn wizard refuses its first capture when another remote was pressed alongside it.**
+  The first capture of a run is the one with no calibrated identity to gate on, so any Zemismart
+  remote in range satisfies it — and with the whole fleet listening, that can be several
+  households' worth. When a press from a different remote or a different channel selector lands
+  within one burst window either side of the winner, the wizard stops and names them instead of
+  picking one, since adopting the wrong remote would silently pin the whole wizard to a remote
+  the user never touched. Ordinary house traffic outside that window is ignored, and a capture
+  that could not be checked at all gets its own screen rather than being reported as an ambiguity
+  over a list of one name.
+
+- **A capture that cannot claim the whole fleet says so instead of reporting silence.** A
+  listening session takes exclusive hold of every bridge it listens on, all of them or none:
+  two setup windows sharing one bridge's RX would each learn the same press, and listening on
+  only the free subset looks identical to a healthy capture while the bridges that could hear the
+  remote may be precisely the excluded ones. Both flows now show which bridges the other window
+  is holding, rather than running to a timeout that reads as "nothing was pressed".
+
 ## [0.9.4] - 2026-08-07
 
 ### Added
