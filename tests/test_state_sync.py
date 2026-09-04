@@ -2003,7 +2003,6 @@ _TIMED_ROUND_ROBIN_STOP_AFTER_MS: Final = 1_200
 # close at 8.95 s, hiding a genuine press in the six-second phantom tail.
 _TIMED_ROUND_ROBIN_INSIDE_CLAMP: Final = 2.9
 _TIMED_ROUND_ROBIN_PHANTOM_TAIL: Final = 5.0
-_TIMED_MAX_CONCURRENCY: Final = 16
 _TIMED_LONG_DEADLINE_STOP_AFTER_MS: Final = 5_000
 # With a three-second train, +5.0 s needs round-robin stretch but remains
 # inside the +6.75 s clamp; +7.0 s is the phantom tail and must be a takeover.
@@ -2100,27 +2099,19 @@ def test_timed_round_robin_phantom_tail_dispatches_a_physical_takeover() -> None
     _register_timed_round_robin_burst(
         ledger,
         consumer,
-        target_count=_TIMED_MAX_CONCURRENCY,
+        target_count=state_sync_module._LEDGER_MAX_CONCURRENT_TARGETS,
         stop_after_ms=_TIMED_LONG_DEADLINE_STOP_AFTER_MS,
     )
 
-    now_value[0] = _TIMED_LONG_DEADLINE_OWN_REPEAT
-    consumer.handle_rx(
-        _ROUND_ROBIN_PEER,
-        _BOOT,
-        int(_TIMED_LONG_DEADLINE_OWN_REPEAT * _MILLISECONDS_PER_SECOND),
-        _frame((1,), "DOWN"),
-        _TIMED_LONG_DEADLINE_OWN_REPEAT,
-    )
-
-    now_value[0] = _TIMED_LONG_DEADLINE_TAKEOVER
-    consumer.handle_rx(
-        _ROUND_ROBIN_PEER,
-        _BOOT,
-        int(_TIMED_LONG_DEADLINE_TAKEOVER * _MILLISECONDS_PER_SECOND),
-        _frame((1,), "DOWN"),
-        _TIMED_LONG_DEADLINE_TAKEOVER,
-    )
+    for heard_at in (_TIMED_LONG_DEADLINE_OWN_REPEAT, _TIMED_LONG_DEADLINE_TAKEOVER):
+        now_value[0] = heard_at
+        consumer.handle_rx(
+            _ROUND_ROBIN_PEER,
+            _BOOT,
+            int(heard_at * _MILLISECONDS_PER_SECOND),
+            _frame((1,), "DOWN"),
+            heard_at,
+        )
 
     assert ([event.button for event in dispatched], proofs) == (
         ["DOWN"],
