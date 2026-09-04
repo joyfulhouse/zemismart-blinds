@@ -414,7 +414,7 @@ class CommandLedger:
             window.train_seconds,
             concurrency,
         )
-        if window.signature[2] == "STOP" or entry.handoff is None:
+        if window.signature[2] == "STOP":
             return effective_end
         stop_frame = next(
             (frame for frame in entry.frames if frame.signature[2] == "STOP"),
@@ -422,6 +422,7 @@ class CommandLedger:
         )
         if stop_frame is None:
             return effective_end
+        assert entry.handoff is not None
         constants = _state_sync_constants()
         deadline_clamp = (
             entry.handoff
