@@ -1983,18 +1983,14 @@ def test_round_robin_concurrency_is_capped_at_the_firmware_target_limit() -> Non
     assert ledger.match(signature, _CAP_BETWEEN_CAPPED_AND_UNCAPPED) is None
 
 
-# #22 coherence check: a TIMED move's action frame is deliberately truncated
-# below the full repeat train (models.py::_ledger_registration computes
+# #22: a TIMED move's action frame is deliberately truncated below the full
+# repeat train (transport.py::_ledger_registration computes
 # `action_ms = min(train_ms, stop_after_ms + _LEDGER_REPEAT_AIRTIME_MS)`,
-# unchanged by this fix) because its fail-safe STOP promotes and preempts
-# the remaining action repeats at its wall-clock deadline. The round-robin
-# stretch must compose with that truncation rather than fight it: it is
-# applied per-window from THAT window's own `train_seconds`, so the
-# (already-shorter) action window is stretched using its own smaller
-# effective repeat count, while the untruncated STOP window -- a separate
-# window on a separate signature -- is stretched using the full count. This
-# pins that composition with a concrete number rather than only reasoning
-# about it.
+# unchanged by this fix) because its fail-safe STOP promotes and preempts the
+# remaining action repeats at its wall-clock deadline. Round-robin stretching
+# must still cover legitimate action repeats, but it cannot extend an action
+# signature past that deadline plus one in-flight repeat and ledger slack. The
+# STOP train itself runs to completion and therefore keeps its full stretch.
 _TIMED_ROUND_ROBIN_HANDOFF: Final = 0.0
 _TIMED_ROUND_ROBIN_TARGET_COUNT: Final = 7
 _TIMED_ROUND_ROBIN_TRAIN_MS: Final = 3_000  # repeats=3, the production default
@@ -2002,21 +1998,27 @@ _TIMED_ROUND_ROBIN_TRAIN_MS: Final = 3_000  # repeats=3, the production default
 # even, which would make the effective repeat count ambiguous at one).
 _TIMED_ROUND_ROBIN_STOP_AFTER_MS: Final = 1_200
 # action_ms = min(3000, 1200 + 1000) = 2200 -> train_seconds=2.2 -> repeats=2.
-# Nominal action window closes at 2.2 + 0.75 = 2.95 s. Stretched by
-# concurrency=7: (2 - 1) * (7 - 1) * 1 s = 6 s -> closes at 8.95 s.
-_TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO: Final = 5.0
+# Nominal action window and its deadline clamp both close at
+# 1.2 + 1 + 0.75 = 2.95 s. An unclamped concurrency=7 stretch would instead
+# close at 8.95 s, hiding a genuine press in the six-second phantom tail.
+_TIMED_ROUND_ROBIN_INSIDE_CLAMP: Final = 2.9
+_TIMED_ROUND_ROBIN_PHANTOM_TAIL: Final = 5.0
+_TIMED_MAX_CONCURRENCY: Final = 16
+_TIMED_LONG_DEADLINE_STOP_AFTER_MS: Final = 5_000
+# With a three-second train, +5.0 s needs round-robin stretch but remains
+# inside the +6.75 s clamp; +7.0 s is the phantom tail and must be a takeover.
+_TIMED_LONG_DEADLINE_OWN_REPEAT: Final = 5.0
+_TIMED_LONG_DEADLINE_TAKEOVER: Final = 7.0
 
 
-def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window() -> None:
-    """A timed move's shortened action window still stretches correctly (#22).
-
-    Without this composition, a timed move's own late-but-legitimate action
-    repeat -- already narrowed by the fail-safe-STOP truncation -- would be
-    doubly disadvantaged under concurrency: narrowed AND unstretched. This
-    proves the stretch still reaches a truncated window using that window's
-    own (smaller) repeat count, exactly as it does for an untruncated one.
-    """
-    ledger = CommandLedger()
+def _register_timed_round_robin_burst(
+    ledger: CommandLedger,
+    consumer: StateSyncConsumer,
+    *,
+    target_count: int = _TIMED_ROUND_ROBIN_TARGET_COUNT,
+    stop_after_ms: int = _TIMED_ROUND_ROBIN_STOP_AFTER_MS,
+) -> tuple[FrameSignature, FrameSignature]:
+    """Confirm one timed move and its plain peers on the same bridge."""
     action = _required_signature((1,), "DOWN")
     stop = _required_signature((1,), "STOP")
     ledger.register_pending(
@@ -2028,20 +2030,26 @@ def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window
             LedgerFrameSpec(
                 action,
                 offset_ms=0,
-                airtime_ms=(
-                    _TIMED_ROUND_ROBIN_STOP_AFTER_MS + state_sync_module._LEDGER_REPEAT_AIRTIME_MS
+                airtime_ms=min(
+                    _TIMED_ROUND_ROBIN_TRAIN_MS,
+                    stop_after_ms + state_sync_module._LEDGER_REPEAT_AIRTIME_MS,
                 ),
             ),
             LedgerFrameSpec(
                 stop,
-                offset_ms=_TIMED_ROUND_ROBIN_STOP_AFTER_MS,
+                offset_ms=stop_after_ms,
                 airtime_ms=_TIMED_ROUND_ROBIN_TRAIN_MS,
             ),
         ],
     )
+    consumer.record_commanded_start(
+        _REMOTE_KEY,
+        frozenset({1}),
+        _TIMED_ROUND_ROBIN_HANDOFF,
+    )
     ledger.confirm("timed-office", _TIMED_ROUND_ROBIN_HANDOFF)
-    for index in range(_TIMED_ROUND_ROBIN_TARGET_COUNT - 1):
-        channels = (index + 10,)
+    for index in range(target_count - 1):
+        channels = (index + 2,)
         ledger.register_pending(
             f"peer-{index}",
             _ROUND_ROBIN_BRIDGE,
@@ -2055,10 +2063,66 @@ def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window
                 ),
             ],
         )
+        consumer.record_commanded_start(
+            _REMOTE_KEY,
+            frozenset(channels),
+            _TIMED_ROUND_ROBIN_HANDOFF,
+        )
         ledger.confirm(f"peer-{index}", _TIMED_ROUND_ROBIN_HANDOFF)
+    return action, stop
 
-    assert ledger.match(action, _TIMED_ROUND_ROBIN_LATE_TRUNCATED_ECHO) == (
-        "confirmed",
-        "timed-office",
-        _ROUND_ROBIN_BRIDGE,
+
+def test_round_robin_stretch_composes_with_a_timed_moves_truncated_action_window() -> None:
+    """Timed actions clamp at their deadline while STOP keeps its stretch."""
+    ledger = CommandLedger()
+    consumer = _consumer(ledger, [], [], [_TIMED_ROUND_ROBIN_HANDOFF])
+    action, stop = _register_timed_round_robin_burst(ledger, consumer)
+
+    confirmed = ("confirmed", "timed-office", _ROUND_ROBIN_BRIDGE)
+    assert (
+        ledger.match(action, _TIMED_ROUND_ROBIN_INSIDE_CLAMP),
+        ledger.match(action, _TIMED_ROUND_ROBIN_PHANTOM_TAIL),
+        ledger.match(stop, _TIMED_ROUND_ROBIN_PHANTOM_TAIL),
+    ) == (
+        confirmed,
+        None,
+        confirmed,
+    )
+
+
+def test_timed_round_robin_phantom_tail_dispatches_a_physical_takeover() -> None:
+    """At max concurrency, own action survives but a later press takes over."""
+    ledger = CommandLedger()
+    dispatched: list[HeardEvent] = []
+    proofs: list[str] = []
+    now_value = [_TIMED_ROUND_ROBIN_HANDOFF]
+    consumer = _consumer(ledger, dispatched, proofs, now_value)
+    _register_timed_round_robin_burst(
+        ledger,
+        consumer,
+        target_count=_TIMED_MAX_CONCURRENCY,
+        stop_after_ms=_TIMED_LONG_DEADLINE_STOP_AFTER_MS,
+    )
+
+    now_value[0] = _TIMED_LONG_DEADLINE_OWN_REPEAT
+    consumer.handle_rx(
+        _ROUND_ROBIN_PEER,
+        _BOOT,
+        int(_TIMED_LONG_DEADLINE_OWN_REPEAT * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "DOWN"),
+        _TIMED_LONG_DEADLINE_OWN_REPEAT,
+    )
+
+    now_value[0] = _TIMED_LONG_DEADLINE_TAKEOVER
+    consumer.handle_rx(
+        _ROUND_ROBIN_PEER,
+        _BOOT,
+        int(_TIMED_LONG_DEADLINE_TAKEOVER * _MILLISECONDS_PER_SECOND),
+        _frame((1,), "DOWN"),
+        _TIMED_LONG_DEADLINE_TAKEOVER,
+    )
+
+    assert ([event.button for event in dispatched], proofs) == (
+        ["DOWN"],
+        ["timed-office"],
     )

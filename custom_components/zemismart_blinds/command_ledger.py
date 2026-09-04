@@ -395,6 +395,12 @@ class CommandLedger:
         than a normal repeat train, so it is excluded here exactly as it is
         in ``_round_robin_concurrency``.
 
+        A timed command's STOP offset is its wall-clock deadline. Its action
+        and trailer repeats can be stretched only until that deadline plus
+        one in-flight repeat and normal ledger slack; the STOP train itself
+        runs to completion and keeps its full stretch. Commands without a
+        STOP frame are not deadline-bound and keep the full stretch too.
+
         ``concurrency`` may be supplied by a caller that already counted it for
         this entry, so a multi-window entry counts once per classification
         rather than once per window -- this runs inside match(), on every
@@ -404,7 +410,26 @@ class CommandLedger:
             return window.ends_at
         if concurrency is None:
             concurrency = self._round_robin_concurrency(entry)
-        return window.ends_at + _round_robin_stretch_seconds(window.train_seconds, concurrency)
+        effective_end = window.ends_at + _round_robin_stretch_seconds(
+            window.train_seconds,
+            concurrency,
+        )
+        if window.signature[2] == "STOP" or entry.handoff is None:
+            return effective_end
+        stop_frame = next(
+            (frame for frame in entry.frames if frame.signature[2] == "STOP"),
+            None,
+        )
+        if stop_frame is None:
+            return effective_end
+        constants = _state_sync_constants()
+        deadline_clamp = (
+            entry.handoff
+            + (stop_frame.offset_ms + constants._LEDGER_REPEAT_AIRTIME_MS)
+            / constants._MILLISECONDS_PER_SECOND
+            + constants._LEDGER_WINDOW_SLACK_SECONDS
+        )
+        return min(effective_end, deadline_clamp)
 
     def match(self, signature: FrameSignature, heard_at: float) -> LedgerMatch | None:
         """Return the best-fitting pending or windowed confirmed command match.
